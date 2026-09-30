@@ -1,0 +1,40 @@
+name: aegis_health
+description: "A new Flutter project."
+publish_to: 'none'
+
+version: 1.0.0+1
+
+environment:
+  sdk: ^3.11.4
+
+dependencies:
+  flutter:
+    sdk: flutter
+  provider: ^6.1.1
+  sensors_plus: ^6.1.1
+  google_generative_ai: ^0.4.0
+  cupertino_icons: ^1.0.8
+  file_picker: ^8.0.0
+  path: ^1.9.0
+  image_picker: ^1.1.2
+  shared_preferences: ^2.2.2
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^6.0.0
+
+flutter:
+  uses-material-design: true
+
+  assets:
+    - assets/images/heart.png
+    - assets/images/circulationsystem.png
+    - assets/images/allsystems.png
+    - assets/images/endocrynesystem.png
+    - assets/images/bonesystem.png
+    - assets/images/kidneys.png
+    - assets/images/lungs.png
+    - assets/images/lymphaticsystem.png
+    - assets/images/nervesystem.png
+    - assets/images/stomack.png
