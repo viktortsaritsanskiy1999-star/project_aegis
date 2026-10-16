@@ -12,6 +12,8 @@ import 'services/athena_trigger_service.dart';
 import 'package:aegis_health/services/aegis_cascade_controller.dart';
 import 'package:aegis_health/services/vitals_monitor_service.dart';
 import 'package:aegis_health/widgets/vitals_activity_check_modal.dart';
+import 'widgets/workout_session_modal.dart';
+import 'widgets/emergency_medical_modal.dart';
 
 void main() => runApp(
   MultiProvider(
@@ -102,6 +104,9 @@ class _AtlasScreenState extends State<AtlasScreen> {
 
   // 1. Храним ссылку на сервис для отписки в dispose
   VitalsMonitorService? _vitalsService;
+  bool _isActivityModalOpen = false;
+  bool _isWorkoutModalOpen = false;
+  bool _isCriticalModalOpen = false;
 
   @override
   void initState() {
@@ -133,14 +138,92 @@ class _AtlasScreenState extends State<AtlasScreen> {
 
     final state = _vitalsService?.currentState;
 
-    // 3. Вызываем показы только после завершения текущего кадра рендера
-    if (state == AlertState.waitingUserResponse) {
+    if (state == AlertState.waitingUserResponse && !_isActivityModalOpen) {
+      _isActivityModalOpen = true;
       WidgetsBinding.instance.addPostFrameCallback((_) {
         if (mounted) {
-          VitalsActivityCheckModal.show(context);
+          VitalsActivityCheckModal.show(context).then((_) {
+            _isActivityModalOpen = false;
+          });
+        }
+      });
+    } else if (state == AlertState.workoutActive && !_isWorkoutModalOpen) {
+      _isWorkoutModalOpen = true;
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) {
+          WorkoutSessionModal.show(context).then((_) {
+            _isWorkoutModalOpen = false;
+          });
+        }
+      });
+    } else if (state == AlertState.criticalAnomaly && !_isCriticalModalOpen) {
+      _isCriticalModalOpen = true;
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) {
+          _showCriticalAnomalyDialog().then((_) {
+            _isCriticalModalOpen = false;
+          });
         }
       });
     }
+  }
+
+  Future<void> _showCriticalAnomalyDialog() async {
+    final reason = _vitalsService?.criticalAnomalyReason ??
+        "Возможная потеря сигнала: пульс 0 уд/мин зафиксирован более 2 минут.";
+
+    await showDialog(
+      context: context,
+      barrierDismissible: false,
+      builder: (dialogCtx) => AlertDialog(
+        backgroundColor: const Color(0xFF161B22),
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(16),
+          side: const BorderSide(color: Colors.amberAccent, width: 2),
+        ),
+        title: const Row(
+          children: [
+            Icon(Icons.sensors_off_rounded, color: Colors.amberAccent, size: 28),
+            SizedBox(width: 10),
+            Expanded(
+              child: Text(
+                "ПРОВЕРКА СВЯЗИ С ДАТЧИКОМ",
+                style: TextStyle(
+                  color: Colors.amberAccent,
+                  fontWeight: FontWeight.bold,
+                  fontSize: 16,
+                ),
+              ),
+            ),
+          ],
+        ),
+        content: Text(
+          "$reason\n\nУбедитесь, что смарт-часы плотно прилегают к запястью и датчик чист. Автоматический вызов экстренных служб отключен. При ухудшении самочувствия вы можете вызвать помощь вручную.",
+          style: const TextStyle(color: Colors.white, fontSize: 14),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () {
+              Navigator.of(dialogCtx).pop();
+              _vitalsService?.resetToIdle();
+            },
+            child: const Text("Датчик поправлен / Сброс", style: TextStyle(color: Colors.cyanAccent)),
+          ),
+          ElevatedButton(
+            style: ElevatedButton.styleFrom(
+              backgroundColor: const Color(0xFF21262D),
+              foregroundColor: Colors.white70,
+            ),
+            onPressed: () {
+              Navigator.of(dialogCtx).pop();
+              _vitalsService?.resetToIdle();
+              EmergencyMedicalModal.show(context);
+            },
+            child: const Text("Нужна помощь"),
+          ),
+        ],
+      ),
+    );
   }
 
   @override

@@ -4,6 +4,7 @@ import '../services/brain_service.dart';
 import '../services/vault_service.dart';
 import '../services/time_service.dart';
 import 'package:aegis_health/services/aegis_cascade_controller.dart';
+import '../services/vitals_monitor_service.dart';
 import '../widgets/emergency_medical_modal.dart';
 
 class CuratorChatScreen extends StatefulWidget {
@@ -23,6 +24,7 @@ class _CuratorChatScreenState extends State<CuratorChatScreen> {
 
   VaultService? _vaultService;
   AegisCascadeController? _cascadeController;
+  VitalsMonitorService? _vitalsService;
 
   @override
   void initState() {
@@ -30,6 +32,7 @@ class _CuratorChatScreenState extends State<CuratorChatScreen> {
     WidgetsBinding.instance.addPostFrameCallback((_) {
       _vaultService = Provider.of<VaultService>(context, listen: false);
       _cascadeController = Provider.of<AegisCascadeController>(context, listen: false);
+      _vitalsService = Provider.of<VitalsMonitorService>(context, listen: false);
 
       _vaultService?.addListener(_onVaultUpdated);
       _startCuratorFlow();
@@ -208,6 +211,9 @@ class _CuratorChatScreenState extends State<CuratorChatScreen> {
 
   @override
   void dispose() {
+    if (_vitalsService?.currentState == AlertState.inChatWithAthena) {
+      _vitalsService?.resetToIdle();
+    }
     _vaultService?.removeListener(_onVaultUpdated);
     _textController.dispose();
     _scrollController.dispose();
