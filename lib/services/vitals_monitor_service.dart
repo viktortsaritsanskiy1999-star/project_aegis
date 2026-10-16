@@ -12,7 +12,7 @@ enum AlertState {
   workoutActive,         // Workout in progress: 1-min interval, blocking screen active
   postWorkoutRecovery,   // Recovery mode: 0-10m: 2m, 10-50m: 5m, 50m+: 10m
   inChatWithAthena,      // User answered "No", control handed over to Athena
-  criticalAnomaly,       // Pulse 0 for >= 2 minutes (cardiac arrest / sensor detached)
+  criticalAnomaly,       // Pulse 0 for >= 2 minutes (sensor lost / detached)
   trackingInBackground,  // Kept for backward compatibility
 }
 
@@ -23,6 +23,8 @@ class PulseRecord {
   final String phase; // 'workout', 'recovery_0_10', 'recovery_10_50', 'standard'
   final String note;
   final bool isSimulated;
+  final String source; // 'watch_sensor', 'manual', 'test_chip', 'time_simulation'
+  final String? sessionId;
 
   const PulseRecord({
     required this.timestamp,
@@ -30,6 +32,8 @@ class PulseRecord {
     required this.phase,
     this.note = '',
     this.isSimulated = false,
+    this.source = 'watch_sensor',
+    this.sessionId,
   });
 
   Map<String, dynamic> toJson() => {
@@ -38,7 +42,19 @@ class PulseRecord {
     'phase': phase,
     'note': note,
     'is_simulated': isSimulated,
+    'source': source,
+    if (sessionId != null) 'session_id': sessionId,
   };
+
+  factory PulseRecord.fromJson(Map<String, dynamic> json) => PulseRecord(
+    timestamp: DateTime.tryParse(json['timestamp']?.toString() ?? '') ?? DateTime.now(),
+    pulse: (json['pulse'] as num?)?.toInt() ?? 0,
+    phase: json['phase']?.toString() ?? 'workout',
+    note: json['note']?.toString() ?? '',
+    isSimulated: json['is_simulated'] == true,
+    source: json['source']?.toString() ?? 'watch_sensor',
+    sessionId: json['session_id']?.toString(),
+  );
 }
 
 /// Pulse analysis, workout tracking, and adaptive monitoring service
@@ -61,10 +77,14 @@ class VitalsMonitorService extends ChangeNotifier {
   DateTime? _workoutEndTime;
   DateTime? _lastRecordedTime;
   DateTime? _zeroPulseStartTime;
+  DateTime? _anomalyDetectedTime;
+  DateTime? _activityConfirmedTime;
+  String? _currentSessionId;
   String? criticalAnomalyReason;
 
   DateTime? get workoutStartTime => _workoutStartTime;
   DateTime? get workoutEndTime => _workoutEndTime;
+  String? get currentSessionId => _currentSessionId;
 
   final List<PulseRecord> _workoutPulseLog = [];
   List<PulseRecord> get workoutPulseLog => List.unmodifiable(_workoutPulseLog);
@@ -82,13 +102,23 @@ class VitalsMonitorService extends ChangeNotifier {
   }
 
   /// Helper to record a pulse point into the workout/recovery log
-  void _recordLog(DateTime time, int pulse, String phase, [String note = '', bool isSimulated = false]) {
+  void _recordLog(
+    DateTime time,
+    int pulse,
+    String phase, [
+    String note = '',
+    bool isSimulated = false,
+    String source = 'watch_sensor',
+    String? sessionId,
+  ]) {
     _workoutPulseLog.add(PulseRecord(
       timestamp: time,
       pulse: pulse,
       phase: phase,
       note: note,
       isSimulated: isSimulated,
+      source: source,
+      sessionId: sessionId ?? _currentSessionId,
     ));
     _lastRecordedTime = time;
     debugPrint("📝 [VitalsMonitor Log]: $pulse bpm ($phase${note.isNotEmpty ? ', $note' : ''}${isSimulated ? ', SIMULATED' : ''}) at $time");
@@ -113,7 +143,11 @@ class VitalsMonitorService extends ChangeNotifier {
   }
 
   /// Main entry method: called when a new pulse value arrives from the watch/panel/tests
-  void onNewPulseRead(int newPulse) {
+  void onNewPulseRead(
+    int newPulse, {
+    String source = 'watch_sensor',
+    bool isSimulated = false,
+  }) {
     _currentPulse = newPulse;
 
     if (newPulse > 0) {
@@ -123,9 +157,9 @@ class VitalsMonitorService extends ChangeNotifier {
       }
     }
 
-    debugPrint("📥 [VitalsMonitor]: New pulse: $newPulse bpm (Buffer: ${_pulseBuffer.length}, State: $currentState)");
+    debugPrint("📥 [VitalsMonitor]: New pulse: $newPulse bpm (Buffer: ${_pulseBuffer.length}, State: $currentState, Source: $source, Simulated: $isSimulated)");
 
-    // 1. Zero pulse check (asystole / sensor lost anomaly)
+    // 1. Zero pulse check (sensor lost / detached anomaly)
     _checkZeroPulseAnomaly(newPulse);
     if (currentState == AlertState.criticalAnomaly) {
       notifyListeners();
@@ -137,17 +171,23 @@ class VitalsMonitorService extends ChangeNotifier {
       case AlertState.idle:
       case AlertState.trackingInBackground:
         if (newPulse >= 140) {
-          _triggerSpikeAlert(newPulse, reason: "Высокий пульс ($newPulse bpm >= 140)");
+          _triggerSpikeAlert(newPulse, reason: "Высокий пульс ($newPulse bpm >= 140)", source: source, isSimulated: isSimulated);
         } else {
           _analyzeForSpike(newPulse);
         }
         break;
 
       case AlertState.workoutActive:
-        // Record reading during workout if at least 1 minute elapsed since last record
-        if (_lastRecordedTime == null ||
-            _timeService.now.difference(_lastRecordedTime!).inMinutes >= 1) {
-          _recordLog(_timeService.now, newPulse, 'workout');
+        _recordLog(_timeService.now, newPulse, 'workout', '', isSimulated, source, _currentSessionId);
+        if (_currentSessionId != null) {
+          _vaultService.addHeartRateSample(
+            sessionId: _currentSessionId,
+            timestamp: _timeService.now,
+            pulse: newPulse,
+            phase: 'workout',
+            source: source,
+            isSimulated: isSimulated,
+          );
         }
         notifyListeners();
         break;
@@ -156,7 +196,7 @@ class VitalsMonitorService extends ChangeNotifier {
         // Anomaly: Pulse 140+ during recovery triggers the alert cycle again!
         if (newPulse >= 140) {
           debugPrint("🚨 [VitalsMonitor]: Pulse $newPulse bpm >= 140 during recovery! Restarting alert cycle.");
-          _triggerSpikeAlert(newPulse, reason: "Скачок пульса после тренировки ($newPulse bpm)");
+          _triggerSpikeAlert(newPulse, reason: "Скачок пульса после тренировки ($newPulse bpm)", source: source, isSimulated: isSimulated);
           return;
         }
 
@@ -170,7 +210,26 @@ class VitalsMonitorService extends ChangeNotifier {
           final phase = elapsed < 10
               ? 'recovery_0_10 (каждые 2 мин)'
               : (elapsed < 50 ? 'recovery_10_50 (каждые 5 мин)' : 'standard (каждые 10 мин)');
-          _recordLog(_timeService.now, newPulse, phase);
+
+          _recordLog(_timeService.now, newPulse, phase, '', isSimulated, source, _currentSessionId);
+          if (_currentSessionId != null) {
+            _vaultService.addHeartRateSample(
+              sessionId: _currentSessionId,
+              timestamp: _timeService.now,
+              pulse: newPulse,
+              phase: phase,
+              source: source,
+              isSimulated: isSimulated,
+            );
+          }
+        }
+
+        // Check physiological recovery end
+        if (newPulse <= (_baselinePulse * 1.15) && _currentSessionId != null) {
+          _vaultService.recordPhysiologicalEnd(
+            sessionId: _currentSessionId!,
+            physiologicalEndTime: _timeService.now,
+          );
         }
         notifyListeners();
         break;
@@ -245,7 +304,12 @@ class VitalsMonitorService extends ChangeNotifier {
   }
 
   /// Activates the spike alert and prepares context
-  void _triggerSpikeAlert(int currentPulse, {String? reason}) {
+  void _triggerSpikeAlert(
+    int currentPulse, {
+    String? reason,
+    String source = 'watch_sensor',
+    bool isSimulated = false,
+  }) {
     final VitalsThresholds doctorThresholds = _vaultService.getVitalsThresholds() ??
         const VitalsThresholds(
           minPessimumBpm: 45,
@@ -254,8 +318,18 @@ class VitalsMonitorService extends ChangeNotifier {
           clinicalRationale: "Default safety thresholds",
         );
 
+    // If a new workout starts during recovery of previous, close previous data collection cleanly
+    if (currentState == AlertState.postWorkoutRecovery && _currentSessionId != null) {
+      _vaultService.finishDataCollection(
+        sessionId: _currentSessionId!,
+        reason: 'interrupted_by_new_workout_session',
+      );
+    }
+
     // Workout start time is fixed at the EXACT moment the warning alert appears!
     _workoutStartTime = _timeService.now;
+    _anomalyDetectedTime = _workoutStartTime;
+    _currentSessionId = 'ws_${_workoutStartTime!.millisecondsSinceEpoch}';
     currentState = AlertState.waitingUserResponse;
 
     currentEvent = VitalsAlertContext(
@@ -268,7 +342,7 @@ class VitalsMonitorService extends ChangeNotifier {
 
     _lastRecordedTime = _workoutStartTime;
 
-    debugPrint("🚨 [VitalsMonitor]: SPIKE DETECTED ($reason)! Workout start marked at $_workoutStartTime. Transition to AlertState.waitingUserResponse.");
+    debugPrint("🚨 [VitalsMonitor]: SPIKE DETECTED ($reason)! Session: $_currentSessionId, Workout start marked at $_workoutStartTime. Transition to AlertState.waitingUserResponse.");
     notifyListeners();
   }
 
@@ -286,14 +360,32 @@ class VitalsMonitorService extends ChangeNotifier {
       // Workout confirmed -> switch to workout active mode
       currentState = AlertState.workoutActive;
       _workoutStartTime ??= currentEvent?.timestamp ?? _timeService.now;
+      _activityConfirmedTime = _timeService.now;
       _workoutEndTime = null;
-      _workoutPulseLog.clear();
+      _currentSessionId ??= 'ws_${_workoutStartTime!.millisecondsSinceEpoch}';
 
       // Record starting minute
-      _recordLog(_workoutStartTime!, _currentPulse, 'workout', 'Старт тренировки');
+      _recordLog(_workoutStartTime!, _currentPulse, 'workout', 'Старт тренировки', false, 'watch_sensor', _currentSessionId);
       _lastRecordedTime = _workoutStartTime;
 
-      debugPrint("🏃 [VitalsMonitor]: Workout confirmed! Start: $_workoutStartTime. Transition to AlertState.workoutActive.");
+      // Create permanent session in Vault
+      _vaultService.createWorkoutSession(
+        sessionId: _currentSessionId!,
+        anomalyDetectedAt: _anomalyDetectedTime ?? _workoutStartTime!,
+        activityConfirmedAt: _activityConfirmedTime!,
+        baselinePulse: _baselinePulse,
+        peakPulse: _currentPulse,
+        triggerReason: currentEvent?.thresholds.clinicalRationale ?? 'Threshold spike exceeded',
+        doctorThresholds: currentEvent?.thresholds.toJson() ?? {},
+        initialTimestamp: _workoutStartTime!,
+        initialPulse: _currentPulse,
+        initialPhase: 'workout',
+        initialSource: 'watch_sensor',
+        initialIsSimulated: false,
+        initialNote: 'Старт тренировки (алерт)',
+      );
+
+      debugPrint("🏃 [VitalsMonitor]: Workout confirmed! Session: $_currentSessionId, Start: $_workoutStartTime. Transition to AlertState.workoutActive.");
       notifyListeners();
     } else {
       currentState = AlertState.inChatWithAthena;
@@ -319,14 +411,34 @@ class VitalsMonitorService extends ChangeNotifier {
         ? _workoutEndTime!.difference(_workoutStartTime!)
         : Duration.zero;
 
+    if (_currentSessionId != null) {
+      _vaultService.completeWorkoutSession(
+        sessionId: _currentSessionId!,
+        workoutCompletedAt: _workoutEndTime!,
+      );
+
+      _vaultService.addHeartRateSample(
+        sessionId: _currentSessionId,
+        timestamp: _workoutEndTime!,
+        pulse: _currentPulse,
+        phase: 'recovery_0_10 (каждые 2 мин)',
+        source: 'watch_sensor',
+        isSimulated: false,
+        note: 'Тренировка завершена (${duration.inMinutes} мин)',
+      );
+    }
+
     _recordLog(
       _workoutEndTime!,
       _currentPulse,
       'recovery_0_10 (каждые 2 мин)',
       'Тренировка завершена (${duration.inMinutes} мин)',
+      false,
+      'watch_sensor',
+      _currentSessionId,
     );
 
-    debugPrint("🏁 [VitalsMonitor]: Workout ended at $_workoutEndTime. Duration: ${duration.inMinutes}m ${duration.inSeconds % 60}s. Switched to AlertState.postWorkoutRecovery.");
+    debugPrint("🏁 [VitalsMonitor]: Workout ended at $_workoutEndTime. Session: $_currentSessionId, Duration: ${duration.inMinutes}m ${duration.inSeconds % 60}s. Switched to AlertState.postWorkoutRecovery.");
     notifyListeners();
   }
 
@@ -343,25 +455,28 @@ class VitalsMonitorService extends ChangeNotifier {
       }
     }
 
-    // 2. Active workout phase: record minute-by-minute progression
-    if (currentState == AlertState.workoutActive && _workoutStartTime != null) {
+    // 2. Active workout phase: record missed sample gaps across time jumps (NO synthetic measurement fabrication!)
+    if (currentState == AlertState.workoutActive && _workoutStartTime != null && _currentSessionId != null) {
       final lastTime = _lastRecordedTime ?? _workoutStartTime!;
       final minutesElapsed = now.difference(lastTime).inMinutes;
 
-      if (minutesElapsed >= 1) {
-        // Record elapsed minutes explicitly marked as simulated
-        for (int m = 1; m <= minutesElapsed && m <= 60; m++) {
-          final entryTime = lastTime.add(Duration(minutes: m));
-          _recordLog(entryTime, _currentPulse, 'workout', 'simulated', true);
-        }
+      if (minutesElapsed > 1) {
+        _vaultService.recordMissedSamples(
+          sessionId: _currentSessionId!,
+          from: lastTime,
+          to: now,
+          expectedIntervalMinutes: 1,
+          missedCount: minutesElapsed - 1,
+          reason: 'time_jump_no_sensor_reading',
+        );
         _lastRecordedTime = now;
         notifyListeners();
       }
       return;
     }
 
-    // 3. Post-workout recovery phase: adaptive sampling (0-10m: 2m, 10-50m: 5m, 50m+: 10m)
-    if (currentState == AlertState.postWorkoutRecovery && _workoutEndTime != null) {
+    // 3. Post-workout recovery phase: adaptive sampling intervals and gap detection
+    if (currentState == AlertState.postWorkoutRecovery && _workoutEndTime != null && _currentSessionId != null) {
       // Check if pulse surged to 140+ during time jump
       if (_currentPulse >= 140) {
         _triggerSpikeAlert(_currentPulse, reason: "Скачок пульса после тренировки ($_currentPulse bpm)");
@@ -372,15 +487,29 @@ class VitalsMonitorService extends ChangeNotifier {
       final lastTime = _lastRecordedTime ?? _workoutEndTime!;
       final minutesElapsed = now.difference(lastTime).inMinutes;
 
-      if (minutesElapsed >= interval) {
-        final totalElapsedSinceEnd = now.difference(_workoutEndTime!).inMinutes;
-        final phase = totalElapsedSinceEnd < 10
-            ? 'recovery_0_10 (каждые 2 мин)'
-            : (totalElapsedSinceEnd < 50 ? 'recovery_10_50 (каждые 5 мин)' : 'standard (каждые 10 мин)');
-
-        _recordLog(now, _currentPulse, phase, 'simulated', true);
+      if (minutesElapsed > interval) {
+        final missedCount = (minutesElapsed / interval).floor() - 1;
+        if (missedCount > 0) {
+          _vaultService.recordMissedSamples(
+            sessionId: _currentSessionId!,
+            from: lastTime,
+            to: now,
+            expectedIntervalMinutes: interval,
+            missedCount: missedCount,
+            reason: 'time_jump_no_sensor_reading',
+          );
+        }
         _lastRecordedTime = now;
         notifyListeners();
+      }
+
+      // Check if recovery period elapsed (50+ min)
+      final totalElapsedSinceEnd = now.difference(_workoutEndTime!).inMinutes;
+      if (totalElapsedSinceEnd >= 50) {
+        _vaultService.finishDataCollection(
+          sessionId: _currentSessionId!,
+          reason: 'standard_recovery_period_completed',
+        );
       }
       return;
     }
@@ -405,19 +534,22 @@ class VitalsMonitorService extends ChangeNotifier {
     notifyListeners();
   }
 
-  /// Complete state reset to default
+  /// Complete state reset to default without deleting persistent workout history
   void reset() {
     currentState = AlertState.idle;
     currentEvent = null;
     _lastRecordedTime = null;
     _workoutStartTime = null;
     _workoutEndTime = null;
+    _anomalyDetectedTime = null;
+    _activityConfirmedTime = null;
+    _currentSessionId = null;
     _zeroPulseStartTime = null;
     criticalAnomalyReason = null;
-    _workoutPulseLog.clear();
+    // NOTE: We do NOT clear _workoutPulseLog and do NOT delete Vault history!
     _pulseBuffer.clear();
     _currentPulse = 70;
-    debugPrint("🔄 [VitalsMonitor]: Service completely reset to standby mode (AlertState.idle)");
+    debugPrint("🔄 [VitalsMonitor]: Service reset to standby mode (AlertState.idle). Workout history preserved.");
     notifyListeners();
   }
 

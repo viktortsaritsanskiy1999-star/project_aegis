@@ -6,7 +6,19 @@ class VaultService extends ChangeNotifier {
   // Your data for Atlas
   final Map<String, dynamic> _data = {
     "health_systems": {
-      "cvs": {"name": "Cardiovascular", "completeness": 0.0, "color": "0xFFFF0000", "markers": {}},
+      "cvs": {
+        "name": "Cardiovascular",
+        "completeness": 0.0,
+        "color": "0xFFFF0000",
+        "markers": {
+          "smart_watch": {
+            "workout_sessions": <Map<String, dynamic>>[],
+            "heart_rate_samples": <Map<String, dynamic>>[],
+            "workout_context": <String, dynamic>{},
+            "workout_analysis_reports": <Map<String, dynamic>>[],
+          }
+        }
+      },
       "gi_tract": {"name": "GI Tract", "completeness": 0.0, "color": "0xFFFFA500", "markers": {}},
       "respiratory": {"name": "Respiratory", "completeness": 0.0, "color": "0xFF00FFFF", "markers": {}},
       "nervous": {"name": "Nervous", "completeness": 0.0, "color": "0xFF8A2BE2", "markers": {}},
@@ -88,12 +100,19 @@ class VaultService extends ChangeNotifier {
 
   String? _selectedSystem;
 
+  Future<void>? _initFuture;
+  Future<void>? get initFuture => _initFuture;
+
   VaultService() {
-    _initVault();
+    _initFuture = _initVault();
   }
 
   Future<void> _initVault() async {
+    final inMemorySessions = getWorkoutSessions();
+    final inMemorySamples = getHeartRateSamples();
+
     final loadedData = await VaultStorageService.loadVault();
+    debugPrint("💾 [_initVault] completed, loaded: ${loadedData.keys}");
     if (loadedData.isNotEmpty) {
       if (loadedData.containsKey('health_systems')) {
         _data['health_systems'] = loadedData['health_systems'];
@@ -129,9 +148,31 @@ class VaultService extends ChangeNotifier {
       if (loadedData.containsKey('vitals_thresholds')) {
         _systemFolders['global']?['vitals_thresholds'] = loadedData['vitals_thresholds'];
       }
-
-      notifyListeners();
     }
+
+    _ensureSmartWatchStructure();
+
+    // Preserve any in-memory workout sessions/samples if created before storage finished loading
+    if (inMemorySessions.isNotEmpty) {
+      final sw = _smartWatchData;
+      final existingSessions = (sw['workout_sessions'] as List<dynamic>? ?? []).toList();
+      for (var s in inMemorySessions) {
+        if (!existingSessions.any((e) => e is Map && e['session_id'] == s['session_id'])) {
+          existingSessions.add(s);
+        }
+      }
+      sw['workout_sessions'] = existingSessions;
+    }
+    if (inMemorySamples.isNotEmpty) {
+      final sw = _smartWatchData;
+      final existingSamples = (sw['heart_rate_samples'] as List<dynamic>? ?? []).toList();
+      for (var s in inMemorySamples) {
+        existingSamples.add(s);
+      }
+      sw['heart_rate_samples'] = existingSamples;
+    }
+
+    notifyListeners();
   }
 
   void _persist() {
@@ -539,6 +580,406 @@ class VaultService extends ChangeNotifier {
     _data['health_systems'] = healthSystems;
 
     _mirrorToNotesExport('vitals_smart_watch', smartWatch);
+    _persist();
+    notifyListeners();
+  }
+
+  // ==========================================
+  // SMART WATCH WORKOUT STORAGE (CVS MARKERS)
+  // Section: health_systems -> cvs -> markers -> smart_watch
+  // ==========================================
+
+  void _ensureSmartWatchStructure() {
+    final healthSystems = Map<String, dynamic>.from(_data['health_systems'] ?? <String, dynamic>{});
+    final cvs = Map<String, dynamic>.from(healthSystems['cvs'] ?? <String, dynamic>{});
+    final markers = Map<String, dynamic>.from(cvs['markers'] ?? <String, dynamic>{});
+    final smartWatch = Map<String, dynamic>.from(markers['smart_watch'] ?? <String, dynamic>{});
+
+    smartWatch.putIfAbsent('workout_sessions', () => <Map<String, dynamic>>[]);
+    smartWatch.putIfAbsent('heart_rate_samples', () => <Map<String, dynamic>>[]);
+    smartWatch.putIfAbsent('workout_context', () => <String, dynamic>{});
+    smartWatch.putIfAbsent('workout_analysis_reports', () => <Map<String, dynamic>>[]);
+
+    markers['smart_watch'] = smartWatch;
+    cvs['markers'] = markers;
+    healthSystems['cvs'] = cvs;
+    _data['health_systems'] = healthSystems;
+  }
+
+  Map<String, dynamic> getSmartWatchData() {
+    _ensureSmartWatchStructure();
+    return _smartWatchData;
+  }
+
+  List<Map<String, dynamic>> getWorkoutSessions() {
+    _ensureSmartWatchStructure();
+    final sw = _smartWatchData;
+    final list = sw['workout_sessions'] as List<dynamic>? ?? [];
+    return list.map((e) => Map<String, dynamic>.from(e as Map)).toList();
+  }
+
+  Map<String, dynamic>? getWorkoutSession(String sessionId) {
+    final sessions = getWorkoutSessions();
+    for (var s in sessions) {
+      if (s['session_id'] == sessionId) {
+        return s;
+      }
+    }
+    return null;
+  }
+
+  List<Map<String, dynamic>> getHeartRateSamples({String? sessionId}) {
+    _ensureSmartWatchStructure();
+    final sw = _smartWatchData;
+    final list = sw['heart_rate_samples'] as List<dynamic>? ?? [];
+    final mapped = list.map((e) => Map<String, dynamic>.from(e as Map));
+    if (sessionId != null) {
+      return mapped.where((e) => e['session_id'] == sessionId).toList();
+    }
+    return mapped.toList();
+  }
+
+  Map<String, dynamic> getWorkoutContext() {
+    _ensureSmartWatchStructure();
+    final sw = _smartWatchData;
+    return Map<String, dynamic>.from(sw['workout_context'] as Map<String, dynamic>? ?? {});
+  }
+
+  List<Map<String, dynamic>> getWorkoutAnalysisReports({String? sessionId}) {
+    _ensureSmartWatchStructure();
+    final sw = _smartWatchData;
+    final list = sw['workout_analysis_reports'] as List<dynamic>? ?? [];
+    final mapped = list.map((e) => Map<String, dynamic>.from(e as Map));
+    if (sessionId != null) {
+      return mapped.where((e) => e['session_id'] == sessionId).toList();
+    }
+    return mapped.toList();
+  }
+
+  Map<String, dynamic>? getLatestWorkoutReport(String sessionId) {
+    final reports = getWorkoutAnalysisReports(sessionId: sessionId);
+    if (reports.isEmpty) return null;
+    reports.sort((a, b) => ((b['version'] as num?) ?? 0).compareTo((a['version'] as num?) ?? 0));
+    return reports.first;
+  }
+
+  void createWorkoutSession({
+    required String sessionId,
+    required DateTime anomalyDetectedAt,
+    required DateTime activityConfirmedAt,
+    int? baselinePulse,
+    int? peakPulse,
+    String? triggerReason,
+    Map<String, dynamic>? doctorThresholds,
+    DateTime? initialTimestamp,
+    int? initialPulse,
+    String? initialPhase,
+    String initialSource = 'watch_sensor',
+    bool initialIsSimulated = false,
+    String initialNote = '',
+  }) {
+    _ensureSmartWatchStructure();
+    final healthSystems = Map<String, dynamic>.from(_data['health_systems'] ?? <String, dynamic>{});
+    final cvs = Map<String, dynamic>.from(healthSystems['cvs'] ?? <String, dynamic>{});
+    final markers = Map<String, dynamic>.from(cvs['markers'] ?? <String, dynamic>{});
+    final smartWatch = Map<String, dynamic>.from(markers['smart_watch'] ?? <String, dynamic>{});
+    final List<dynamic> sessions = (smartWatch['workout_sessions'] as List<dynamic>? ?? []).toList();
+
+    final sessionContext = <String, dynamic>{
+      'baseline_pulse': baselinePulse,
+      'peak_pulse': peakPulse,
+      'trigger_reason': triggerReason,
+      'doctor_thresholds': doctorThresholds ?? <String, dynamic>{},
+      'activity_confirmed': true,
+      'confirmed_at': activityConfirmedAt.toIso8601String(),
+    };
+
+    final newSession = <String, dynamic>{
+      'session_id': sessionId,
+      'anomaly_detected_at': anomalyDetectedAt.toIso8601String(),
+      'activity_confirmed_at': activityConfirmedAt.toIso8601String(),
+      'workout_completed_at': null,
+      'physiological_end_time': null,
+      'status': 'active',
+      'is_data_collection_finished': false,
+      'workout_context': sessionContext,
+      'workout_samples': <Map<String, dynamic>>[],
+      'recovery_samples': <Map<String, dynamic>>[],
+      'missed_samples': <Map<String, dynamic>>[],
+      'reports': <Map<String, dynamic>>[],
+    };
+
+    sessions.add(newSession);
+    smartWatch['workout_sessions'] = sessions;
+    smartWatch['workout_context'] = sessionContext;
+
+    markers['smart_watch'] = smartWatch;
+    cvs['markers'] = markers;
+    healthSystems['cvs'] = cvs;
+    _data['health_systems'] = healthSystems;
+    debugPrint("💾 [createWorkoutSession] saved session count = ${sessions.length}, _data sessions = ${((_data['health_systems'] as Map)['cvs']['markers']['smart_watch']['workout_sessions'] as List).length}");
+
+    if (initialTimestamp != null && initialPulse != null) {
+      addHeartRateSample(
+        sessionId: sessionId,
+        timestamp: initialTimestamp,
+        pulse: initialPulse,
+        phase: initialPhase ?? 'workout',
+        source: initialSource,
+        isSimulated: initialIsSimulated,
+        note: initialNote,
+      );
+    } else {
+      _persist();
+      notifyListeners();
+    }
+  }
+
+  void addHeartRateSample({
+    String? sessionId,
+    required DateTime timestamp,
+    required int pulse,
+    required String phase,
+    String source = 'watch_sensor',
+    bool isSimulated = false,
+    String note = '',
+  }) {
+    _ensureSmartWatchStructure();
+    final healthSystems = Map<String, dynamic>.from(_data['health_systems'] ?? <String, dynamic>{});
+    final cvs = Map<String, dynamic>.from(healthSystems['cvs'] ?? <String, dynamic>{});
+    final markers = Map<String, dynamic>.from(cvs['markers'] ?? <String, dynamic>{});
+    final smartWatch = Map<String, dynamic>.from(markers['smart_watch'] ?? <String, dynamic>{});
+    final List<dynamic> samples = (smartWatch['heart_rate_samples'] as List<dynamic>? ?? []).toList();
+
+    final sampleJson = <String, dynamic>{
+      'timestamp': timestamp.toIso8601String(),
+      'pulse': pulse,
+      'phase': phase,
+      'source': source,
+      'is_simulated': isSimulated,
+      'note': note,
+    };
+    if (sessionId != null) {
+      sampleJson['session_id'] = sessionId;
+    }
+
+    samples.add(sampleJson);
+    smartWatch['heart_rate_samples'] = samples;
+
+    if (sessionId != null) {
+      final List<dynamic> sessions = (smartWatch['workout_sessions'] as List<dynamic>? ?? []).toList();
+      for (int i = 0; i < sessions.length; i++) {
+        final s = Map<String, dynamic>.from(sessions[i] as Map);
+        if (s['session_id'] == sessionId) {
+          if (phase.startsWith('recovery')) {
+            final recList = (s['recovery_samples'] as List<dynamic>? ?? []).toList();
+            recList.add(sampleJson);
+            s['recovery_samples'] = recList;
+          } else {
+            final wList = (s['workout_samples'] as List<dynamic>? ?? []).toList();
+            wList.add(sampleJson);
+            s['workout_samples'] = wList;
+          }
+          sessions[i] = s;
+          break;
+        }
+      }
+      smartWatch['workout_sessions'] = sessions;
+    }
+
+    markers['smart_watch'] = smartWatch;
+    cvs['markers'] = markers;
+    healthSystems['cvs'] = cvs;
+    _data['health_systems'] = healthSystems;
+
+    _persist();
+    notifyListeners();
+  }
+
+  void recordMissedSamples({
+    required String sessionId,
+    required DateTime from,
+    required DateTime to,
+    required int expectedIntervalMinutes,
+    required int missedCount,
+    String reason = 'time_jump_or_no_signal',
+  }) {
+    if (missedCount <= 0) return;
+    _ensureSmartWatchStructure();
+    final healthSystems = Map<String, dynamic>.from(_data['health_systems'] ?? <String, dynamic>{});
+    final cvs = Map<String, dynamic>.from(healthSystems['cvs'] ?? <String, dynamic>{});
+    final markers = Map<String, dynamic>.from(cvs['markers'] ?? <String, dynamic>{});
+    final smartWatch = Map<String, dynamic>.from(markers['smart_watch'] ?? <String, dynamic>{});
+    final List<dynamic> sessions = (smartWatch['workout_sessions'] as List<dynamic>? ?? []).toList();
+
+    for (int i = 0; i < sessions.length; i++) {
+      final s = Map<String, dynamic>.from(sessions[i] as Map);
+      if (s['session_id'] == sessionId) {
+        final missedList = (s['missed_samples'] as List<dynamic>? ?? []).toList();
+        missedList.add(<String, dynamic>{
+          'from': from.toIso8601String(),
+          'to': to.toIso8601String(),
+          'expected_interval_minutes': expectedIntervalMinutes,
+          'missed_count': missedCount,
+          'reason': reason,
+        });
+        s['missed_samples'] = missedList;
+        sessions[i] = s;
+        break;
+      }
+    }
+
+    smartWatch['workout_sessions'] = sessions;
+    markers['smart_watch'] = smartWatch;
+    cvs['markers'] = markers;
+    healthSystems['cvs'] = cvs;
+    _data['health_systems'] = healthSystems;
+
+    _persist();
+    notifyListeners();
+  }
+
+  void completeWorkoutSession({
+    required String sessionId,
+    required DateTime workoutCompletedAt,
+  }) {
+    _ensureSmartWatchStructure();
+    final healthSystems = Map<String, dynamic>.from(_data['health_systems'] ?? <String, dynamic>{});
+    final cvs = Map<String, dynamic>.from(healthSystems['cvs'] ?? <String, dynamic>{});
+    final markers = Map<String, dynamic>.from(cvs['markers'] ?? <String, dynamic>{});
+    final smartWatch = Map<String, dynamic>.from(markers['smart_watch'] ?? <String, dynamic>{});
+    final List<dynamic> sessions = (smartWatch['workout_sessions'] as List<dynamic>? ?? []).toList();
+
+    for (int i = 0; i < sessions.length; i++) {
+      final s = Map<String, dynamic>.from(sessions[i] as Map);
+      if (s['session_id'] == sessionId) {
+        s['workout_completed_at'] = workoutCompletedAt.toIso8601String();
+        s['status'] = 'recovering';
+        sessions[i] = s;
+        break;
+      }
+    }
+
+    smartWatch['workout_sessions'] = sessions;
+    markers['smart_watch'] = smartWatch;
+    cvs['markers'] = markers;
+    healthSystems['cvs'] = cvs;
+    _data['health_systems'] = healthSystems;
+
+    _persist();
+    notifyListeners();
+  }
+
+  void recordPhysiologicalEnd({
+    required String sessionId,
+    required DateTime physiologicalEndTime,
+  }) {
+    _ensureSmartWatchStructure();
+    final healthSystems = Map<String, dynamic>.from(_data['health_systems'] ?? <String, dynamic>{});
+    final cvs = Map<String, dynamic>.from(healthSystems['cvs'] ?? <String, dynamic>{});
+    final markers = Map<String, dynamic>.from(cvs['markers'] ?? <String, dynamic>{});
+    final smartWatch = Map<String, dynamic>.from(markers['smart_watch'] ?? <String, dynamic>{});
+    final List<dynamic> sessions = (smartWatch['workout_sessions'] as List<dynamic>? ?? []).toList();
+
+    for (int i = 0; i < sessions.length; i++) {
+      final s = Map<String, dynamic>.from(sessions[i] as Map);
+      if (s['session_id'] == sessionId) {
+        s['physiological_end_time'] = physiologicalEndTime.toIso8601String();
+        sessions[i] = s;
+        break;
+      }
+    }
+
+    smartWatch['workout_sessions'] = sessions;
+    markers['smart_watch'] = smartWatch;
+    cvs['markers'] = markers;
+    healthSystems['cvs'] = cvs;
+    _data['health_systems'] = healthSystems;
+
+    _persist();
+    notifyListeners();
+  }
+
+  void finishDataCollection({
+    required String sessionId,
+    String reason = 'recovery_period_elapsed',
+  }) {
+    _ensureSmartWatchStructure();
+    final healthSystems = Map<String, dynamic>.from(_data['health_systems'] ?? <String, dynamic>{});
+    final cvs = Map<String, dynamic>.from(healthSystems['cvs'] ?? <String, dynamic>{});
+    final markers = Map<String, dynamic>.from(cvs['markers'] ?? <String, dynamic>{});
+    final smartWatch = Map<String, dynamic>.from(markers['smart_watch'] ?? <String, dynamic>{});
+    final List<dynamic> sessions = (smartWatch['workout_sessions'] as List<dynamic>? ?? []).toList();
+
+    for (int i = 0; i < sessions.length; i++) {
+      final s = Map<String, dynamic>.from(sessions[i] as Map);
+      if (s['session_id'] == sessionId) {
+        s['is_data_collection_finished'] = true;
+        s['status'] = 'completed';
+        s['completion_reason'] = reason;
+        sessions[i] = s;
+        break;
+      }
+    }
+
+    smartWatch['workout_sessions'] = sessions;
+    markers['smart_watch'] = smartWatch;
+    cvs['markers'] = markers;
+    healthSystems['cvs'] = cvs;
+    _data['health_systems'] = healthSystems;
+
+    _persist();
+    notifyListeners();
+  }
+
+  void saveWorkoutReport({
+    required String sessionId,
+    Map<String, dynamic>? internalAnalysis,
+    Map<String, dynamic>? userWorkoutReport,
+    Map<String, dynamic>? athenaHandoff,
+  }) {
+    _ensureSmartWatchStructure();
+    final healthSystems = Map<String, dynamic>.from(_data['health_systems'] ?? <String, dynamic>{});
+    final cvs = Map<String, dynamic>.from(healthSystems['cvs'] ?? <String, dynamic>{});
+    final markers = Map<String, dynamic>.from(cvs['markers'] ?? <String, dynamic>{});
+    final smartWatch = Map<String, dynamic>.from(markers['smart_watch'] ?? <String, dynamic>{});
+    final List<dynamic> reports = (smartWatch['workout_analysis_reports'] as List<dynamic>? ?? []).toList();
+
+    final existingCount = reports.where((r) => r is Map && r['session_id'] == sessionId).length;
+    final int newVersion = existingCount + 1;
+
+    final reportMap = <String, dynamic>{
+      'report_id': 'rep_${sessionId}_v$newVersion',
+      'session_id': sessionId,
+      'version': newVersion,
+      'created_at': DateTime.now().toIso8601String(),
+      'internal_analysis': internalAnalysis,
+      'user_workout_report': userWorkoutReport,
+      'athena_handoff': athenaHandoff,
+    };
+
+    reports.add(reportMap);
+    smartWatch['workout_analysis_reports'] = reports;
+
+    final List<dynamic> sessions = (smartWatch['workout_sessions'] as List<dynamic>? ?? []).toList();
+    for (int i = 0; i < sessions.length; i++) {
+      final s = Map<String, dynamic>.from(sessions[i] as Map);
+      if (s['session_id'] == sessionId) {
+        final sessionReports = (s['reports'] as List<dynamic>? ?? []).toList();
+        sessionReports.add(reportMap);
+        s['reports'] = sessionReports;
+        sessions[i] = s;
+        break;
+      }
+    }
+    smartWatch['workout_sessions'] = sessions;
+
+    markers['smart_watch'] = smartWatch;
+    cvs['markers'] = markers;
+    healthSystems['cvs'] = cvs;
+    _data['health_systems'] = healthSystems;
+
+    _persist();
     notifyListeners();
   }
 
@@ -717,7 +1158,21 @@ class VaultService extends ChangeNotifier {
   }
 
   // 🗑️ Absolute reset of all device data and memory
-  Future<void> resetVault() async {
+  Future<void> resetVault({bool keepWorkoutHistory = true}) async {
+    List<dynamic> preservedWorkoutSessions = [];
+    List<dynamic> preservedHeartRateSamples = [];
+    Map<String, dynamic> preservedWorkoutContext = {};
+    List<dynamic> preservedWorkoutReports = [];
+
+    if (keepWorkoutHistory) {
+      _ensureSmartWatchStructure();
+      final sw = _smartWatchData;
+      preservedWorkoutSessions = (sw['workout_sessions'] as List<dynamic>? ?? []).toList();
+      preservedHeartRateSamples = (sw['heart_rate_samples'] as List<dynamic>? ?? []).toList();
+      preservedWorkoutContext = Map<String, dynamic>.from(sw['workout_context'] as Map<String, dynamic>? ?? {});
+      preservedWorkoutReports = (sw['workout_analysis_reports'] as List<dynamic>? ?? []).toList();
+    }
+
     _athenaClinicalLogs.clear();
     _systemFolders['global']?['athena_sprint_day'] = 1;
     _hasUnreadAthenaMessage = false;
@@ -728,7 +1183,19 @@ class VaultService extends ChangeNotifier {
     _data.clear();
     _data.addAll({
       "health_systems": {
-        "cvs": {"name": "Cardiovascular", "completeness": 0.0, "color": "0xFFFF0000", "markers": {}},
+        "cvs": {
+          "name": "Cardiovascular",
+          "completeness": 0.0,
+          "color": "0xFFFF0000",
+          "markers": {
+            "smart_watch": {
+              "workout_sessions": preservedWorkoutSessions,
+              "heart_rate_samples": preservedHeartRateSamples,
+              "workout_context": preservedWorkoutContext,
+              "workout_analysis_reports": preservedWorkoutReports,
+            }
+          }
+        },
         "gi_tract": {"name": "GI Tract", "completeness": 0.0, "color": "0xFFFFA500", "markers": {}},
         "respiratory": {"name": "Respiratory", "completeness": 0.0, "color": "0xFF00FFFF", "markers": {}},
         "nervous": {"name": "Nervous", "completeness": 0.0, "color": "0xFF8A2BE2", "markers": {}},
@@ -758,6 +1225,7 @@ class VaultService extends ChangeNotifier {
       'global': {'labs': <String, dynamic>{}},
       'training_sandbox': {'raw_predictions': [], 'missing_data': [], 'risk_analysis': "PENDING..."},
     });
+    _persist();
     notifyListeners();
   }
 

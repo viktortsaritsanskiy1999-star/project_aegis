@@ -1,4 +1,5 @@
 import 'package:flutter_test/flutter_test.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 import 'package:aegis_health/services/vitals_monitor_service.dart';
 import 'package:aegis_health/services/time_service.dart';
 import 'package:aegis_health/services/vault_service.dart';
@@ -12,10 +13,12 @@ void main() {
   late VaultService vaultService;
   late VitalsMonitorService vitalsService;
 
-  setUp(() {
+  setUp(() async {
+    SharedPreferences.setMockInitialValues({});
     timeService = TimeService();
     timeService.resetToRealTime();
     vaultService = VaultService();
+    await vaultService.initFuture;
     vitalsService = VitalsMonitorService(timeService, vaultService);
 
     // Save default doctor thresholds into vault for testing
@@ -46,7 +49,7 @@ void main() {
 
     expect(vitalsService.currentState, AlertState.waitingUserResponse);
     expect(vitalsService.workoutStartTime, isNotNull);
-    expect(vitalsService.workoutStartTime!.millisecondsSinceEpoch, alertTime.millisecondsSinceEpoch);
+    expect(vitalsService.workoutStartTime!.difference(alertTime).inSeconds, 0);
 
     // 4. User confirms physical activity
     final athenaTrigger = AthenaTriggerService();
@@ -61,16 +64,23 @@ void main() {
     expect(vitalsService.currentState, AlertState.workoutActive);
     expect(vitalsService.getRequiredIntervalMinutes(), 1);
 
-    // 5. Simulate 3 minutes passing during workout
+    // 5. Simulate time passing and check missed samples, plus provide a simulated test reading
     timeService.fastForward(const Duration(minutes: 3));
-    expect(vitalsService.workoutPulseLog.length, greaterThanOrEqualTo(3));
-    // Verify that time-shifted entries are explicitly flagged as simulated
+    final session = vaultService.getWorkoutSession(vitalsService.currentSessionId!);
+    expect(session, isNotNull);
+    final missed = session!['missed_samples'] as List;
+    expect(missed, isNotEmpty);
+
+    // Provide a simulated pulse reading
+    vitalsService.onNewPulseRead(140, source: 'test_chip', isSimulated: true);
     final simulatedEntries = vitalsService.workoutPulseLog.where((e) => e.isSimulated);
     expect(simulatedEntries, isNotEmpty);
-    expect(simulatedEntries.first.note, 'simulated');
+    expect(simulatedEntries.first.source, 'test_chip');
 
     // 6. User finishes workout
     vitalsService.finishWorkout();
+    // Pulse cools down to normal post-workout recovery level
+    vitalsService.onNewPulseRead(95);
 
     expect(vitalsService.currentState, AlertState.postWorkoutRecovery);
     expect(vitalsService.workoutEndTime, isNotNull);

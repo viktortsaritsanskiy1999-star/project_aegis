@@ -267,7 +267,7 @@ class _WorkoutSessionModalState extends State<WorkoutSessionModal> {
                                       onPressed: () {
                                         final val = int.tryParse(_customPulseController.text.trim());
                                         if (val != null) {
-                                          vitalsService.onNewPulseRead(val);
+                                          vitalsService.onNewPulseRead(val, source: 'manual_input', isSimulated: true);
                                           _customPulseController.clear();
                                         }
                                       },
@@ -437,7 +437,7 @@ class _WorkoutSessionModalState extends State<WorkoutSessionModal> {
 
   Widget _buildPulseChip(VitalsMonitorService service, int bpm, {bool isDanger = false}) {
     return InkWell(
-      onTap: () => service.onNewPulseRead(bpm),
+      onTap: () => service.onNewPulseRead(bpm, source: 'test_chip', isSimulated: true),
       borderRadius: BorderRadius.circular(8),
       child: Container(
         padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
