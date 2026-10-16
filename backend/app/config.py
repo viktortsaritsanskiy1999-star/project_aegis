@@ -6,6 +6,7 @@ class Settings(BaseSettings):
     """
     Project Aegis Backend Configuration managed via Pydantic v2 Settings.
     Reads from environment variables and optional .env file.
+    Does NOT contain working secret values by default.
     """
     model_config = SettingsConfigDict(
         env_file=".env",
@@ -23,8 +24,9 @@ class Settings(BaseSettings):
         default="sqlite:///./aegis_private_vault.db",
         alias="AEGIS_DATABASE_URL",
     )
+    # Security: No working default secret! Must be configured explicitly in .env
     api_secret: str = Field(
-        default="local_dev_device_token",
+        default="",
         alias="AEGIS_API_SECRET",
     )
     gemini_api_key: str = Field(

@@ -17,8 +17,9 @@ from app.models import Base
 # access to the values within the .ini file in use.
 config = context.config
 
-# Override sqlalchemy.url with runtime settings
-config.set_main_option("sqlalchemy.url", settings.database_url)
+# Override sqlalchemy.url with runtime settings if not explicitly provided
+if not config.get_main_option("sqlalchemy.url") or config.get_main_option("sqlalchemy.url") == "sqlite:///./aegis_private_vault.db":
+    config.set_main_option("sqlalchemy.url", settings.database_url)
 
 # Interpret the config file for Python logging.
 if config.config_file_name is not None:
@@ -43,8 +44,9 @@ def run_migrations_offline() -> None:
 
 def run_migrations_online() -> None:
     """Run migrations in 'online' mode."""
+    target_url = config.get_main_option("sqlalchemy.url") or settings.database_url
     configuration = config.get_section(config.config_ini_section, {})
-    configuration["sqlalchemy.url"] = settings.database_url
+    configuration["sqlalchemy.url"] = target_url
 
     connectable = engine_from_config(
         configuration,

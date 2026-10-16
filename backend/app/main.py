@@ -1,15 +1,14 @@
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from app.config import settings
-from app.database import engine
-from app.models.base import Base
-from app.routers.health import router as health_router
+from app.database import engine, init_db
+from app.routers import health_router, cycles_router, reports_router
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Auto-create tables for local development and test environment
-    Base.metadata.create_all(bind=engine)
+    # Initialize database using Alembic migrations (with safe in-memory/test fallback)
+    init_db(engine)
     yield
 
 
@@ -24,3 +23,5 @@ app = FastAPI(
 
 # Mount Routers
 app.include_router(health_router)
+app.include_router(cycles_router)
+app.include_router(reports_router)

@@ -10,12 +10,14 @@ from sqlalchemy.pool import StaticPool
 # Add backend directory to sys.path
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
+from app.config import settings
 from app.database import get_db
 from app.models.base import Base
 from app.main import app
 
 # In-memory SQLite for isolated test runs
 TEST_DATABASE_URL = "sqlite:///:memory:"
+TEST_API_SECRET = "test_device_secret_token_12345"
 
 test_engine = create_engine(
     TEST_DATABASE_URL,
@@ -28,6 +30,21 @@ TestingSessionLocal = sessionmaker(
     autoflush=False,
     bind=test_engine,
 )
+
+
+@pytest.fixture(scope="function", autouse=True)
+def configure_test_settings():
+    """Sets a deterministic non-empty test secret for authentication tests."""
+    original_secret = settings.api_secret
+    settings.api_secret = TEST_API_SECRET
+    yield
+    settings.api_secret = original_secret
+
+
+@pytest.fixture(scope="function")
+def auth_headers() -> dict[str, str]:
+    """Provides valid Bearer authentication headers for test client."""
+    return {"Authorization": f"Bearer {TEST_API_SECRET}"}
 
 
 @pytest.fixture(scope="function")
