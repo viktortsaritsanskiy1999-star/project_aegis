@@ -145,9 +145,11 @@ class VitalsMonitorService extends ChangeNotifier {
   /// Main entry method: called when a new pulse value arrives from the watch/panel/tests
   void onNewPulseRead(
     int newPulse, {
+    DateTime? timestamp,
     String source = 'watch_sensor',
     bool isSimulated = false,
   }) {
+    final DateTime effectiveTime = timestamp ?? _timeService.now;
     _currentPulse = newPulse;
 
     if (newPulse > 0) {
@@ -157,10 +159,10 @@ class VitalsMonitorService extends ChangeNotifier {
       }
     }
 
-    debugPrint("📥 [VitalsMonitor]: New pulse: $newPulse bpm (Buffer: ${_pulseBuffer.length}, State: $currentState, Source: $source, Simulated: $isSimulated)");
+    debugPrint("📥 [VitalsMonitor]: New pulse: $newPulse bpm at $effectiveTime (Buffer: ${_pulseBuffer.length}, State: $currentState, Source: $source, Simulated: $isSimulated)");
 
     // 1. Zero pulse check (sensor lost / detached anomaly)
-    _checkZeroPulseAnomaly(newPulse);
+    _checkZeroPulseAnomaly(newPulse, effectiveTime);
     if (currentState == AlertState.criticalAnomaly) {
       notifyListeners();
       return;
@@ -171,18 +173,18 @@ class VitalsMonitorService extends ChangeNotifier {
       case AlertState.idle:
       case AlertState.trackingInBackground:
         if (newPulse >= 140) {
-          _triggerSpikeAlert(newPulse, reason: "Высокий пульс ($newPulse bpm >= 140)", source: source, isSimulated: isSimulated);
+          _triggerSpikeAlert(newPulse, timestamp: effectiveTime, reason: "Высокий пульс ($newPulse bpm >= 140)", source: source, isSimulated: isSimulated);
         } else {
-          _analyzeForSpike(newPulse);
+          _analyzeForSpike(newPulse, timestamp: effectiveTime);
         }
         break;
 
       case AlertState.workoutActive:
-        _recordLog(_timeService.now, newPulse, 'workout', '', isSimulated, source, _currentSessionId);
+        _recordLog(effectiveTime, newPulse, 'workout', '', isSimulated, source, _currentSessionId);
         if (_currentSessionId != null) {
           _vaultService.addHeartRateSample(
             sessionId: _currentSessionId,
-            timestamp: _timeService.now,
+            timestamp: effectiveTime,
             pulse: newPulse,
             phase: 'workout',
             source: source,
@@ -196,26 +198,26 @@ class VitalsMonitorService extends ChangeNotifier {
         // Anomaly: Pulse 140+ during recovery triggers the alert cycle again!
         if (newPulse >= 140) {
           debugPrint("🚨 [VitalsMonitor]: Pulse $newPulse bpm >= 140 during recovery! Restarting alert cycle.");
-          _triggerSpikeAlert(newPulse, reason: "Скачок пульса после тренировки ($newPulse bpm)", source: source, isSimulated: isSimulated);
+          _triggerSpikeAlert(newPulse, timestamp: effectiveTime, reason: "Скачок пульса после тренировки ($newPulse bpm)", source: source, isSimulated: isSimulated);
           return;
         }
 
         // Check adaptive sampling interval
         final interval = getRequiredIntervalMinutes();
         if (_lastRecordedTime == null ||
-            _timeService.now.difference(_lastRecordedTime!).inMinutes >= interval) {
+            effectiveTime.difference(_lastRecordedTime!).inMinutes >= interval) {
           final elapsed = _workoutEndTime != null
-              ? _timeService.now.difference(_workoutEndTime!).inMinutes
+              ? effectiveTime.difference(_workoutEndTime!).inMinutes
               : 0;
           final phase = elapsed < 10
               ? 'recovery_0_10 (каждые 2 мин)'
               : (elapsed < 50 ? 'recovery_10_50 (каждые 5 мин)' : 'standard (каждые 10 мин)');
 
-          _recordLog(_timeService.now, newPulse, phase, '', isSimulated, source, _currentSessionId);
+          _recordLog(effectiveTime, newPulse, phase, '', isSimulated, source, _currentSessionId);
           if (_currentSessionId != null) {
             _vaultService.addHeartRateSample(
               sessionId: _currentSessionId,
-              timestamp: _timeService.now,
+              timestamp: effectiveTime,
               pulse: newPulse,
               phase: phase,
               source: source,
@@ -228,7 +230,7 @@ class VitalsMonitorService extends ChangeNotifier {
         if (newPulse <= (_baselinePulse * 1.15) && _currentSessionId != null) {
           _vaultService.recordPhysiologicalEnd(
             sessionId: _currentSessionId!,
-            physiologicalEndTime: _timeService.now,
+            physiologicalEndTime: effectiveTime,
           );
         }
         notifyListeners();
@@ -243,10 +245,11 @@ class VitalsMonitorService extends ChangeNotifier {
   }
 
   /// Checks if pulse has stayed at 0 bpm for 2 or more minutes
-  void _checkZeroPulseAnomaly(int pulse) {
+  void _checkZeroPulseAnomaly(int pulse, [DateTime? time]) {
+    final effectiveTime = time ?? _timeService.now;
     if (pulse == 0) {
-      _zeroPulseStartTime ??= _timeService.now;
-      final minutesZero = _timeService.now.difference(_zeroPulseStartTime!).inMinutes;
+      _zeroPulseStartTime ??= effectiveTime;
+      final minutesZero = effectiveTime.difference(_zeroPulseStartTime!).inMinutes;
       if (minutesZero >= 2) {
         _triggerCriticalAnomaly("Возможная потеря сигнала датчика: пульс 0 уд/мин зафиксирован в течение $minutesZero мин. Проверьте контакт устройства.");
       }
@@ -264,7 +267,7 @@ class VitalsMonitorService extends ChangeNotifier {
   }
 
   /// Sharp spike detection algorithm based on Chief Doctor thresholds
-  void _analyzeForSpike(int currentPulse) {
+  void _analyzeForSpike(int currentPulse, {DateTime? timestamp}) {
     final VitalsThresholds? doctorThresholds = _vaultService.getVitalsThresholds();
 
     if (doctorThresholds == null) {
@@ -298,6 +301,7 @@ class VitalsMonitorService extends ChangeNotifier {
     if (isSpike) {
       _triggerSpikeAlert(
         currentPulse,
+        timestamp: timestamp,
         reason: "Превышение порогов Главврача (Пик: $currentPulse, База: $_baselinePulse)",
       );
     }
@@ -306,6 +310,7 @@ class VitalsMonitorService extends ChangeNotifier {
   /// Activates the spike alert and prepares context
   void _triggerSpikeAlert(
     int currentPulse, {
+    DateTime? timestamp,
     String? reason,
     String source = 'watch_sensor',
     bool isSimulated = false,
@@ -327,7 +332,8 @@ class VitalsMonitorService extends ChangeNotifier {
     }
 
     // Workout start time is fixed at the EXACT moment the warning alert appears!
-    _workoutStartTime = _timeService.now;
+    final effectiveTime = timestamp ?? _timeService.now;
+    _workoutStartTime = effectiveTime;
     _anomalyDetectedTime = _workoutStartTime;
     _currentSessionId = 'ws_${_workoutStartTime!.millisecondsSinceEpoch}';
     currentState = AlertState.waitingUserResponse;

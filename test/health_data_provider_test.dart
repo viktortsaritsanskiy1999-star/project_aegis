@@ -43,7 +43,6 @@ void main() {
   });
 
   test('1. Explicit source tagging: manual_input is never tagged as watch_sensor', () async {
-    // Dispatch manual input
     await healthDataProvider.dispatchManualInput(
       pulse: 78,
       systolic: 125,
@@ -65,7 +64,7 @@ void main() {
     expect(vaultService.spo2, 98);
   });
 
-  test('2. Sources test_chip, simulated, and watch_sensor are strictly distinguished', () async {
+  test('2. Sources test_chip, simulated, watch_sensor, and unknown are strictly distinguished', () async {
     // 1. Test chip
     await healthDataProvider.dispatchTestChip(pulse: 145, note: 'Quick chip tap');
     expect(healthDataProvider.latestMeasurement!.source, HealthDataSource.testChip);
@@ -83,6 +82,11 @@ void main() {
     expect(healthDataProvider.latestMeasurement!.source, HealthDataSource.watchSensor);
     expect(healthDataProvider.latestMeasurement!.source.rawValue, 'watch_sensor');
     expect(healthDataProvider.latestMeasurement!.isSimulated, isFalse);
+
+    // 4. Unknown / invalid source is never defaulted to watch_sensor
+    final unknownSource = HealthDataSource.fromString('arbitrary_unknown_protocol');
+    expect(unknownSource, HealthDataSource.unknown);
+    expect(unknownSource.rawValue, 'unknown');
   });
 
   test('3. No duplicate storage: routes into existing SmartWatch Vault and VitalsMonitorService', () async {
@@ -118,8 +122,8 @@ void main() {
     final StreamController<HealthMeasurement> sensorStreamController =
         StreamController<HealthMeasurement>();
 
-    // Bind external async stream to HealthDataProvider
     healthDataProvider.bindSensorStream(sensorStreamController.stream);
+    expect(healthDataProvider.isSensorStreamBound, isTrue);
 
     final List<HealthMeasurement> receivedOnBroadcast = [];
     final subscription = healthDataProvider.vitalsStream.listen((m) {
@@ -138,7 +142,6 @@ void main() {
       source: HealthDataSource.watchSensor,
     ));
 
-    // Yield to event loop to allow async stream events to process
     await Future.delayed(const Duration(milliseconds: 20));
     expect(vitalsService.currentState, AlertState.idle);
 
@@ -151,7 +154,6 @@ void main() {
 
     await Future.delayed(const Duration(milliseconds: 20));
 
-    // Verify VitalsMonitorService intercepted the spike from async stream
     expect(vitalsService.currentState, AlertState.waitingUserResponse);
     expect(vitalsService.currentPulse, 142);
     expect(receivedOnBroadcast.length, 3);
@@ -160,29 +162,115 @@ void main() {
     await sensorStreamController.close();
   });
 
-  test('5. Batch ingestion processes historical readings in sequence', () async {
-    final now = DateTime.now();
-    final batch = [
+  test('5. Historical batch ingestion does NOT trigger current anomaly alarms or create workouts', () async {
+    expect(vitalsService.currentState, AlertState.idle);
+
+    final pastTime = DateTime.now().subtract(const Duration(hours: 3));
+    final historicalBatch = [
       HealthMeasurement(
-        timestamp: now.subtract(const Duration(minutes: 2)),
-        pulse: 71,
+        timestamp: pastTime,
+        pulse: 72,
         source: HealthDataSource.watchSensor,
+        isHistorical: true,
       ),
       HealthMeasurement(
-        timestamp: now.subtract(const Duration(minutes: 1)),
-        pulse: 73,
+        timestamp: pastTime.add(const Duration(minutes: 1)),
+        pulse: 155, // Spike in historical data!
         source: HealthDataSource.watchSensor,
+        isHistorical: true,
       ),
       HealthMeasurement(
-        timestamp: now,
-        pulse: 75,
+        timestamp: pastTime.add(const Duration(minutes: 2)),
+        pulse: 160, // Another spike in historical data!
         source: HealthDataSource.watchSensor,
+        isHistorical: true,
       ),
     ];
 
-    await healthDataProvider.ingestBatch(batch);
+    await healthDataProvider.ingestBatch(historicalBatch, asHistorical: true);
 
-    expect(healthDataProvider.latestMeasurement!.pulse, 75);
-    expect(vitalsService.currentPulse, 75);
+    // 1. VitalsMonitorService remains in idle state (no tachycardia alert triggered!)
+    expect(vitalsService.currentState, AlertState.idle);
+
+    // 2. No workout session is created from imported historical data
+    expect(vaultService.getWorkoutSessions(), isEmpty);
+
+    // 3. Samples are preserved in Vault under phase 'historical' for medical review
+    final samples = vaultService.getHeartRateSamples();
+    expect(samples, hasLength(3));
+    expect(samples[1]['pulse'], 155);
+    expect(samples[1]['phase'], 'historical');
+    expect(samples[1]['timestamp'], pastTime.add(const Duration(minutes: 1)).toIso8601String());
+  });
+
+  test('6. Timestamp propagation preserves original measurement timestamp vs ingested_at', () async {
+    final measuredAt = DateTime(2026, 10, 15, 14, 30, 0); // Past measurement time
+
+    final measurement = HealthMeasurement(
+      timestamp: measuredAt,
+      pulse: 88,
+      source: HealthDataSource.manualInput,
+      note: 'Doctor recorded yesterday',
+    );
+
+    await healthDataProvider.ingestMeasurement(measurement);
+
+    final samples = vaultService.getHeartRateSamples();
+    expect(samples, isNotEmpty);
+    final savedSample = samples.last;
+
+    // Measurement timestamp matches exactly measuredAt
+    expect(savedSample['timestamp'], measuredAt.toIso8601String());
+
+    // Ingested_at is recorded separately and reflects current ingestion
+    expect(savedSample['ingested_at'], isNotNull);
+    final ingestedTime = DateTime.parse(savedSample['ingested_at'] as String);
+    expect(ingestedTime.year, DateTime.now().year);
+    expect(savedSample['timestamp'], isNot(savedSample['ingested_at']));
+  });
+
+  test('7. Repeated bindSensorStream cancels old subscription and prevents duplicate event processing', () async {
+    final streamController1 = StreamController<HealthMeasurement>.broadcast();
+    final streamController2 = StreamController<HealthMeasurement>.broadcast();
+
+    int receivedEventsCount = 0;
+    final sub = healthDataProvider.vitalsStream.listen((_) {
+      receivedEventsCount++;
+    });
+
+    // 1. Bind first stream
+    healthDataProvider.bindSensorStream(streamController1.stream);
+    streamController1.add(HealthMeasurement(
+      timestamp: DateTime.now(),
+      pulse: 70,
+      source: HealthDataSource.watchSensor,
+    ));
+    await Future.delayed(const Duration(milliseconds: 20));
+    expect(receivedEventsCount, 1);
+
+    // 2. Re-bind to second stream (must cancel subscription to stream 1)
+    healthDataProvider.bindSensorStream(streamController2.stream);
+
+    // Event on old stream 1 must be ignored
+    streamController1.add(HealthMeasurement(
+      timestamp: DateTime.now(),
+      pulse: 72,
+      source: HealthDataSource.watchSensor,
+    ));
+    await Future.delayed(const Duration(milliseconds: 20));
+    expect(receivedEventsCount, 1); // Still 1! Old stream was successfully unsubscribed
+
+    // Event on new stream 2 is received exactly once
+    streamController2.add(HealthMeasurement(
+      timestamp: DateTime.now(),
+      pulse: 74,
+      source: HealthDataSource.watchSensor,
+    ));
+    await Future.delayed(const Duration(milliseconds: 20));
+    expect(receivedEventsCount, 2);
+
+    await sub.cancel();
+    await streamController1.close();
+    await streamController2.close();
   });
 }

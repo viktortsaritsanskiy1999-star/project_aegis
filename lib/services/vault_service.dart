@@ -743,6 +743,7 @@ class VaultService extends ChangeNotifier {
     String source = 'watch_sensor',
     bool isSimulated = false,
     String note = '',
+    DateTime? ingestedAt,
   }) {
     _ensureSmartWatchStructure();
     final healthSystems = Map<String, dynamic>.from(_data['health_systems'] ?? <String, dynamic>{});
@@ -753,6 +754,7 @@ class VaultService extends ChangeNotifier {
 
     final sampleJson = <String, dynamic>{
       'timestamp': timestamp.toIso8601String(),
+      'ingested_at': (ingestedAt ?? DateTime.now()).toIso8601String(),
       'pulse': pulse,
       'phase': phase,
       'source': source,

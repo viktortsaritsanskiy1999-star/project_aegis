@@ -8,7 +8,8 @@ enum HealthDataSource {
   watchSensor('watch_sensor'),
   manualInput('manual_input'),
   testChip('test_chip'),
-  simulated('simulated');
+  simulated('simulated'),
+  unknown('unknown'); // Safe distinct status for unknown or invalid sources
 
   final String rawValue;
   const HealthDataSource(this.rawValue);
@@ -22,15 +23,17 @@ enum HealthDataSource {
       case 'simulated':
         return HealthDataSource.simulated;
       case 'watch_sensor':
-      default:
         return HealthDataSource.watchSensor;
+      default:
+        return HealthDataSource.unknown;
     }
   }
 }
 
 /// Standardized model representing a single or multi-metric biometric measurement
 class HealthMeasurement {
-  final DateTime timestamp;
+  final DateTime timestamp; // Original measurement time
+  final DateTime ingestedAt; // When app received/ingested the data
   final int? pulse;
   final int? systolic;
   final int? diastolic;
@@ -38,11 +41,13 @@ class HealthMeasurement {
   final String? ecgStatus;
   final HealthDataSource source;
   final bool isSimulated;
+  final bool isHistorical;
   final String note;
   final Map<String, dynamic> metadata;
 
-  const HealthMeasurement({
+  HealthMeasurement({
     required this.timestamp,
+    DateTime? ingestedAt,
     this.pulse,
     this.systolic,
     this.diastolic,
@@ -50,12 +55,44 @@ class HealthMeasurement {
     this.ecgStatus,
     required this.source,
     this.isSimulated = false,
+    this.isHistorical = false,
     this.note = '',
     this.metadata = const {},
-  });
+  }) : ingestedAt = ingestedAt ?? DateTime.now();
+
+  HealthMeasurement copyWith({
+    DateTime? timestamp,
+    DateTime? ingestedAt,
+    int? pulse,
+    int? systolic,
+    int? diastolic,
+    int? spo2,
+    String? ecgStatus,
+    HealthDataSource? source,
+    bool? isSimulated,
+    bool? isHistorical,
+    String? note,
+    Map<String, dynamic>? metadata,
+  }) {
+    return HealthMeasurement(
+      timestamp: timestamp ?? this.timestamp,
+      ingestedAt: ingestedAt ?? this.ingestedAt,
+      pulse: pulse ?? this.pulse,
+      systolic: systolic ?? this.systolic,
+      diastolic: diastolic ?? this.diastolic,
+      spo2: spo2 ?? this.spo2,
+      ecgStatus: ecgStatus ?? this.ecgStatus,
+      source: source ?? this.source,
+      isSimulated: isSimulated ?? this.isSimulated,
+      isHistorical: isHistorical ?? this.isHistorical,
+      note: note ?? this.note,
+      metadata: metadata ?? this.metadata,
+    );
+  }
 
   Map<String, dynamic> toJson() => {
     'timestamp': timestamp.toIso8601String(),
+    'ingested_at': ingestedAt.toIso8601String(),
     if (pulse != null) 'pulse': pulse,
     if (systolic != null) 'systolic': systolic,
     if (diastolic != null) 'diastolic': diastolic,
@@ -63,12 +100,14 @@ class HealthMeasurement {
     if (ecgStatus != null) 'ecg_status': ecgStatus,
     'source': source.rawValue,
     'is_simulated': isSimulated,
+    'is_historical': isHistorical,
     'note': note,
     if (metadata.isNotEmpty) 'metadata': metadata,
   };
 
   factory HealthMeasurement.fromJson(Map<String, dynamic> json) => HealthMeasurement(
     timestamp: DateTime.tryParse(json['timestamp']?.toString() ?? '') ?? DateTime.now(),
+    ingestedAt: DateTime.tryParse(json['ingested_at']?.toString() ?? '') ?? DateTime.now(),
     pulse: (json['pulse'] as num?)?.toInt(),
     systolic: (json['systolic'] as num?)?.toInt(),
     diastolic: (json['diastolic'] as num?)?.toInt(),
@@ -76,6 +115,7 @@ class HealthMeasurement {
     ecgStatus: json['ecg_status']?.toString(),
     source: HealthDataSource.fromString(json['source']?.toString()),
     isSimulated: json['is_simulated'] == true,
+    isHistorical: json['is_historical'] == true,
     note: json['note']?.toString() ?? '',
     metadata: Map<String, dynamic>.from(json['metadata'] as Map? ?? {}),
   );
@@ -98,6 +138,9 @@ class HealthDataProvider extends ChangeNotifier {
   /// Asynchronous broadcast stream for future smartwatch sensors and UI listeners
   Stream<HealthMeasurement> get vitalsStream => _vitalsStreamController.stream;
 
+  /// Checks whether an external sensor stream is currently bound
+  bool get isSensorStreamBound => _activeSensorSubscription != null;
+
   HealthDataProvider({
     required VaultService vaultService,
     required VitalsMonitorService vitalsMonitorService,
@@ -113,22 +156,43 @@ class HealthDataProvider extends ChangeNotifier {
     _vitalsMonitorService = vitalsMonitorService;
   }
 
-  /// Core ingestion pipeline for all incoming biometric measurements
+  /// Core ingestion pipeline for incoming biometric measurements
   Future<void> ingestMeasurement(HealthMeasurement measurement) async {
+    // If tagged as historical data, route directly to historical ingestion
+    if (measurement.isHistorical) {
+      await ingestHistoricalMeasurement(measurement);
+      return;
+    }
+
     _latestMeasurement = measurement;
 
-    // 1. Broadcast to any active async stream subscribers
+    // 1. Broadcast live measurement to any active async stream subscribers
     if (!_vitalsStreamController.isClosed) {
       _vitalsStreamController.add(measurement);
     }
 
-    // 2. Route pulse into VitalsMonitorService (for threshold analysis, workout tracking, anomaly detection)
+    // 2. Route live pulse into VitalsMonitorService (with exact measurement timestamp)
     if (measurement.pulse != null) {
       _vitalsMonitorService.onNewPulseRead(
         measurement.pulse!,
+        timestamp: measurement.timestamp, // Original measurement timestamp
         source: measurement.source.rawValue,
         isSimulated: measurement.isSimulated,
       );
+
+      // If in standby/idle mode, persist the pulse sample to SmartWatch Vault heart_rate_samples
+      if (_vitalsMonitorService.currentState == AlertState.idle ||
+          _vitalsMonitorService.currentState == AlertState.trackingInBackground) {
+        _vaultService.addHeartRateSample(
+          timestamp: measurement.timestamp,
+          ingestedAt: measurement.ingestedAt,
+          pulse: measurement.pulse!,
+          phase: 'standby',
+          source: measurement.source.rawValue,
+          isSimulated: measurement.isSimulated,
+          note: measurement.note,
+        );
+      }
     }
 
     // 3. Update top-level smart watch metrics in VaultService if pressure, SpO2, or ECG are present
@@ -149,14 +213,50 @@ class HealthDataProvider extends ChangeNotifier {
     notifyListeners();
   }
 
-  /// Ingest a batch of measurements asynchronously (e.g. historical sync from watch)
-  Future<void> ingestBatch(List<HealthMeasurement> batch) async {
+  /// Ingest an individual historical measurement directly into SmartWatch Vault
+  /// Preserves measurement timestamp without launching current tachycardia alarms or workouts
+  Future<void> ingestHistoricalMeasurement(HealthMeasurement measurement) async {
+    // 1. Broadcast to any subscribers interested in historical stream
+    if (!_vitalsStreamController.isClosed) {
+      _vitalsStreamController.add(measurement);
+    }
+
+    // 2. Persist to VaultService's smart_watch heart_rate_samples directly for analytical review
+    if (measurement.pulse != null) {
+      _vaultService.addHeartRateSample(
+        timestamp: measurement.timestamp, // Preserves original timestamp
+        ingestedAt: measurement.ingestedAt, // App receipt timestamp
+        pulse: measurement.pulse!,
+        phase: 'historical',
+        source: measurement.source.rawValue,
+        isSimulated: measurement.isSimulated,
+        note: measurement.note.isNotEmpty ? measurement.note : 'historical_import',
+      );
+    }
+
+    notifyListeners();
+  }
+
+  /// Ingest a batch of measurements asynchronously.
+  /// By default, batches are treated as historical data (asHistorical: true) so they are
+  /// preserved for medical review without launching current alarms or re-creating workouts.
+  Future<void> ingestBatch(
+    List<HealthMeasurement> batch, {
+    bool asHistorical = true,
+  }) async {
     for (final measurement in batch) {
-      await ingestMeasurement(measurement);
+      if (asHistorical || measurement.isHistorical) {
+        await ingestHistoricalMeasurement(
+          measurement.isHistorical ? measurement : measurement.copyWith(isHistorical: true),
+        );
+      } else {
+        await ingestMeasurement(measurement);
+      }
     }
   }
 
-  /// Bind an external asynchronous stream of measurements (e.g. future smartwatch Privileged SDK or mock stream)
+  /// Bind an external asynchronous stream of measurements (e.g. future smartwatch Privileged SDK or mock stream).
+  /// Cancels previous active subscription to prevent duplicate processing.
   void bindSensorStream(Stream<HealthMeasurement> stream) {
     _activeSensorSubscription?.cancel();
     _activeSensorSubscription = stream.listen(
