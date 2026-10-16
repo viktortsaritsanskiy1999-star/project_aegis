@@ -14,6 +14,7 @@ import 'package:aegis_health/services/vitals_monitor_service.dart';
 import 'package:aegis_health/widgets/vitals_activity_check_modal.dart';
 import 'widgets/workout_session_modal.dart';
 import 'widgets/emergency_medical_modal.dart';
+import 'services/health_data_provider.dart';
 
 void main() => runApp(
   MultiProvider(
@@ -43,6 +44,22 @@ void main() => runApp(
         ),
         update: (context, timeService, vaultService, previous) =>
         previous!..updateTimeService(timeService),
+      ),
+
+      // 🔗 HealthDataProvider: Universal health data ingestion
+      ChangeNotifierProxyProvider2<VaultService, VitalsMonitorService, HealthDataProvider>(
+        create: (context) => HealthDataProvider(
+          vaultService: context.read<VaultService>(),
+          vitalsMonitorService: context.read<VitalsMonitorService>(),
+        ),
+        update: (context, vaultService, vitalsService, previous) =>
+            (previous ?? HealthDataProvider(
+              vaultService: vaultService,
+              vitalsMonitorService: vitalsService,
+            ))..updateDependencies(
+              vaultService: vaultService,
+              vitalsMonitorService: vitalsService,
+            ),
       ),
     ],
     child: const AegisApp(),
@@ -1406,19 +1423,17 @@ class VitalsHeaderCard extends StatelessWidget {
                   ),
                   onPressed: () {
                     final int? pulse = int.tryParse(pulseController.text);
+                    final int? sys = int.tryParse(sysController.text);
+                    final int? dia = int.tryParse(diaController.text);
+                    final int? spo2 = int.tryParse(spo2Controller.text);
 
-                    vault.updateSmartWatchMetrics(
-                      systolic: int.tryParse(sysController.text),
-                      diastolic: int.tryParse(diaController.text),
+                    // 🚀 Dispatch manual vitals entry via HealthDataProvider
+                    context.read<HealthDataProvider>().dispatchManualInput(
                       pulse: pulse,
-                      spo2: int.tryParse(spo2Controller.text),
-                      ecgSummary: vault.ecgSummary,
+                      systolic: sys,
+                      diastolic: dia,
+                      spo2: spo2,
                     );
-
-                    // 🚀 Trigger tachycardia check service
-                    if (pulse != null) {
-                      context.read<VitalsMonitorService>().onNewPulseRead(pulse);
-                    }
 
                     Navigator.pop(context);
                   },
