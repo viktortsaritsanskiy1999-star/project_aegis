@@ -12,6 +12,16 @@ from app.services.gemini_gateway import (
     GeminiValidationError,
     GeminiTransientError,
 )
+from app.services.primary_consilium_service import (
+    PrimaryConsiliumService,
+    ConsiliumError,
+    ConsiliumCycleNotFoundError,
+    ConsiliumContextMissingError,
+    ConsiliumQualityRejectionError,
+    PREPARATORY_ANAMNESIS_REPORT_TYPE,
+    PREPARATORY_OCR_REPORT_TYPE,
+    PREPARATORY_ECG_REPORT_TYPE,
+)
 
 __all__ = [
     "create_sqlite_backup",
@@ -24,4 +34,12 @@ __all__ = [
     "GeminiAuthOrBillingError",
     "GeminiValidationError",
     "GeminiTransientError",
+    "PrimaryConsiliumService",
+    "ConsiliumError",
+    "ConsiliumCycleNotFoundError",
+    "ConsiliumContextMissingError",
+    "ConsiliumQualityRejectionError",
+    "PREPARATORY_ANAMNESIS_REPORT_TYPE",
+    "PREPARATORY_OCR_REPORT_TYPE",
+    "PREPARATORY_ECG_REPORT_TYPE",
 ]

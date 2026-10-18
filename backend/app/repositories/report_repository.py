@@ -54,6 +54,7 @@ class ModelReportRepository:
         sprint_id: Optional[str] = None,
         session_id: Optional[str] = None,
         created_at: Optional[datetime] = None,
+        commit: bool = True,
     ) -> ModelReport:
         validated_privacy = self._validate_privacy_level(privacy_level)
 
@@ -86,8 +87,11 @@ class ModelReportRepository:
             created_at=now,
         )
         self.db.add(report)
-        self.db.commit()
-        self.db.refresh(report)
+        if commit:
+            self.db.commit()
+            self.db.refresh(report)
+        else:
+            self.db.flush()
         return report
 
     def get_latest_version_number(
@@ -119,6 +123,7 @@ class ModelReportRepository:
         sprint_id: Optional[str] = None,
         session_id: Optional[str] = None,
         created_at: Optional[datetime] = None,
+        commit: bool = True,
     ) -> ModelReport:
         """
         Safely creates the next sequential version (v1, v2, v3...) of a report
@@ -160,6 +165,7 @@ class ModelReportRepository:
             sprint_id=sprint_id,
             session_id=session_id,
             created_at=created_at,
+            commit=commit,
         )
 
     def list_versions(

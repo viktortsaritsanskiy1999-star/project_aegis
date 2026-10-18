@@ -2,7 +2,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from app.config import settings
 from app.database import engine, init_db
-from app.routers import health_router, cycles_router, reports_router
+from app.routers import health_router, cycles_router, reports_router, cascade_router
 
 
 @asynccontextmanager
@@ -25,3 +25,4 @@ app = FastAPI(
 app.include_router(health_router)
 app.include_router(cycles_router)
 app.include_router(reports_router)
+app.include_router(cascade_router)
