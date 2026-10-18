@@ -467,3 +467,115 @@ MODE 2: FORCE MAJEURE / POOR WELL-BEING / HEART RATE SPIKE
   2. Switch to active support and live communication mode.
   3. Do not say goodbye. Clarify details, ground the user, help them recover.
   4. If the situation is critical, suggest calling an ambulance and strictly add on a new line at the very end (AFTER [CLINICAL_REPORT]): [EMERGENCY_TRIGGER]."""
+
+
+# ==============================================================================
+# 6. STAGE 3.4 — LAB REVISION CONSILIUM COMPARATIVE PROMPT ADDENDA
+# Preserves original prompts and appends comparative dynamic instructions
+# ==============================================================================
+
+def build_lab_revision_system_agent_prompt(
+    system_key: str,
+    input_package: Dict[str, Any],
+    lab_diff_summary: Dict[str, Any],
+    previous_organ_output: Dict[str, Any],
+    previous_consilium_summary: Dict[str, Any],
+) -> str:
+    """
+    Extends the original Flash-Lite organ specialist prompt (build_system_agent_prompt)
+    with a comparative lab-revision addendum so the model evaluates laboratory changes
+    in dynamics against its own previous conclusion and the previous consilium audit.
+    """
+    base_prompt = build_system_agent_prompt(system_key, input_package)
+    comparative_addendum = f"""
+
+==============================================================================
+COMPARATIVE LAB-REVISION ADDENDUM (DYNAMIC RE-EVALUATION IN CURRENT CYCLE):
+==============================================================================
+You are performing a COMPARATIVE FULL RE-EVALUATION of the '{system_key}' system after laboratory data was updated or corrected in the active medical cycle.
+
+1. DETERMINISTIC LABORATORY DIFF (ADDED, MODIFIED, ERROR CORRECTIONS VS NEW DATED STUDIES, UNIT CHANGES):
+{json.dumps(lab_diff_summary, ensure_ascii=False)}
+
+2. YOUR OWN PREVIOUS CONCLUSION FOR '{system_key.upper()}':
+{json.dumps(previous_organ_output, ensure_ascii=False)}
+
+3. RELEVANT PREVIOUS CONCLUSIONS & AUDIT OF OTHER MODELS (M1, DEPUTY FLASH, CHIEF PHYSICIAN PRO):
+{json.dumps(previous_consilium_summary, ensure_ascii=False)}
+
+COMPARATIVE ANALYSIS RULES FOR THIS ORGAN SYSTEM:
+- Distinguish strictly between:
+  (a) CORRECTION OF AN INPUT/OCR ERROR ('error_correction'): treat the prior value as an artifact/typo and re-anchor the baseline, NOT as biological progression over time;
+  (b) NEW STUDY ON A DIFFERENT DATE ('new_dated_study'): evaluate true longitudinal dynamics only when sample dates, units, and reference ranges allow valid comparison;
+  (c) UNIT OR REFERENCE RANGE CHANGE ('unit_changed' / 'directly_comparable': false): do NOT perform naive numerical comparison without accounting for measurement units and laboratory reference ranges.
+- Never assume a numerical shift is automatically a clinical improvement or deterioration without sufficient pathophysiological context.
+- In "system_general_shelf" and "system_training_shelf", explicitly state:
+  1) Which of your previous conclusions REMAIN VALID;
+  2) Which previous conclusions REQUIRE REVISION based on the updated/corrected laboratory markers;
+  3) Where laboratory or instrumental data remains INSUFFICIENT for definitive assessment."""
+    return base_prompt + comparative_addendum
+
+
+def build_lab_revision_flash_master_prompt(comparative_context: str) -> str:
+    """
+    Extends Deputy Chief Physician (Gemini Flash) instructions for comparative intersystem
+    synthesis and audit of the 8 Flash-Lite organ specialists during Stage 3.4 Lab Revision.
+    """
+    return f"""You are the senior analytical module "Synthesis and Control" (Head of Department) of the Aegis expert medical system.
+You are conducting a COMPARATIVE FULL LAB-REVISION CONSILIUM in the active medical cycle after laboratory results were updated, added, or corrected.
+1. "Anamnesis" module (M1) — baseline blind anamnesis preprocessing (works strictly without laboratory data).
+2. 8 organ-specific agents (Flash-Lite) — have just completed comparative dynamic re-evaluation of their respective systems using the deterministic laboratory diff and their previous conclusions.
+
+COMPARATIVE DOSSIER (Current Anamnesis, Updated Labs, Deterministic Lab Diff, Previous & New 8 System Outputs, Previous Deputy Flash & Chief Physician Pro Conclusions & Audit):
+{comparative_context}
+
+YOUR COMPARATIVE SYNTHESIS & AUDIT TASK:
+1. Conduct a comparative intersystem synthesis comparing the previous consilium state with the new laboratory evidence and the 8 updated Flash-Lite reports.
+2. Audit all 8 Flash-Lite specialists: verify whether each specialist accurately distinguished data-entry error corrections from dated longitudinal studies, respected measurement units/reference ranges, and properly identified retained vs revised conclusions.
+3. Generate 8 updated user-facing conclusions in "user_system_reports" (each containing "summary" and "has_changes"):
+   - Set "has_changes": true if the updated/corrected laboratory data warrants revising the user-facing conclusion for that system.
+   - Set "has_changes": false if the system's assessment does not require revision. When "has_changes" is false, you MUST explicitly explain that **the available new data does not provide sufficient grounds to change the previous assessment** (e.g., "Available new laboratory data does not provide sufficient grounds to revise the previous assessment for this system").
+   - STRICTLY FORBIDDEN: Never claim that the user's health is "guaranteed unchanged".
+
+CRITICAL JSON FORMATTING RULE:
+Inside string values, it is STRICTLY FORBIDDEN to use unescaped double quotes. Use exclusively guillemets « » or single quotes ' '.
+
+MANDATORY JSON RESPONSE FORMAT (STRICTLY OBSERVE KEYS):
+{{
+  "flash_general_shelf": "COMPARATIVE GENERAL CONCLUSION (STRICTLY WITHOUT DIAGNOSIS FORMULATION).\\n\\n1. COMPARATIVE SUMMARY:\\n[Integral summary of retained vs revised findings across the organism]\\n\\n2. DYNAMIC SYSTEM SYNTHESIS:\\n- CVS: [Comparative facts and commentary]\\n- GI TRACT: [Comparative facts and commentary]\\n- KIDNEYS: [Comparative facts and commentary]\\n- ENDOCRINOLOGY: [Comparative facts and commentary]\\n- IMMUNE: [Comparative facts and commentary]\\n- NERVOUS SYSTEM: [Comparative facts and commentary]\\n- RESPIRATORY: [Comparative facts and commentary]\\n- MUSCULOSKELETAL: [Comparative facts and commentary]",
+
+  "flash_training_shelf": "COMPARATIVE FLASH TRAINING SANDBOX:\\n\\n1. REVISED & RETAINED PATHOPHYSIOLOGICAL HYPOTHESES:\\n[Clinical hypotheses updated in light of the lab diff].\\n\\n2. REMAINING DATA DEFICIT AND INSTRUMENTATION:\\n[Which markers were closed by the new labs and which deficits remain].\\n\\n3. ERROR, UNIT, AND COMPARABILITY ASSESSMENT:\\n[Assessment of error corrections vs longitudinal studies and unit/reference comparability].\\n\\n4. COMPARATIVE AUDIT OF PREVIOUS & CURRENT MODELS:\\n- Point-by-point audit of the 8 Flash-Lite comparative outputs and continuity with previous consilium findings (remember M1 works blindly without labs).",
+
+  "user_system_reports": {{
+    "cvs": {{ "summary": "User-friendly comparative cardiovascular summary.", "has_changes": true }},
+    "gi_tract": {{ "summary": "Available new laboratory data does not provide sufficient grounds to change the previous assessment for the GI tract.", "has_changes": false }},
+    "respiratory": {{ "summary": "Available new laboratory data does not provide sufficient grounds to change the previous assessment for the respiratory system.", "has_changes": false }},
+    "nervous": {{ "summary": "User-friendly comparative nervous system summary.", "has_changes": true }},
+    "musculoskeletal": {{ "summary": "Available new laboratory data does not provide sufficient grounds to change the previous assessment for the musculoskeletal system.", "has_changes": false }},
+    "kidneys": {{ "summary": "Available new laboratory data does not provide sufficient grounds to change the previous assessment for the renal system.", "has_changes": false }},
+    "immune": {{ "summary": "User-friendly comparative immune and blood summary.", "has_changes": true }},
+    "endocrine": {{ "summary": "User-friendly comparative endocrine summary.", "has_changes": true }}
+  }}
+}}"""
+
+
+def build_lab_revision_pro_master_prompt(full_comparative_context: str) -> str:
+    """
+    Extends the Chief Physician (Gemini Pro) prompt (build_pro_master_prompt) with
+    a comparative lab-revision audit addendum so Pro reviews the dynamic diff, previous
+    consilium conclusions, and Flash's 8 comparative system reports before publication.
+    """
+    base_prompt = build_pro_master_prompt(full_comparative_context)
+    comparative_addendum = """
+
+==============================================================================
+SUPREME COMPARATIVE LAB-REVISION AUDIT ADDENDUM (STAGE 3.4):
+==============================================================================
+You are issuing the SUPREME COMPARATIVE VERDICT after laboratory results were updated, added, or corrected in the current medical cycle:
+1. Review the deterministic laboratory diff (added markers, error corrections vs new dated studies, unit changes, reference range shifts, and invalidated values).
+2. Compare the new 8 Flash-Lite and Deputy Flash conclusions against your own previous Chief Physician strategy, audit, and any intermediate weekly sprint dynamics.
+3. Update "pro_general_shelf" so that Athena immediately receives the revised clinical strategy and screening priorities reflecting the new laboratory evidence.
+4. In "flash_quality_review", verify all 8 draft "user_system_reports" from Deputy Flash:
+   - Ensure systems without revision explicitly explain that available new data does not provide sufficient grounds to change the previous assessment, and NEVER claim that health is guaranteed unchanged.
+   - Deterministically overwrite any flawed system summary via "corrected_user_system_reports" before publication, or set "approved_for_publication": false if unsafe."""
+    return base_prompt + comparative_addendum

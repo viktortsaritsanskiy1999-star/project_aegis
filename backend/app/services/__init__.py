@@ -31,6 +31,13 @@ from app.services.weekly_consilium_service import (
     WEEKLY_CHIEF_INTERNAL_REPORT_TYPE,
     WEEKLY_OVERALL_CLIENT_REPORT_TYPE,
 )
+from app.services.lab_revision_consilium_service import (
+    LabRevisionConsiliumService,
+    ConsiliumCooldownError,
+    LABORATORY_LEDGER_REPORT_TYPE,
+    LABORATORY_DIFF_AUDIT_REPORT_TYPE,
+    LAB_REVISION_EXECUTION_LOG_REPORT_TYPE,
+)
 
 __all__ = [
     "create_sqlite_backup",
@@ -45,10 +52,12 @@ __all__ = [
     "GeminiTransientError",
     "PrimaryConsiliumService",
     "WeeklyConsiliumService",
+    "LabRevisionConsiliumService",
     "ConsiliumError",
     "ConsiliumCycleNotFoundError",
     "ConsiliumContextMissingError",
     "ConsiliumQualityRejectionError",
+    "ConsiliumCooldownError",
     "PREPARATORY_ANAMNESIS_REPORT_TYPE",
     "PREPARATORY_OCR_REPORT_TYPE",
     "PREPARATORY_ECG_REPORT_TYPE",
@@ -58,4 +67,7 @@ __all__ = [
     "WEEKLY_DEPUTY_INTERNAL_REPORT_TYPE",
     "WEEKLY_CHIEF_INTERNAL_REPORT_TYPE",
     "WEEKLY_OVERALL_CLIENT_REPORT_TYPE",
+    "LABORATORY_LEDGER_REPORT_TYPE",
+    "LABORATORY_DIFF_AUDIT_REPORT_TYPE",
+    "LAB_REVISION_EXECUTION_LOG_REPORT_TYPE",
 ]

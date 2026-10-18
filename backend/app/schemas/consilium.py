@@ -535,3 +535,321 @@ class WeeklyConsiliumClientResponse(BaseModel):
     report_date: str
     overall_report: ClientModelReportResponse
     system_reports: Dict[str, ClientModelReportResponse]
+
+
+# =====================================================================
+# 7. STAGE 3.4 — LAB REVISION CONSILIUM & VERSIONED LAB LEDGER SCHEMAS
+# =====================================================================
+
+LAB_REVISION_COOLDOWN_HOURS: int = 168
+
+MEDICAL_SAFETY_COOLDOWN_NOTICE: str = (
+    "IMPORTANT MEDICAL NOTICE: AI re-evaluation cooldown applies only to automated "
+    "consilium recalculation. If any laboratory values show potentially dangerous "
+    "deviations or if you experience concerning symptoms, seek in-person medical "
+    "attention immediately rather than waiting for the AI cooldown to expire."
+)
+
+_INSUFFICIENT_GROUNDS_SUBSTRINGS: tuple[str, ...] = (
+    "sufficient grounds",
+    "insufficient grounds",
+    "do not provide grounds",
+    "does not provide grounds",
+    "no grounds to revise",
+    "no basis to change",
+    "no basis to revise",
+    "insufficient new data",
+    "не дают достаточных оснований",
+    "недостаточно оснований",
+    "не дают оснований",
+    "недостаточно данных для пересмотра",
+)
+
+
+def validate_lab_revision_unchanged_explanation(
+    text: str, has_changes: bool, field_label: str = "Lab revision system summary"
+) -> str:
+    cleaned = validate_no_guaranteed_unchanged_claim(text, field_label)
+    if not has_changes:
+        lower = cleaned.lower()
+        if not any(phrase in lower for phrase in _INSUFFICIENT_GROUNDS_SUBSTRINGS):
+            raise ValueError(
+                f"{field_label} with has_changes=False must explicitly explain that "
+                "available new data does not provide sufficient grounds to change the previous assessment."
+            )
+    return cleaned
+
+
+class LabEventType(str, Enum):
+    """
+    Distinguishes between:
+    - initial: baseline laboratory entry;
+    - new_study: new laboratory test result from another sample date;
+    - correction: correction of a previously entered erroneous value (without erasing the old record);
+    - invalidated: marking a prior observation as erroneous/removed while keeping it in history.
+    """
+    INITIAL = "initial"
+    NEW_STUDY = "new_study"
+    CORRECTION = "correction"
+    INVALIDATED = "invalidated"
+
+
+class LabReferenceRange(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    low: Optional[float] = None
+    high: Optional[float] = None
+    text: Optional[str] = Field(default=None, max_length=128)
+
+
+class LabObservationEntry(BaseModel):
+    """
+    Immutable single observation record in the server-side laboratory ledger.
+    Previous records are never overwritten in place; corrections create a new entry
+    referencing `supersedes_observation_id` while the original entry stays in history
+    with `is_active=False`.
+    """
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    observation_id: str = Field(..., min_length=3, max_length=64)
+    marker_key: str = Field(..., min_length=1, max_length=64)
+    display_name: str = Field(..., min_length=1, max_length=128)
+    value: Optional[float | int | str] = None
+    numeric_value: Optional[float] = None
+    unit: Optional[str] = Field(default=None, max_length=64)
+    sample_date: Optional[str] = Field(default=None, max_length=32)
+    reference_range: Optional[LabReferenceRange] = None
+    event_type: LabEventType = Field(default=LabEventType.INITIAL)
+    supersedes_observation_id: Optional[str] = Field(default=None, max_length=64)
+    superseded_by_observation_id: Optional[str] = Field(default=None, max_length=64)
+    correction_reason: Optional[str] = Field(default=None, max_length=256)
+    is_active: bool = Field(default=True)
+    is_critical_flag: bool = Field(default=False)
+    recorded_at: str = Field(..., min_length=1, max_length=64)
+
+
+class LabMarkerMutationItem(BaseModel):
+    """
+    Single laboratory mutation submitted by the user or preparatory pipeline.
+    Supports adding a new marker, recording a new study with a different sample_date,
+    correcting an erroneous old value, or invalidating an erroneous entry.
+    """
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    marker_key: str = Field(..., min_length=1, max_length=64)
+    display_name: Optional[str] = Field(default=None, max_length=128)
+    event_type: LabEventType = Field(default=LabEventType.NEW_STUDY)
+    value: Optional[float | int | str] = None
+    unit: Optional[str] = Field(default=None, max_length=64)
+    sample_date: Optional[str] = Field(default=None, max_length=32)
+    reference_range: Optional[LabReferenceRange] = None
+    supersedes_observation_id: Optional[str] = Field(default=None, max_length=64)
+    correction_reason: Optional[str] = Field(default=None, max_length=256)
+    is_critical_flag: bool = Field(default=False)
+
+    @model_validator(mode="after")
+    def validate_mutation_fields(self) -> "LabMarkerMutationItem":
+        if self.event_type != LabEventType.INVALIDATED:
+            if self.value is None or (isinstance(self.value, str) and not self.value.strip()):
+                raise ValueError(
+                    f"Laboratory marker '{self.marker_key}' with event_type='{self.event_type.value}' "
+                    "requires a non-empty value."
+                )
+        return self
+
+
+class LabLedgerUpsertRequest(BaseModel):
+    """
+    Request to save new or edited laboratory markers in the current medical cycle.
+    Saving laboratory data is always allowed immediately with zero cooldown.
+    """
+    model_config = ConfigDict(extra="forbid")
+
+    cycle_id: str = Field(..., min_length=3, max_length=64)
+    mutations: List[LabMarkerMutationItem] = Field(..., min_length=1)
+
+
+class LabLedgerStateResponse(BaseModel):
+    """
+    Client-safe view of the versioned laboratory ledger and its AI evaluation status.
+    Explicitly indicates when new/edited laboratory values have not yet been evaluated
+    by a new Full Consilium version, so old AI conclusions are never mistaken for
+    an analysis of the new unreviewed labs.
+    """
+    model_config = ConfigDict(extra="forbid")
+
+    cycle_id: str
+    ledger_version: int = Field(..., ge=0)
+    last_evaluated_ledger_version: int = Field(..., ge=0)
+    has_unreviewed_lab_changes: bool
+    evaluation_status: str
+    evaluation_notice: str
+    has_critical_flags: bool = Field(default=False)
+    safety_notice: str = Field(default=MEDICAL_SAFETY_COOLDOWN_NOTICE)
+    active_markers: Dict[str, LabObservationEntry] = Field(default_factory=dict)
+    observations_history: List[LabObservationEntry] = Field(default_factory=list)
+
+
+class LabDiffItem(BaseModel):
+    """
+    Deterministic comparison entry for a single laboratory marker before running
+    the Full Lab-Revision Consilium.
+    Never labels a numeric shift as a clinical improvement or deterioration without context.
+    """
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    marker_key: str
+    display_name: str
+    change_type: str
+    previous_observation_id: Optional[str] = None
+    new_observation_id: Optional[str] = None
+    previous_value: Optional[float | int | str] = None
+    new_value: Optional[float | int | str] = None
+    previous_unit: Optional[str] = None
+    new_unit: Optional[str] = None
+    previous_sample_date: Optional[str] = None
+    new_sample_date: Optional[str] = None
+    previous_reference_range: Optional[LabReferenceRange] = None
+    new_reference_range: Optional[LabReferenceRange] = None
+    directly_comparable: bool = Field(default=True)
+    comparability_note: str
+    neutral_summary: str
+
+
+class LaboratoryDiffReport(BaseModel):
+    """
+    Complete deterministic diff between the previously evaluated laboratory state
+    and the current laboratory ledger. Stored as a server_only audit record.
+    """
+    model_config = ConfigDict(extra="forbid")
+
+    cycle_id: str
+    baseline_ledger_version: int
+    target_ledger_version: int
+    generated_at_utc: str
+    added_markers: List[LabDiffItem] = Field(default_factory=list)
+    modified_values: List[LabDiffItem] = Field(default_factory=list)
+    corrected_error_values: List[LabDiffItem] = Field(default_factory=list)
+    new_dated_studies: List[LabDiffItem] = Field(default_factory=list)
+    unit_changed_markers: List[LabDiffItem] = Field(default_factory=list)
+    removed_or_invalidated_markers: List[LabDiffItem] = Field(default_factory=list)
+    unchanged_markers: List[LabDiffItem] = Field(default_factory=list)
+
+
+class LabRevisionSystemUpdateItem(BaseModel):
+    """
+    Single dated user-facing update for one of the 8 Atlas systems generated during
+    the Full Lab-Revision Consilium.
+    - When has_changes is False, summary must explicitly explain that available new
+      data does not provide sufficient grounds to change the previous assessment,
+      and must never claim that health is guaranteed unchanged.
+    """
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    summary: str = Field(..., min_length=1)
+    has_changes: bool = Field(default=True)
+
+    @model_validator(mode="after")
+    def verify_summary_rules(self) -> "LabRevisionSystemUpdateItem":
+        self.summary = validate_lab_revision_unchanged_explanation(
+            self.summary,
+            self.has_changes,
+            "Lab revision system summary",
+        )
+        return self
+
+
+class LabRevisionUserSystemReportsMap(BaseModel):
+    """
+    8 separate dated user-facing system conclusions generated by Deputy Chief Physician (Flash)
+    during the Full Lab-Revision Consilium. All 8 systems are strictly required.
+    """
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    cvs: LabRevisionSystemUpdateItem
+    gi_tract: LabRevisionSystemUpdateItem
+    respiratory: LabRevisionSystemUpdateItem
+    nervous: LabRevisionSystemUpdateItem
+    musculoskeletal: LabRevisionSystemUpdateItem
+    kidneys: LabRevisionSystemUpdateItem
+    immune: LabRevisionSystemUpdateItem
+    endocrine: LabRevisionSystemUpdateItem
+
+    @model_validator(mode="after")
+    def verify_all_eight_systems_present(self) -> "LabRevisionUserSystemReportsMap":
+        for key in SYSTEM_KEYS:
+            item = getattr(self, key, None)
+            if not isinstance(item, LabRevisionSystemUpdateItem) or not item.summary.strip():
+                raise ValueError(
+                    f"Incomplete lab revision user_system_reports: system '{key}' must be present and non-empty."
+                )
+        return self
+
+    def to_dict(self) -> Dict[str, Dict[str, Any]]:
+        return {key: getattr(self, key).model_dump() for key in SYSTEM_KEYS}
+
+
+class LabRevisionFlashMasterOutput(BaseModel):
+    """
+    Structured output contract for Deputy Chief Physician (Flash) during Full Lab-Revision Consilium:
+    - flash_general_shelf (server_only comparative intersystem synthesis)
+    - flash_training_shelf (server_only clinical hypotheses, deficits, comparative audit of 8 models)
+    - user_system_reports (8 dated user-facing organ reports to be verified by Pro)
+    """
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    flash_general_shelf: str = Field(..., min_length=1)
+    flash_training_shelf: str = Field(..., min_length=1)
+    user_system_reports: LabRevisionUserSystemReportsMap
+
+
+class LabRevisionCooldownStatus(BaseModel):
+    """
+    Authoritative server-time cooldown status for user-initiated Full Lab-Revision Consilium (168 hours).
+    """
+    model_config = ConfigDict(extra="forbid")
+
+    cycle_id: str
+    cooldown_hours: int = Field(default=LAB_REVISION_COOLDOWN_HOURS)
+    is_allowed: bool
+    remaining_seconds: int = Field(default=0, ge=0)
+    remaining_hours: float = Field(default=0.0, ge=0.0)
+    last_completed_at_utc: Optional[str] = None
+    next_available_at_utc: Optional[str] = None
+    has_unreviewed_lab_changes: bool = Field(default=False)
+    evaluation_status: str = Field(default="evaluated")
+    message: str
+    safety_notice: str = Field(default=MEDICAL_SAFETY_COOLDOWN_NOTICE)
+
+
+class LabRevisionConsiliumRunRequest(BaseModel):
+    """
+    Request to trigger the user-initiated Full Lab-Revision Consilium
+    (8 Gemini Flash-Lite -> Gemini Flash -> Gemini Pro) in the current medical cycle.
+    Subject to the server-side 168-hour cooldown between successful full revisions.
+    """
+    model_config = ConfigDict(extra="forbid")
+
+    cycle_id: str = Field(..., min_length=3, max_length=64)
+    report_date: Optional[str] = Field(
+        default=None,
+        max_length=32,
+        description="Optional ISO date string (YYYY-MM-DD) for user-facing dated entries (never used for cooldown calculation).",
+    )
+
+
+class LabRevisionConsiliumClientResponse(BaseModel):
+    """
+    Strict client-facing response returned after successful Full Lab-Revision Consilium completion.
+    Contains ONLY verified user reports, numeric vitals thresholds, and evaluation/cooldown status.
+    """
+    model_config = ConfigDict(extra="forbid")
+
+    cycle_id: str
+    report_date: str
+    evaluated_ledger_version: int
+    evaluation_status: str
+    overall_report: ClientModelReportResponse
+    system_reports: Dict[str, ClientModelReportResponse]
+    vitals_thresholds: ClientVitalsThresholds
+    cooldown: LabRevisionCooldownStatus

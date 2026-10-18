@@ -1,4 +1,6 @@
-from fastapi import APIRouter, Depends, HTTPException, status
+from datetime import datetime, timezone
+from typing import Callable
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.orm import Session
 
 from app.database import get_db
@@ -7,6 +9,11 @@ from app.schemas.consilium import (
     PrimaryConsiliumClientResponse,
     WeeklyConsiliumRunRequest,
     WeeklyConsiliumClientResponse,
+    LabLedgerUpsertRequest,
+    LabLedgerStateResponse,
+    LabRevisionCooldownStatus,
+    LabRevisionConsiliumRunRequest,
+    LabRevisionConsiliumClientResponse,
 )
 from app.security.auth import verify_client_token
 from app.services.gemini_gateway import GeminiGateway, GeminiGatewayError
@@ -18,6 +25,10 @@ from app.services.primary_consilium_service import (
     ConsiliumQualityRejectionError,
 )
 from app.services.weekly_consilium_service import WeeklyConsiliumService
+from app.services.lab_revision_consilium_service import (
+    LabRevisionConsiliumService,
+    ConsiliumCooldownError,
+)
 
 router = APIRouter(prefix="/api/v1/cascade", tags=["Medical Consilium Cascade"])
 
@@ -25,6 +36,11 @@ router = APIRouter(prefix="/api/v1/cascade", tags=["Medical Consilium Cascade"])
 def get_gemini_gateway() -> GeminiGateway:
     """Dependency provider for GeminiGateway (overrideable in tests)."""
     return GeminiGateway()
+
+
+def get_server_now_provider() -> Callable[[], datetime]:
+    """Dependency provider for authoritative server UTC clock (overrideable in tests)."""
+    return lambda: datetime.now(timezone.utc)
 
 
 @router.post(
@@ -118,4 +134,140 @@ async def run_weekly_consilium_endpoint(
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail=f"Gemini weekly cascade execution failed: {exc}",
+        )
+
+
+@router.post(
+    "/labs/upsert",
+    response_model=LabLedgerStateResponse,
+    summary="Add, update, or correct laboratory markers in the current medical cycle (no cooldown)",
+    description=(
+        "Saves new laboratory markers, new dated studies, or error corrections as a new "
+        "immutable ledger version without erasing historical observations. "
+        "Saving laboratory data is always allowed immediately with zero cooldown."
+    ),
+)
+def upsert_laboratory_markers_endpoint(
+    payload: LabLedgerUpsertRequest,
+    db: Session = Depends(get_db),
+    now_provider: Callable[[], datetime] = Depends(get_server_now_provider),
+    _token: str = Depends(verify_client_token),
+) -> LabLedgerStateResponse:
+    service = LabRevisionConsiliumService(db=db, now_provider=now_provider)
+    try:
+        return service.upsert_laboratory_markers(
+            cycle_id=payload.cycle_id,
+            mutations=payload.mutations,
+        )
+    except ConsiliumCycleNotFoundError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=str(exc),
+        )
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(exc),
+        )
+
+
+@router.get(
+    "/labs/state",
+    response_model=LabLedgerStateResponse,
+    summary="Get versioned laboratory ledger state and AI evaluation status",
+)
+def get_laboratory_ledger_state_endpoint(
+    cycle_id: str = Query(..., min_length=3, max_length=64),
+    db: Session = Depends(get_db),
+    now_provider: Callable[[], datetime] = Depends(get_server_now_provider),
+    _token: str = Depends(verify_client_token),
+) -> LabLedgerStateResponse:
+    service = LabRevisionConsiliumService(db=db, now_provider=now_provider)
+    try:
+        return service.get_lab_ledger_state(cycle_id=cycle_id)
+    except ConsiliumCycleNotFoundError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=str(exc),
+        )
+
+
+@router.get(
+    "/lab-revision-cooldown",
+    response_model=LabRevisionCooldownStatus,
+    summary="Check the 168-hour cooldown status for Full Lab-Revision Consilium",
+)
+def get_lab_revision_cooldown_endpoint(
+    cycle_id: str = Query(..., min_length=3, max_length=64),
+    db: Session = Depends(get_db),
+    now_provider: Callable[[], datetime] = Depends(get_server_now_provider),
+    _token: str = Depends(verify_client_token),
+) -> LabRevisionCooldownStatus:
+    service = LabRevisionConsiliumService(db=db, now_provider=now_provider)
+    try:
+        return service.get_cooldown_status(cycle_id=cycle_id)
+    except ConsiliumCycleNotFoundError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=str(exc),
+        )
+
+
+@router.post(
+    "/run-lab-revision",
+    response_model=LabRevisionConsiliumClientResponse,
+    summary="Execute Full Lab-Revision Consilium (8 Flash-Lite -> Deputy Flash -> Chief Physician Pro)",
+    description=(
+        "Executes the comparative Full Lab-Revision Consilium after laboratory data changes. "
+        "Enforces a strict 168-hour server-time cooldown between successful user-initiated "
+        "full revisions (independent of the 7-day Weekly Consilium). Returns 429 with remaining "
+        "wait time and medical safety notice if blocked by cooldown without calling Gemini."
+    ),
+)
+async def run_lab_revision_consilium_endpoint(
+    payload: LabRevisionConsiliumRunRequest,
+    db: Session = Depends(get_db),
+    gateway: GeminiGateway = Depends(get_gemini_gateway),
+    now_provider: Callable[[], datetime] = Depends(get_server_now_provider),
+    _token: str = Depends(verify_client_token),
+) -> LabRevisionConsiliumClientResponse:
+    service = LabRevisionConsiliumService(
+        db=db,
+        gateway=gateway,
+        now_provider=now_provider,
+    )
+    try:
+        return await service.run_lab_revision_consilium(
+            cycle_id=payload.cycle_id,
+            report_date=payload.report_date,
+        )
+    except ConsiliumCooldownError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail=exc.cooldown_status.model_dump(),
+        )
+    except ConsiliumCycleNotFoundError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=str(exc),
+        )
+    except ConsiliumContextMissingError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=str(exc),
+        )
+    except ConsiliumQualityRejectionError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=str(exc),
+        )
+    except ConsiliumError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(exc),
+        )
+    except GeminiGatewayError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Gemini lab-revision cascade execution failed: {exc}",
         )

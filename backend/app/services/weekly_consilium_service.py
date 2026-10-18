@@ -476,10 +476,16 @@ class WeeklyConsiliumService:
                 "('deputy_chief_physician_internal' and 'chief_physician_internal') has not been completed yet."
             )
 
-        pro_primary = pro_primary_list[0].content or {}
-        flash_primary = flash_primary_list[0].content or {}
+        pro_latest = pro_primary_list[0].content or {}
+        flash_latest = flash_primary_list[0].content or {}
+        pro_initial = pro_primary_list[-1].content or {}
+        flash_initial = flash_primary_list[-1].content or {}
 
-        # Check if prior weekly sprints exist
+        # Check if prior weekly sprints or active strategy versions exist
+        strategy_reports = self.report_repo.list_server_only(
+            cycle_id=cycle_id,
+            report_type=ATHENA_ACTIVE_STRATEGY_REPORT_TYPE,
+        )
         prior_weekly_flash = self.report_repo.list_server_only(
             cycle_id=cycle_id,
             report_type=WEEKLY_DEPUTY_INTERNAL_REPORT_TYPE,
@@ -489,21 +495,31 @@ class WeeklyConsiliumService:
             report_type=WEEKLY_CHIEF_INTERNAL_REPORT_TYPE,
         )
 
-        latest_flash_general = (
-            str(prior_weekly_flash[0].content.get("weekly_deputy_analysis", ""))
-            if prior_weekly_flash
-            else str(flash_primary.get("flash_general_shelf", ""))
-        )
-        latest_flash_training = str(flash_primary.get("flash_training_shelf", ""))
+        if strategy_reports:
+            latest_strat_c = strategy_reports[0].content or {}
+            latest_pro_strategy = str(
+                latest_strat_c.get("active_strategy_text")
+                or pro_latest.get("pro_general_shelf", "")
+            )
+            latest_flash_general = str(
+                latest_strat_c.get("deputy_synthesis_text")
+                or flash_latest.get("flash_general_shelf", "")
+            )
+        else:
+            latest_flash_general = (
+                str(prior_weekly_flash[0].content.get("weekly_deputy_analysis", ""))
+                if prior_weekly_flash
+                else str(flash_latest.get("flash_general_shelf", ""))
+            )
+            latest_pro_strategy = (
+                str(prior_weekly_pro[0].content.get("updated_weekly_strategy", ""))
+                if prior_weekly_pro
+                else str(pro_latest.get("pro_general_shelf", ""))
+            )
+        latest_flash_training = str(flash_latest.get("flash_training_shelf", ""))
+        latest_pro_training = str(pro_latest.get("pro_training_shelf", ""))
 
-        latest_pro_strategy = (
-            str(prior_weekly_pro[0].content.get("updated_weekly_strategy", ""))
-            if prior_weekly_pro
-            else str(pro_primary.get("pro_general_shelf", ""))
-        )
-        latest_pro_training = str(pro_primary.get("pro_training_shelf", ""))
-
-        # Load stored 8 organ specialist conclusions from Primary Consilium (read-only, never re-invoked)
+        # Load stored 8 organ specialist conclusions from latest full consilium (Primary or Lab-Revision; read-only)
         organ_summaries: List[str] = []
         for system_key in SYSTEM_KEYS:
             role_val = AegisAgentRole.for_system_key(system_key).value
@@ -557,6 +573,27 @@ class WeeklyConsiliumService:
             else {}
         )
 
+        # Prefer the latest evaluated laboratory_ledger version (if a Full Lab-Revision Consilium completed)
+        # so stale OCR values never reappear after a lab revision, while unreviewed pending edits are not
+        # prematurely treated as evaluated by the full consilium.
+        lab_exec_logs = self.report_repo.list_server_only(
+            cycle_id=cycle_id,
+            report_type="lab_revision_execution_log",
+        )
+        if lab_exec_logs:
+            eval_ver = int((lab_exec_logs[0].content or {}).get("evaluated_ledger_version", 0))
+            if eval_ver > 0:
+                ledger_versions = self.report_repo.list_versions(
+                    cycle_id=cycle_id,
+                    report_type="laboratory_ledger",
+                    privacy_level=PrivacyLevel.SERVER_ONLY,
+                )
+                for l_rep in ledger_versions:
+                    l_ver = int((l_rep.content or {}).get("ledger_version", l_rep.version))
+                    if l_ver == eval_ver:
+                        shared_labs = (l_rep.content or {}).get("shared_labs_table", shared_labs)
+                        break
+
         initial_context_lines = [
             "=== ANAMNESIS AND INPUT DATA ===",
             json.dumps(
@@ -594,9 +631,9 @@ class WeeklyConsiliumService:
             "initial_context": "\n".join(initial_context_lines),
             "latest_pro_strategy": latest_pro_strategy,
             "latest_pro_training": latest_pro_training,
-            "primary_flash_general": str(flash_primary.get("flash_general_shelf", "")),
-            "primary_pro_general": str(pro_primary.get("pro_general_shelf", "")),
-            "primary_pro_training": str(pro_primary.get("pro_training_shelf", "")),
+            "primary_flash_general": str(flash_initial.get("flash_general_shelf", "")),
+            "primary_pro_general": str(pro_initial.get("pro_general_shelf", "")),
+            "primary_pro_training": str(pro_initial.get("pro_training_shelf", "")),
         }
 
     # ==========================================================================
