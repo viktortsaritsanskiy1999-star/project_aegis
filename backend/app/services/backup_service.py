@@ -8,15 +8,19 @@ from app.config import settings
 logger = logging.getLogger("aegis.backup")
 
 
+from urllib.parse import unquote
+
+
 def get_sqlite_path(database_url: str) -> Optional[Path]:
     """Extracts the local file path from a SQLAlchemy SQLite connection URL."""
     if not database_url.startswith("sqlite:"):
         return None
-    # Strip sqlite:/// prefix
-    clean_url = database_url.replace("sqlite:///", "")
-    if clean_url == ":memory:":
+    # Strip sqlite:/// prefix and unquote URL-encoded Windows separators (%3A, %5C)
+    clean_url = unquote(database_url.replace("sqlite:///", "", 1))
+    if not clean_url or clean_url == ":memory:" or ":memory:" in clean_url:
         return None
     return Path(clean_url).resolve()
+
 
 
 def create_sqlite_backup(

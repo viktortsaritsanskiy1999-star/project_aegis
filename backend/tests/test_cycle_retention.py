@@ -118,3 +118,86 @@ def test_data_available_after_database_restart():
 
         s2.close()
         engine2.dispose()
+
+
+def test_model_report_versioning_preserves_history_and_prevents_id_collisions():
+    """
+    Verifies that:
+    1. create_next_version() increments version numbers (v1, v2, v3) sequentially
+       and preserves all previous report versions intact without overwriting.
+    2. Attempting to create a report with a duplicate report_id raises ValueError
+       instead of silently overwriting or dropping the new report.
+    """
+    import pytest
+
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(bind=engine)
+    Session = sessionmaker(bind=engine)
+    session = Session()
+
+    try:
+        cycle_repo = MedicalCycleRepository(session)
+        report_repo = ModelReportRepository(session)
+        cycle = cycle_repo.create(cycle_id="cycle_ver_test", status="active")
+
+        v1 = report_repo.create_next_version(
+            cycle_id=cycle.cycle_id,
+            model="gemini-3.1-pro-preview",
+            report_type="pro_general_shelf",
+            privacy_level=PrivacyLevel.CLIENT_FACING,
+            content={"title": "Initial Plan", "summary": "Week 1 baseline plan"},
+        )
+        v2 = report_repo.create_next_version(
+            cycle_id=cycle.cycle_id,
+            model="gemini-3.1-pro-preview",
+            report_type="pro_general_shelf",
+            privacy_level=PrivacyLevel.CLIENT_FACING,
+            content={"title": "Week 2 Update", "summary": "Week 2 adjusted plan"},
+        )
+        v3 = report_repo.create_next_version(
+            cycle_id=cycle.cycle_id,
+            model="gemini-3.1-pro-preview",
+            report_type="pro_general_shelf",
+            privacy_level=PrivacyLevel.CLIENT_FACING,
+            content={"title": "Lab Revision", "summary": "Updated after lab review"},
+        )
+
+        assert v1.version == 1
+        assert v2.version == 2
+        assert v3.version == 3
+        assert len({v1.report_id, v2.report_id, v3.report_id}) == 3
+
+        history = report_repo.list_versions(
+            cycle_id=cycle.cycle_id,
+            report_type="pro_general_shelf",
+            privacy_level=PrivacyLevel.CLIENT_FACING,
+        )
+        assert [r.version for r in history] == [1, 2, 3]
+        assert history[0].content["summary"] == "Week 1 baseline plan"
+        assert history[1].content["summary"] == "Week 2 adjusted plan"
+        assert history[2].content["summary"] == "Updated after lab review"
+
+        # Attempting to reuse an existing report_id must raise ValueError
+        with pytest.raises(ValueError) as excinfo:
+            report_repo.create(
+                report_id=v1.report_id,
+                cycle_id=cycle.cycle_id,
+                model="gemini-3.1-pro-preview",
+                report_type="pro_general_shelf",
+                privacy_level=PrivacyLevel.CLIENT_FACING,
+                content={"title": "Overwrite attempt", "summary": "Should be rejected"},
+            )
+        assert "Report ID collision" in str(excinfo.value)
+
+        with pytest.raises(ValueError):
+            report_repo.create_next_version(
+                cycle_id=cycle.cycle_id,
+                model="gemini-3.1-pro-preview",
+                report_type="pro_general_shelf",
+                privacy_level=PrivacyLevel.CLIENT_FACING,
+                report_id=v2.report_id,
+                content={"title": "Overwrite attempt 2", "summary": "Should be rejected"},
+            )
+    finally:
+        session.close()
+        engine.dispose()

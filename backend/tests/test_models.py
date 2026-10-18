@@ -115,3 +115,10 @@ def test_model_report_privacy_partitioning(db_session: Session):
     assert len(client_reports) == 1
     assert client_reports[0].report_id == "rep_client_01"
     assert "user_workout_report" in client_reports[0].content
+
+    from app.schemas.reports import ClientModelReportResponse
+
+    validated_client = ClientModelReportResponse.model_validate(client_reports[0])
+    assert validated_client.content.user_workout_report is not None
+    assert validated_client.content.user_workout_report.summary == "Great workout, pulse well-regulated"
+    assert validated_client.content.summary == "Great workout, pulse well-regulated"

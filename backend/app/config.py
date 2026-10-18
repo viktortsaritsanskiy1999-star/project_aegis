@@ -33,6 +33,40 @@ class Settings(BaseSettings):
         default="",
         alias="GEMINI_API_KEY",
     )
+    gemini_flash_lite_model: str = Field(
+        default="gemini-3.1-flash-lite",
+        alias="AEGIS_GEMINI_FLASH_LITE_MODEL",
+    )
+    gemini_flash_model: str = Field(
+        default="gemini-3.6-flash",
+        alias="AEGIS_GEMINI_FLASH_MODEL",
+    )
+    gemini_pro_model: str = Field(
+        default="gemini-3.1-pro-preview",
+        alias="AEGIS_GEMINI_PRO_MODEL",
+    )
+    gemini_timeout_seconds: float = Field(
+        default=60.0,
+        ge=1.0,
+        le=300.0,
+        alias="AEGIS_GEMINI_TIMEOUT_SECONDS",
+    )
+    gemini_max_retries: int = Field(
+        default=3,
+        ge=1,
+        le=10,
+        alias="AEGIS_GEMINI_MAX_RETRIES",
+    )
+    gemini_initial_backoff_seconds: float = Field(
+        default=1.0,
+        ge=0.0,
+        le=30.0,
+        alias="AEGIS_GEMINI_INITIAL_BACKOFF_SECONDS",
+    )
+    gemini_base_url: str = Field(
+        default="https://generativelanguage.googleapis.com/v1beta",
+        alias="AEGIS_GEMINI_BASE_URL",
+    )
 
 
 settings = Settings()
