@@ -28,6 +28,7 @@ class WeeklySprintRepository:
         sprint_number: int = 1,
         status: str = "active",
         started_at: Optional[datetime] = None,
+        commit: bool = True,
     ) -> WeeklySprint:
         existing = self.get(sprint_id)
         if existing:
@@ -43,14 +44,18 @@ class WeeklySprintRepository:
             created_at=now,
         )
         self.db.add(sprint)
-        self.db.commit()
-        self.db.refresh(sprint)
+        if commit:
+            self.db.commit()
+            self.db.refresh(sprint)
+        else:
+            self.db.flush()
         return sprint
 
     def complete_sprint(
         self,
         sprint_id: str,
         completed_at: Optional[datetime] = None,
+        commit: bool = True,
     ) -> Optional[WeeklySprint]:
         sprint = self.get(sprint_id)
         if not sprint:
@@ -58,8 +63,11 @@ class WeeklySprintRepository:
 
         sprint.status = "completed"
         sprint.completed_at = completed_at or datetime.now(timezone.utc)
-        self.db.commit()
-        self.db.refresh(sprint)
+        if commit:
+            self.db.commit()
+            self.db.refresh(sprint)
+        else:
+            self.db.flush()
         return sprint
 
     def list_by_cycle(self, cycle_id: str) -> List[WeeklySprint]:

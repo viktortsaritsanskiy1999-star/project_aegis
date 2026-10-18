@@ -17,6 +17,15 @@ from app.schemas.consilium import (
     PrimaryConsiliumRunRequest,
     ClientVitalsThresholds,
     PrimaryConsiliumClientResponse,
+    WeeklySystemUpdateItem,
+    WeeklyUserSystemReportsMap,
+    WeeklyFlashMasterOutput,
+    WeeklyProMasterOutput,
+    AthenaClinicalLogEntry,
+    ActiveAthenaStrategyContext,
+    AthenaSessionState,
+    WeeklyConsiliumRunRequest,
+    WeeklyConsiliumClientResponse,
 )
 
 __all__ = [
@@ -42,4 +51,13 @@ __all__ = [
     "PrimaryConsiliumRunRequest",
     "ClientVitalsThresholds",
     "PrimaryConsiliumClientResponse",
+    "WeeklySystemUpdateItem",
+    "WeeklyUserSystemReportsMap",
+    "WeeklyFlashMasterOutput",
+    "WeeklyProMasterOutput",
+    "AthenaClinicalLogEntry",
+    "ActiveAthenaStrategyContext",
+    "AthenaSessionState",
+    "WeeklyConsiliumRunRequest",
+    "WeeklyConsiliumClientResponse",
 ]

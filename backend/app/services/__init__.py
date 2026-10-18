@@ -22,6 +22,15 @@ from app.services.primary_consilium_service import (
     PREPARATORY_OCR_REPORT_TYPE,
     PREPARATORY_ECG_REPORT_TYPE,
 )
+from app.services.weekly_consilium_service import (
+    WeeklyConsiliumService,
+    ATHENA_CLINICAL_LOG_REPORT_TYPE,
+    ATHENA_CHAT_HISTORY_REPORT_TYPE,
+    ATHENA_ACTIVE_STRATEGY_REPORT_TYPE,
+    WEEKLY_DEPUTY_INTERNAL_REPORT_TYPE,
+    WEEKLY_CHIEF_INTERNAL_REPORT_TYPE,
+    WEEKLY_OVERALL_CLIENT_REPORT_TYPE,
+)
 
 __all__ = [
     "create_sqlite_backup",
@@ -35,6 +44,7 @@ __all__ = [
     "GeminiValidationError",
     "GeminiTransientError",
     "PrimaryConsiliumService",
+    "WeeklyConsiliumService",
     "ConsiliumError",
     "ConsiliumCycleNotFoundError",
     "ConsiliumContextMissingError",
@@ -42,4 +52,10 @@ __all__ = [
     "PREPARATORY_ANAMNESIS_REPORT_TYPE",
     "PREPARATORY_OCR_REPORT_TYPE",
     "PREPARATORY_ECG_REPORT_TYPE",
+    "ATHENA_CLINICAL_LOG_REPORT_TYPE",
+    "ATHENA_CHAT_HISTORY_REPORT_TYPE",
+    "ATHENA_ACTIVE_STRATEGY_REPORT_TYPE",
+    "WEEKLY_DEPUTY_INTERNAL_REPORT_TYPE",
+    "WEEKLY_CHIEF_INTERNAL_REPORT_TYPE",
+    "WEEKLY_OVERALL_CLIENT_REPORT_TYPE",
 ]
