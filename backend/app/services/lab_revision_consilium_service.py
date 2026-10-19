@@ -3,15 +3,20 @@ from datetime import datetime, timedelta, timezone
 import json
 import math
 import re
+import threading
+import time
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 import uuid
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.orm import Session
 
 from app.models.model_report import ModelReport
 from app.repositories.cycle_repository import MedicalCycleRepository
 from app.repositories.measurement_repository import HealthMeasurementRepository
-from app.repositories.report_repository import ModelReportRepository
+from app.repositories.report_repository import (
+    ModelReportRepository,
+    ReportVersionConflictError,
+)
 from app.schemas.consilium import (
     SYSTEM_KEYS,
     SYSTEM_TITLES,
@@ -47,6 +52,7 @@ from app.services.primary_consilium_service import (
     ConsiliumCycleNotFoundError,
     ConsiliumContextMissingError,
     ConsiliumQualityRejectionError,
+    ConsiliumConcurrencyConflictError,
     PREPARATORY_ANAMNESIS_REPORT_TYPE,
     PREPARATORY_OCR_REPORT_TYPE,
     PREPARATORY_ECG_REPORT_TYPE,
@@ -100,6 +106,8 @@ class LabRevisionConsiliumService:
     """
 
     _CYCLE_LOCKS: Dict[str, asyncio.Lock] = {}
+    _LEDGER_THREAD_LOCKS: Dict[str, threading.Lock] = {}
+    _LEDGER_META_LOCK = threading.Lock()
 
     def __init__(
         self,
@@ -107,6 +115,7 @@ class LabRevisionConsiliumService:
         gateway: Optional[GeminiGateway] = None,
         now_provider: Optional[Callable[[], datetime]] = None,
         lock_registry: Optional[Dict[str, asyncio.Lock]] = None,
+        ledger_lock_registry: Optional[Dict[str, threading.Lock]] = None,
         lease_ttl_seconds: int = LAB_REVISION_IN_FLIGHT_LOCK_TTL_SECONDS,
         lease_heartbeat_interval_seconds: float = LAB_REVISION_IN_FLIGHT_LOCK_HEARTBEAT_SECONDS,
     ):
@@ -114,6 +123,11 @@ class LabRevisionConsiliumService:
         self.gateway = gateway or GeminiGateway()
         self.now_provider = now_provider or (lambda: datetime.now(timezone.utc))
         self._lock_registry = lock_registry if lock_registry is not None else self._CYCLE_LOCKS
+        self._ledger_lock_registry = (
+            ledger_lock_registry
+            if ledger_lock_registry is not None
+            else self._LEDGER_THREAD_LOCKS
+        )
         self.lease_ttl_seconds = max(1, int(lease_ttl_seconds))
         self.lease_heartbeat_interval_seconds = max(0.001, float(lease_heartbeat_interval_seconds))
         self.cycle_repo = MedicalCycleRepository(db)
@@ -126,6 +140,14 @@ class LabRevisionConsiliumService:
             lock = asyncio.Lock()
             self._lock_registry[cycle_id] = lock
         return lock
+
+    def _get_ledger_thread_lock(self, cycle_id: str) -> threading.Lock:
+        with self._LEDGER_META_LOCK:
+            lock = self._ledger_lock_registry.get(cycle_id)
+            if lock is None:
+                lock = threading.Lock()
+                self._ledger_lock_registry[cycle_id] = lock
+            return lock
 
     def _now_utc(self) -> datetime:
         dt = self.now_provider()
@@ -304,19 +326,32 @@ class LabRevisionConsiliumService:
                 active_markers[marker_key] = dumped
 
         shared_labs_table = self._build_shared_labs_table_from_active(active_markers)
-        return self.report_repo.create_next_version(
-            cycle_id=cycle_id,
-            model="aegis-lab-ledger",
-            report_type=LABORATORY_LEDGER_REPORT_TYPE,
-            privacy_level=PrivacyLevel.SERVER_ONLY,
-            content={
-                "ledger_version": 1,
-                "source": "preparatory_vision_ocr",
-                "active_markers": active_markers,
-                "observations_history": observations_history,
-                "shared_labs_table": shared_labs_table,
-            },
-        )
+        try:
+            return self.report_repo.create_next_version(
+                cycle_id=cycle_id,
+                model="aegis-lab-ledger",
+                report_type=LABORATORY_LEDGER_REPORT_TYPE,
+                privacy_level=PrivacyLevel.SERVER_ONLY,
+                content={
+                    "ledger_version": 1,
+                    "source": "preparatory_vision_ocr",
+                    "active_markers": active_markers,
+                    "observations_history": observations_history,
+                    "shared_labs_table": shared_labs_table,
+                },
+                expected_version=1,
+                max_retries=0,
+            )
+        except (ReportVersionConflictError, IntegrityError):
+            self.db.rollback()
+            self.db.expire_all()
+            existing_ledgers = self.report_repo.list_server_only(
+                cycle_id=cycle_id,
+                report_type=LABORATORY_LEDGER_REPORT_TYPE,
+            )
+            if existing_ledgers:
+                return existing_ledgers[0]
+            raise
 
     @staticmethod
     def _build_shared_labs_table_from_active(
@@ -430,6 +465,7 @@ class LabRevisionConsiliumService:
         self,
         cycle_id: str,
         mutations: List[LabMarkerMutationItem | Dict[str, Any]],
+        max_retries: int = 5,
     ) -> LabLedgerStateResponse:
         """
         Saves new laboratory markers, new dated studies, corrections of erroneous values,
@@ -439,10 +475,9 @@ class LabRevisionConsiliumService:
           `supersedes_observation_id`, keeping the original erroneous value intact for audit.
         - New dated studies add a chronological observation without marking prior studies as errors.
         - Always allowed immediately with zero cooldown.
+        - Uses per-cycle thread serialization and bounded optimistic read-modify-write retries
+          with `expected_version` so concurrent upserts never overwrite each other or lose markers.
         """
-        cycle = self.cycle_repo.get(cycle_id)
-        if not cycle:
-            raise ConsiliumCycleNotFoundError(f"Medical cycle '{cycle_id}' not found.")
         if not mutations:
             raise ValueError("At least one laboratory mutation must be provided.")
 
@@ -451,171 +486,193 @@ class LabRevisionConsiliumService:
             for m in mutations
         ]
 
-        current_state = self.get_lab_ledger_state(cycle_id)
-        next_ledger_ver = current_state.ledger_version + 1
-        now_iso = self._now_utc().isoformat()
+        effective_retries = max(0, int(max_retries))
+        with self._get_ledger_thread_lock(cycle_id):
+            for attempt in range(effective_retries + 1):
+                if attempt > 0:
+                    self.db.rollback()
+                    self.db.expire_all()
+                    time.sleep(0.015 * attempt)
 
-        history_list: List[Dict[str, Any]] = [
-            obs.model_dump() for obs in current_state.observations_history
-        ]
-        active_map: Dict[str, Dict[str, Any]] = {
-            k: obs.model_dump() for k, obs in current_state.active_markers.items()
-        }
+                try:
+                    cycle = self.cycle_repo.get(cycle_id)
+                    if not cycle:
+                        raise ConsiliumCycleNotFoundError(f"Medical cycle '{cycle_id}' not found.")
 
-        for idx, mut in enumerate(validated_mutations, start=1):
-            marker_key = self._normalize_marker_key(mut.marker_key)
-            prior_active = active_map.get(marker_key)
-            display_name = (
-                mut.display_name
-                or (prior_active.get("display_name") if prior_active else None)
-                or mut.marker_key.strip()
-            )
-            obs_id = f"obs_{marker_key}_v{next_ledger_ver}_{idx}"
+                    current_state = self.get_lab_ledger_state(cycle_id)
+                    next_ledger_ver = current_state.ledger_version + 1
+                    now_iso = self._now_utc().isoformat()
 
-            if mut.event_type == LabEventType.INVALIDATED:
-                target_prev_id = mut.supersedes_observation_id or (
-                    prior_active.get("observation_id") if prior_active else None
-                )
-                if target_prev_id is None:
-                    raise ValueError(
-                        f"Cannot invalidate marker '{marker_key}': no active observation found."
+                    history_list: List[Dict[str, Any]] = [
+                        obs.model_dump() for obs in current_state.observations_history
+                    ]
+                    active_map: Dict[str, Dict[str, Any]] = {
+                        k: obs.model_dump() for k, obs in current_state.active_markers.items()
+                    }
+
+                    for idx, mut in enumerate(validated_mutations, start=1):
+                        marker_key = self._normalize_marker_key(mut.marker_key)
+                        prior_active = active_map.get(marker_key)
+                        display_name = (
+                            mut.display_name
+                            or (prior_active.get("display_name") if prior_active else None)
+                            or mut.marker_key.strip()
+                        )
+                        obs_id = f"obs_{marker_key}_v{next_ledger_ver}_{idx}"
+
+                        if mut.event_type == LabEventType.INVALIDATED:
+                            target_prev_id = mut.supersedes_observation_id or (
+                                prior_active.get("observation_id") if prior_active else None
+                            )
+                            if target_prev_id is None:
+                                raise ValueError(
+                                    f"Cannot invalidate marker '{marker_key}': no active observation found."
+                                )
+                            for h_item in history_list:
+                                if h_item.get("observation_id") == target_prev_id:
+                                    h_item["is_active"] = False
+                                    h_item["superseded_by_observation_id"] = obs_id
+                            active_map.pop(marker_key, None)
+
+                            inv_entry = LabObservationEntry(
+                                observation_id=obs_id,
+                                marker_key=marker_key,
+                                display_name=display_name,
+                                value=prior_active.get("value") if prior_active else None,
+                                numeric_value=prior_active.get("numeric_value") if prior_active else None,
+                                unit=prior_active.get("unit") if prior_active else mut.unit,
+                                sample_date=prior_active.get("sample_date") if prior_active else mut.sample_date,
+                                reference_range=(
+                                    LabReferenceRange.model_validate(prior_active["reference_range"])
+                                    if prior_active and prior_active.get("reference_range")
+                                    else mut.reference_range
+                                ),
+                                event_type=LabEventType.INVALIDATED,
+                                supersedes_observation_id=target_prev_id,
+                                correction_reason=mut.correction_reason or "Marked as erroneous/invalidated",
+                                is_active=False,
+                                is_critical_flag=False,
+                                recorded_at=now_iso,
+                            )
+                            history_list.append(inv_entry.model_dump())
+                            continue
+
+                        if mut.event_type == LabEventType.CORRECTION:
+                            target_prev_id = mut.supersedes_observation_id or (
+                                prior_active.get("observation_id") if prior_active else None
+                            )
+                            if target_prev_id is None:
+                                raise ValueError(
+                                    f"Cannot apply error correction for marker '{marker_key}': no prior observation exists to correct."
+                                )
+                            # Mark the erroneous observation inactive in history while preserving its original value
+                            superseded_obs: Optional[Dict[str, Any]] = None
+                            for h_item in history_list:
+                                if h_item.get("observation_id") == target_prev_id:
+                                    h_item["is_active"] = False
+                                    h_item["superseded_by_observation_id"] = obs_id
+                                    superseded_obs = h_item
+                                    break
+                            if superseded_obs is None:
+                                raise ValueError(
+                                    f"Observation '{target_prev_id}' not found in history for marker '{marker_key}'."
+                                )
+
+                            fallback_unit = mut.unit if mut.unit is not None else superseded_obs.get("unit")
+                            num_val, resolved_unit = self._parse_numeric_and_unit(mut.value, fallback_unit)
+                            resolved_date = mut.sample_date or superseded_obs.get("sample_date") or now_iso[:10]
+                            resolved_ref = mut.reference_range or (
+                                LabReferenceRange.model_validate(superseded_obs["reference_range"])
+                                if superseded_obs.get("reference_range")
+                                else None
+                            )
+                            crit = self._detect_critical_deviation(num_val, resolved_ref, mut.is_critical_flag)
+
+                            corr_entry = LabObservationEntry(
+                                observation_id=obs_id,
+                                marker_key=marker_key,
+                                display_name=display_name,
+                                value=mut.value,
+                                numeric_value=num_val,
+                                unit=resolved_unit,
+                                sample_date=resolved_date,
+                                reference_range=resolved_ref,
+                                event_type=LabEventType.CORRECTION,
+                                supersedes_observation_id=target_prev_id,
+                                correction_reason=mut.correction_reason or "Correction of prior input/OCR value",
+                                is_active=True,
+                                is_critical_flag=crit,
+                                recorded_at=now_iso,
+                            )
+                            dumped_corr = corr_entry.model_dump()
+                            history_list.append(dumped_corr)
+                            active_map[marker_key] = dumped_corr
+                            continue
+
+                        # LabEventType.INITIAL or LabEventType.NEW_STUDY
+                        # Note: If a prior active study exists on an earlier date, it remains a valid historical
+                        # study (NOT marked as an error), while the new study becomes the current active marker.
+                        effective_event = (
+                            LabEventType.INITIAL if prior_active is None and mut.event_type == LabEventType.INITIAL else (
+                                LabEventType.NEW_STUDY if prior_active is not None else mut.event_type
+                            )
+                        )
+                        fallback_unit = mut.unit if mut.unit is not None else (
+                            prior_active.get("unit") if prior_active else None
+                        )
+                        num_val, resolved_unit = self._parse_numeric_and_unit(mut.value, fallback_unit)
+                        resolved_date = mut.sample_date or now_iso[:10]
+                        resolved_ref = mut.reference_range or (
+                            LabReferenceRange.model_validate(prior_active["reference_range"])
+                            if prior_active and prior_active.get("reference_range")
+                            else None
+                        )
+                        crit = self._detect_critical_deviation(num_val, resolved_ref, mut.is_critical_flag)
+
+                        new_entry = LabObservationEntry(
+                            observation_id=obs_id,
+                            marker_key=marker_key,
+                            display_name=display_name,
+                            value=mut.value,
+                            numeric_value=num_val,
+                            unit=resolved_unit,
+                            sample_date=resolved_date,
+                            reference_range=resolved_ref,
+                            event_type=effective_event,
+                            supersedes_observation_id=None,
+                            correction_reason=None,
+                            is_active=True,
+                            is_critical_flag=crit,
+                            recorded_at=now_iso,
+                        )
+                        dumped_new = new_entry.model_dump()
+                        history_list.append(dumped_new)
+                        active_map[marker_key] = dumped_new
+
+                    shared_labs_table = self._build_shared_labs_table_from_active(active_map)
+                    self.report_repo.create_next_version(
+                        cycle_id=cycle_id,
+                        model="aegis-lab-ledger",
+                        report_type=LABORATORY_LEDGER_REPORT_TYPE,
+                        privacy_level=PrivacyLevel.SERVER_ONLY,
+                        content={
+                            "ledger_version": next_ledger_ver,
+                            "source": "user_or_clinical_update",
+                            "active_markers": active_map,
+                            "observations_history": history_list,
+                            "shared_labs_table": shared_labs_table,
+                        },
+                        expected_version=next_ledger_ver,
+                        max_retries=0,
                     )
-                for h_item in history_list:
-                    if h_item.get("observation_id") == target_prev_id:
-                        h_item["is_active"] = False
-                        h_item["superseded_by_observation_id"] = obs_id
-                active_map.pop(marker_key, None)
-
-                inv_entry = LabObservationEntry(
-                    observation_id=obs_id,
-                    marker_key=marker_key,
-                    display_name=display_name,
-                    value=prior_active.get("value") if prior_active else None,
-                    numeric_value=prior_active.get("numeric_value") if prior_active else None,
-                    unit=prior_active.get("unit") if prior_active else mut.unit,
-                    sample_date=prior_active.get("sample_date") if prior_active else mut.sample_date,
-                    reference_range=(
-                        LabReferenceRange.model_validate(prior_active["reference_range"])
-                        if prior_active and prior_active.get("reference_range")
-                        else mut.reference_range
-                    ),
-                    event_type=LabEventType.INVALIDATED,
-                    supersedes_observation_id=target_prev_id,
-                    correction_reason=mut.correction_reason or "Marked as erroneous/invalidated",
-                    is_active=False,
-                    is_critical_flag=False,
-                    recorded_at=now_iso,
-                )
-                history_list.append(inv_entry.model_dump())
-                continue
-
-            if mut.event_type == LabEventType.CORRECTION:
-                target_prev_id = mut.supersedes_observation_id or (
-                    prior_active.get("observation_id") if prior_active else None
-                )
-                if target_prev_id is None:
-                    raise ValueError(
-                        f"Cannot apply error correction for marker '{marker_key}': no prior observation exists to correct."
-                    )
-                # Mark the erroneous observation inactive in history while preserving its original value
-                superseded_obs: Optional[Dict[str, Any]] = None
-                for h_item in history_list:
-                    if h_item.get("observation_id") == target_prev_id:
-                        h_item["is_active"] = False
-                        h_item["superseded_by_observation_id"] = obs_id
-                        superseded_obs = h_item
-                        break
-                if superseded_obs is None:
-                    raise ValueError(
-                        f"Observation '{target_prev_id}' not found in history for marker '{marker_key}'."
-                    )
-
-                fallback_unit = mut.unit if mut.unit is not None else superseded_obs.get("unit")
-                num_val, resolved_unit = self._parse_numeric_and_unit(mut.value, fallback_unit)
-                resolved_date = mut.sample_date or superseded_obs.get("sample_date") or now_iso[:10]
-                resolved_ref = mut.reference_range or (
-                    LabReferenceRange.model_validate(superseded_obs["reference_range"])
-                    if superseded_obs.get("reference_range")
-                    else None
-                )
-                crit = self._detect_critical_deviation(num_val, resolved_ref, mut.is_critical_flag)
-
-                corr_entry = LabObservationEntry(
-                    observation_id=obs_id,
-                    marker_key=marker_key,
-                    display_name=display_name,
-                    value=mut.value,
-                    numeric_value=num_val,
-                    unit=resolved_unit,
-                    sample_date=resolved_date,
-                    reference_range=resolved_ref,
-                    event_type=LabEventType.CORRECTION,
-                    supersedes_observation_id=target_prev_id,
-                    correction_reason=mut.correction_reason or "Correction of prior input/OCR value",
-                    is_active=True,
-                    is_critical_flag=crit,
-                    recorded_at=now_iso,
-                )
-                dumped_corr = corr_entry.model_dump()
-                history_list.append(dumped_corr)
-                active_map[marker_key] = dumped_corr
-                continue
-
-            # LabEventType.INITIAL or LabEventType.NEW_STUDY
-            # Note: If a prior active study exists on an earlier date, it remains a valid historical
-            # study (NOT marked as an error), while the new study becomes the current active marker.
-            effective_event = (
-                LabEventType.INITIAL if prior_active is None and mut.event_type == LabEventType.INITIAL else (
-                    LabEventType.NEW_STUDY if prior_active is not None else mut.event_type
-                )
-            )
-            fallback_unit = mut.unit if mut.unit is not None else (
-                prior_active.get("unit") if prior_active else None
-            )
-            num_val, resolved_unit = self._parse_numeric_and_unit(mut.value, fallback_unit)
-            resolved_date = mut.sample_date or now_iso[:10]
-            resolved_ref = mut.reference_range or (
-                LabReferenceRange.model_validate(prior_active["reference_range"])
-                if prior_active and prior_active.get("reference_range")
-                else None
-            )
-            crit = self._detect_critical_deviation(num_val, resolved_ref, mut.is_critical_flag)
-
-            new_entry = LabObservationEntry(
-                observation_id=obs_id,
-                marker_key=marker_key,
-                display_name=display_name,
-                value=mut.value,
-                numeric_value=num_val,
-                unit=resolved_unit,
-                sample_date=resolved_date,
-                reference_range=resolved_ref,
-                event_type=effective_event,
-                supersedes_observation_id=None,
-                correction_reason=None,
-                is_active=True,
-                is_critical_flag=crit,
-                recorded_at=now_iso,
-            )
-            dumped_new = new_entry.model_dump()
-            history_list.append(dumped_new)
-            active_map[marker_key] = dumped_new
-
-        shared_labs_table = self._build_shared_labs_table_from_active(active_map)
-        self.report_repo.create_next_version(
-            cycle_id=cycle_id,
-            model="aegis-lab-ledger",
-            report_type=LABORATORY_LEDGER_REPORT_TYPE,
-            privacy_level=PrivacyLevel.SERVER_ONLY,
-            content={
-                "ledger_version": next_ledger_ver,
-                "source": "user_or_clinical_update",
-                "active_markers": active_map,
-                "observations_history": history_list,
-                "shared_labs_table": shared_labs_table,
-            },
-        )
-        return self.get_lab_ledger_state(cycle_id)
+                    return self.get_lab_ledger_state(cycle_id)
+                except (ReportVersionConflictError, OperationalError, IntegrityError) as exc:
+                    self.db.rollback()
+                    if attempt >= effective_retries:
+                        raise ConsiliumConcurrencyConflictError(
+                            f"Concurrent laboratory ledger update conflict for cycle '{cycle_id}' "
+                            f"after {effective_retries + 1} attempts: {exc}"
+                        ) from exc
 
     # ==========================================================================
     # 2. DETERMINISTIC LABORATORY DIFF ENGINE

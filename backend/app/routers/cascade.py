@@ -4,6 +4,7 @@ from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Upload
 from sqlalchemy.orm import Session
 
 from app.database import get_db
+from app.repositories.report_repository import ReportVersionConflictError
 from app.schemas.consilium import (
     AnamnesisIntakeRequest,
     AnamnesisIntakeClientResponse,
@@ -86,7 +87,11 @@ async def submit_anamnesis_intake_endpoint(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=str(exc),
         )
-    except (ConsiliumAnamnesisLockedError, ConsiliumConcurrencyConflictError) as exc:
+    except (
+        ConsiliumAnamnesisLockedError,
+        ConsiliumConcurrencyConflictError,
+        ReportVersionConflictError,
+    ) as exc:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail=str(exc),
@@ -130,7 +135,11 @@ async def run_primary_consilium_endpoint(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=str(exc),
         )
-    except ConsiliumContextMissingError as exc:
+    except (
+        ConsiliumContextMissingError,
+        ConsiliumConcurrencyConflictError,
+        ReportVersionConflictError,
+    ) as exc:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail=str(exc),
@@ -175,7 +184,11 @@ async def run_weekly_consilium_endpoint(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=str(exc),
         )
-    except ConsiliumContextMissingError as exc:
+    except (
+        ConsiliumContextMissingError,
+        ConsiliumConcurrencyConflictError,
+        ReportVersionConflictError,
+    ) as exc:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail=str(exc),
@@ -222,6 +235,11 @@ def upsert_laboratory_markers_endpoint(
     except ConsiliumCycleNotFoundError as exc:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
+            detail=str(exc),
+        )
+    except (ConsiliumConcurrencyConflictError, ReportVersionConflictError) as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
             detail=str(exc),
         )
     except ValueError as exc:
@@ -311,7 +329,11 @@ async def run_lab_revision_consilium_endpoint(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=str(exc),
         )
-    except ConsiliumContextMissingError as exc:
+    except (
+        ConsiliumContextMissingError,
+        ConsiliumConcurrencyConflictError,
+        ReportVersionConflictError,
+    ) as exc:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail=str(exc),
@@ -371,6 +393,11 @@ async def submit_lab_images_intake_endpoint(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=str(exc),
         )
+    except (ConsiliumConcurrencyConflictError, ReportVersionConflictError) as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=str(exc),
+        )
     except LabVisionValidationError as exc:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -422,6 +449,11 @@ async def submit_ecg_image_intake_endpoint(
     except ConsiliumCycleNotFoundError as exc:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
+            detail=str(exc),
+        )
+    except (ConsiliumConcurrencyConflictError, ReportVersionConflictError) as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
             detail=str(exc),
         )
     except EcgVisionValidationError as exc:

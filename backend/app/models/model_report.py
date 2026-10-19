@@ -1,6 +1,6 @@
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING
-from sqlalchemy import String, Integer, DateTime, ForeignKey, JSON
+from sqlalchemy import String, Integer, DateTime, ForeignKey, JSON, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from app.models.base import Base
 
@@ -24,6 +24,15 @@ class ModelReport(Base):
         * user_workout_report (User workout summary)
     """
     __tablename__ = "model_reports"
+    __table_args__ = (
+        UniqueConstraint(
+            "cycle_id",
+            "report_type",
+            "privacy_level",
+            "version",
+            name="uq_model_reports_cycle_type_privacy_version",
+        ),
+    )
 
     report_id: Mapped[str] = mapped_column(String(64), primary_key=True, index=True)
     cycle_id: Mapped[str] = mapped_column(

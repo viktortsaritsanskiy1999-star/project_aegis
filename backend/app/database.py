@@ -1,9 +1,9 @@
 import logging
 import sqlite3
 from pathlib import Path
-from typing import Generator, Optional
-from sqlalchemy import create_engine, event
-from sqlalchemy.engine import Engine
+from typing import Any, Dict, Generator, List, Optional, Union
+from sqlalchemy import create_engine, event, inspect, text
+from sqlalchemy.engine import Connection, Engine
 from sqlalchemy.orm import sessionmaker, Session
 from app.config import settings
 from app.models.base import Base
@@ -14,10 +14,11 @@ logger = logging.getLogger("aegis.database")
 
 @event.listens_for(Engine, "connect")
 def _enable_sqlite_foreign_keys(dbapi_connection, _connection_record) -> None:
-    """Enforces referential integrity (PRAGMA foreign_keys=ON) on every SQLite connection."""
+    """Enforces referential integrity (PRAGMA foreign_keys=ON) and default busy_timeout on every SQLite connection."""
     if isinstance(dbapi_connection, sqlite3.Connection):
         cursor = dbapi_connection.cursor()
         cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.execute("PRAGMA busy_timeout=5000")
         cursor.close()
 
 
@@ -107,3 +108,95 @@ def init_db(
     except Exception as e:
         logger.error(f"Alembic migration failed ({e}). Aborting startup to prevent schema corruption.")
         raise RuntimeError(f"Database migration failed via Alembic: {e}") from e
+
+
+def _query_duplicate_report_versions(
+    conn_or_session: Union[Connection, Session],
+) -> List[Dict[str, Any]]:
+    bind = conn_or_session.get_bind() if isinstance(conn_or_session, Session) else conn_or_session
+    inspector = inspect(bind)
+    if "model_reports" not in inspector.get_table_names():
+        return []
+
+    dup_rows = conn_or_session.execute(
+        text(
+            """
+            SELECT cycle_id, report_type, privacy_level, version, COUNT(*) AS duplicate_count
+            FROM model_reports
+            GROUP BY cycle_id, report_type, privacy_level, version
+            HAVING COUNT(*) > 1
+            ORDER BY cycle_id ASC, report_type ASC, privacy_level ASC, version ASC
+            """
+        )
+    ).fetchall()
+
+    results: List[Dict[str, Any]] = []
+    for row in dup_rows:
+        id_rows = conn_or_session.execute(
+            text(
+                """
+                SELECT report_id
+                FROM model_reports
+                WHERE cycle_id = :cycle_id
+                  AND report_type = :report_type
+                  AND privacy_level = :privacy_level
+                  AND version = :version
+                ORDER BY created_at ASC, report_id ASC
+                """
+            ),
+            {
+                "cycle_id": row[0],
+                "report_type": row[1],
+                "privacy_level": row[2],
+                "version": row[3],
+            },
+        ).fetchall()
+        results.append(
+            {
+                "cycle_id": str(row[0]),
+                "report_type": str(row[1]),
+                "privacy_level": str(row[2]),
+                "version": int(row[3]),
+                "duplicate_count": int(row[4]),
+                "report_ids": [str(r[0]) for r in id_rows],
+            }
+        )
+    return results
+
+
+def find_duplicate_report_versions(
+    bind_or_session: Union[Engine, Connection, Session],
+) -> List[Dict[str, Any]]:
+    """
+    Executes a strictly read-only inspection on `model_reports` to detect any
+    duplicate (cycle_id, report_type, privacy_level, version) combinations.
+    Never modifies, merges, or deletes any records.
+    """
+    if isinstance(bind_or_session, Engine):
+        with bind_or_session.connect() as conn:
+            return _query_duplicate_report_versions(conn)
+    return _query_duplicate_report_versions(bind_or_session)
+
+
+def assert_no_duplicate_report_versions(
+    bind_or_session: Union[Engine, Connection, Session],
+) -> None:
+    """
+    Verifies via read-only query that no duplicate (cycle_id, report_type, privacy_level, version)
+    combinations exist in `model_reports`. Raises RuntimeError with diagnostic metadata if found.
+    """
+    duplicates = find_duplicate_report_versions(bind_or_session)
+    if duplicates:
+        summary = "; ".join(
+            f"(cycle_id='{d['cycle_id']}', report_type='{d['report_type']}', "
+            f"privacy_level='{d['privacy_level']}', version={d['version']}, "
+            f"count={d['duplicate_count']}, report_ids={d['report_ids']})"
+            for d in duplicates
+        )
+        raise RuntimeError(
+            "Historical data integrity check failed: duplicate "
+            "(cycle_id, report_type, privacy_level, version) combinations detected in "
+            f"model_reports ({len(duplicates)} duplicate group(s)): {summary}. "
+            "Automatic deletion or merging of clinical reports is forbidden. "
+            "Manual data inspection is required before applying the UNIQUE constraint."
+        )
