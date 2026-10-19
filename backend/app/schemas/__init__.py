@@ -49,6 +49,10 @@ from app.schemas.consilium import (
     VisionOcrDocumentMetadata,
     VisionOcrModelOutput,
     LabVisionIntakeClientResponse,
+    EcgRecordingType,
+    EcgRecordingQuality,
+    VisionEcgModelOutput,
+    EcgVisionIntakeClientResponse,
 )
 
 __all__ = [
@@ -106,4 +110,8 @@ __all__ = [
     "VisionOcrDocumentMetadata",
     "VisionOcrModelOutput",
     "LabVisionIntakeClientResponse",
+    "EcgRecordingType",
+    "EcgRecordingQuality",
+    "VisionEcgModelOutput",
+    "EcgVisionIntakeClientResponse",
 ]

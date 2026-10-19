@@ -43,6 +43,10 @@ from app.services.lab_vision_ocr_service import (
     LabVisionValidationError,
     detect_image_mime_type_from_bytes,
 )
+from app.services.ecg_vision_service import (
+    EcgVisionService,
+    EcgVisionValidationError,
+)
 
 __all__ = [
     "create_sqlite_backup",
@@ -59,12 +63,14 @@ __all__ = [
     "WeeklyConsiliumService",
     "LabRevisionConsiliumService",
     "LabVisionOcrService",
+    "EcgVisionService",
     "ConsiliumError",
     "ConsiliumCycleNotFoundError",
     "ConsiliumContextMissingError",
     "ConsiliumQualityRejectionError",
     "ConsiliumCooldownError",
     "LabVisionValidationError",
+    "EcgVisionValidationError",
     "detect_image_mime_type_from_bytes",
     "PREPARATORY_ANAMNESIS_REPORT_TYPE",
     "PREPARATORY_OCR_REPORT_TYPE",

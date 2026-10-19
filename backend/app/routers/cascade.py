@@ -17,6 +17,7 @@ from app.schemas.consilium import (
     LabRevisionConsiliumRunRequest,
     LabRevisionConsiliumClientResponse,
     LabVisionIntakeClientResponse,
+    EcgVisionIntakeClientResponse,
 )
 from app.security.auth import verify_client_token
 from app.services.gemini_gateway import GeminiGateway, GeminiGatewayError
@@ -37,6 +38,10 @@ from app.services.lab_revision_consilium_service import (
 from app.services.lab_vision_ocr_service import (
     LabVisionOcrService,
     LabVisionValidationError,
+)
+from app.services.ecg_vision_service import (
+    EcgVisionService,
+    EcgVisionValidationError,
 )
 
 router = APIRouter(prefix="/api/v1/cascade", tags=["Medical Consilium Cascade"])
@@ -380,4 +385,57 @@ async def submit_lab_images_intake_endpoint(
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail=f"Gemini Vision OCR extraction failed: {exc}",
+        )
+
+
+@router.post(
+    "/intake/ecg-image",
+    response_model=EcgVisionIntakeClientResponse,
+    summary="Upload electrocardiogram image and run server-side Vision ECG extraction",
+    description=(
+        "Authorized endpoint receiving an ECG image (JPEG, PNG, WEBP, HEIC/HEIF). "
+        "Validates magic bytes, enforces a 10MB file limit, invokes Gemini Vision "
+        "to extract ECG rhythm, rate, intervals, morphology, and limitations under "
+        "server_only privacy level, and saves the verified result for consilium synthesis."
+    ),
+)
+async def submit_ecg_image_intake_endpoint(
+    cycle_id: str = Form(...),
+    file: UploadFile = File(...),
+    record_date: Optional[str] = Form(default=None),
+    db: Session = Depends(get_db),
+    gateway: GeminiGateway = Depends(get_gemini_gateway),
+    now_provider: Callable[[], datetime] = Depends(get_server_now_provider),
+    _token: str = Depends(verify_client_token),
+) -> EcgVisionIntakeClientResponse:
+    service = EcgVisionService(
+        db=db,
+        gateway=gateway,
+        now_provider=now_provider,
+    )
+    try:
+        return await service.process_ecg_image(
+            cycle_id=cycle_id,
+            file=file,
+            record_date_override=record_date,
+        )
+    except ConsiliumCycleNotFoundError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=str(exc),
+        )
+    except EcgVisionValidationError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(exc),
+        )
+    except ConsiliumError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(exc),
+        )
+    except GeminiGatewayError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Gemini Vision ECG extraction failed: {exc}",
         )

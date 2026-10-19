@@ -1124,3 +1124,99 @@ class LabVisionIntakeClientResponse(BaseModel):
         "Laboratory documents processed server-side. Raw image bytes and unverified "
         "OCR hypotheses are never logged or exposed to the client."
     )
+
+
+class EcgRecordingType(str, Enum):
+    """Classification of the physical recording device / lead setup."""
+    SINGLE_LEAD_SMARTWATCH = "single_lead_smartwatch"
+    STANDARD_12_LEAD = "standard_12_lead"
+    OTHER_MULTICHANNEL = "other_multichannel"
+    UNKNOWN = "unknown"
+
+
+class EcgRecordingQuality(str, Enum):
+    """Technical quality of the electrocardiogram tracing."""
+    GOOD = "good"
+    MODERATE = "moderate"
+    POOR = "poor"
+    UNREADABLE = "unreadable"
+
+
+class VisionEcgModelOutput(BaseModel):
+    """
+    Structured Pydantic model produced by Gemini Vision ECG (role='vision_ecg').
+    Enforces strict medical safety rules:
+    - Single-lead recordings (e.g. smartwatch Lead I) CANNOT determine electrical axis.
+    - If recording quality is unreadable, speculative intervals/rates must be null.
+    - No fabricated measurements or premature categorical clinical diagnoses.
+    """
+    model_config = ConfigDict(extra="forbid")
+
+    recording_type: str = "unknown"
+    recording_quality: str = "moderate"
+    lead_name: Optional[str] = None
+    heart_rate_bpm: Optional[int] = Field(default=None, ge=20, le=300)
+    rhythm_type: Optional[str] = None
+    rhythm_regularity: Optional[str] = None
+    pr_interval_ms: Optional[float] = Field(default=None, ge=40.0, le=600.0)
+    qrs_duration_ms: Optional[float] = Field(default=None, ge=30.0, le=400.0)
+    qt_interval_ms: Optional[float] = Field(default=None, ge=150.0, le=800.0)
+    qtc_interval_ms: Optional[float] = Field(default=None, ge=200.0, le=800.0)
+    electrical_axis: Optional[str] = None
+    st_segment_findings: Optional[str] = None
+    t_wave_findings: Optional[str] = None
+    limitations: List[str] = Field(default_factory=list)
+    uncertainties: List[str] = Field(default_factory=list)
+    ecg_summary: str = Field(..., min_length=5)
+    potential_urgent_warning: Optional[str] = None
+
+    @model_validator(mode="after")
+    def enforce_clinical_safety_rules(self) -> "VisionEcgModelOutput":
+        # 1. Single-lead recordings (smartwatches) cannot determine electrical heart axis
+        rec_type_lower = (self.recording_type or "").lower()
+        if (
+            "single" in rec_type_lower
+            or "watch" in rec_type_lower
+            or "lead_i" in rec_type_lower
+            or self.recording_type == EcgRecordingType.SINGLE_LEAD_SMARTWATCH.value
+        ):
+            self.electrical_axis = None
+            axis_lim = "Electrical heart axis cannot be determined from single-lead recording."
+            if not any("axis" in lim.lower() for lim in self.limitations):
+                self.limitations.append(axis_lim)
+
+        # 2. If unreadable quality, strip speculative numeric measurements
+        if (self.recording_quality or "").lower() in ("unreadable", EcgRecordingQuality.UNREADABLE.value):
+            self.heart_rate_bpm = None
+            self.pr_interval_ms = None
+            self.qrs_duration_ms = None
+            self.qt_interval_ms = None
+            self.qtc_interval_ms = None
+            self.electrical_axis = None
+            unreadable_note = "ECG tracing is unreadable or heavily corrupted by noise."
+            if not any("unreadable" in u.lower() for u in self.uncertainties):
+                self.uncertainties.append(unreadable_note)
+
+        return self
+
+
+class EcgVisionIntakeClientResponse(BaseModel):
+    """
+    Safe client-facing confirmation of electrocardiogram Vision processing.
+    Never exposes raw Gemini JSON, internal agent reasoning, or raw tracing images.
+    Provides cautionary emergency guidance if acute warnings are detected.
+    """
+    model_config = ConfigDict(extra="forbid")
+
+    cycle_id: str
+    status: str = "processed"
+    intake_version: int = Field(..., ge=1)
+    recording_type: str
+    recording_quality: str
+    created_at_utc: str
+    primary_consilium_concluded: bool = False
+    privacy_notice: str = (
+        "Electrocardiogram securely accepted and analyzed on the server under server_only privacy level. "
+        "Clinical interpretation, rhythm evaluation, and cardiac findings are synthesized exclusively "
+        "during the medical consilium."
+    )

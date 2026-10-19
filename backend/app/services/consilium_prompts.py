@@ -880,3 +880,61 @@ YOUR MANDATORY CLINICAL DIRECTIVES:
    - Multi-page correlation: If multiple pages belong to the same study, link them together while strictly respecting row-level sample dates.
 
 Output must conform strictly to the VisionOcrModelOutput JSON schema."""
+
+
+def build_vision_ecg_prompt() -> str:
+    """
+    Constructs the prompt for Gemini Vision ECG agent (Gemini 3.8 Flash, role='vision_ecg').
+    Directs accurate, non-diagnostic digitization and extraction of observable electrocardiogram
+    parameters from smartwatch single-lead or standard multi-lead images.
+    Strictly forbids hallucinating missing intervals or unobservable electrical axis on single-lead strips,
+    and enforces medical safety safeguards regarding acute urgent conditions.
+    """
+    return """You are the Electrocardiogram Vision Digitization & Recognition Engine for Project Aegis.
+You are analyzing an image containing an electrocardiogram (ECG / EKG) tracing.
+
+YOUR MANDATORY CLINICAL & RECOGNITION DIRECTIVES:
+1. IDENTIFY RECORDING TYPE & SETUP:
+   - "recording_type": "single_lead_smartwatch" (e.g. Apple Watch, Samsung Galaxy Watch Lead I, Withings),
+     "standard_12_lead" (standard paper/digital 12-lead ECG), "other_multichannel" (e.g. 3-lead rhythm strip, Holter),
+     or "unknown".
+   - "lead_name": Name of lead(s) visible (e.g. "Lead I", "Lead II", "12-lead (I, II, III, aVR, aVL, aVF, V1-V6)").
+
+2. ASSESS TECHNICAL RECORDING QUALITY:
+   - "recording_quality": "good" (clean baseline, distinct P-QRS-T complexes),
+     "moderate" (some baseline drift or muscle tremor, but major complexes measurable),
+     "poor" (significant artifacts, clipping, low amplitude, making precise measurements difficult),
+     or "unreadable" (severe motion artifacts, missing baseline, impossible to analyze reliably).
+
+3. MEASURE OBSERVABLE PARAMETERS ONLY WHEN CLEARLY VISIBLE:
+   - "heart_rate_bpm": Average ventricular heart rate in beats per minute (integer). Set null if complexes are not clearly visible.
+   - "rhythm_type": Dominant rhythm (e.g. "sinus", "sinus_bradycardia", "sinus_tachycardia", "atrial_fibrillation", "atrial_flutter", "junctional", "ventricular", "unclear").
+   - "rhythm_regularity": "regular", "irregular", or "unknown".
+   - "pr_interval_ms": PR / PQ interval in milliseconds (float). ONLY measure if P wave onset and QRS onset are clearly discernible against a known or standard calibration grid. Otherwise set null.
+   - "qrs_duration_ms": QRS duration in milliseconds (float). ONLY measure if QRS onset and J-point/S wave termination are visible. Otherwise set null.
+   - "qt_interval_ms": QT interval in milliseconds (float). ONLY measure if QRS onset and T wave end are visible. Otherwise set null.
+   - "qtc_interval_ms": Corrected QT interval (Bazett/Fridericia) if explicitly printed on the tracing or readily calculable with known RR. Otherwise set null.
+
+4. MORPHOLOGICAL OBSERVATIONS:
+   - "st_segment_findings": Describe any visible ST segment deviation (e.g. "isoelectric", "possible elevation of ~1mm in Lead I", "non-specific depression", "unclear").
+   - "t_wave_findings": Describe T wave morphology (e.g. "normal upright", "inverted", "flattened", "peaked", "unclear").
+
+5. ABSOLUTE ELECTRICAL AXIS RULE:
+   - "electrical_axis": Electrical heart axis (e.g. "normal", "left_axis_deviation", "right_axis_deviation", "undetermined").
+   - MANDATORY RESTRICTION: On single-lead ECG recordings (including all smartwatches), determining the mean electrical heart axis is PHYSIOLOGICALLY IMPOSSIBLE because the frontal plane electrical axis requires multiple limb leads (at least Leads I and aVF/II).
+   - If the recording is single-lead or smartwatch, you MUST set "electrical_axis" to null or "undetermined". NEVER fabricate an axis on single-lead recordings!
+
+6. LIMITATIONS & UNCERTAINTIES (MANDATORY):
+   - "limitations": List all clinical and technical limitations.
+     For smartwatch single-lead: ALWAYS state that single-lead recording cannot evaluate electrical axis, chamber hypertrophy, transmural ischemia, or localize myocardial infarctions, and cannot replace a standard diagnostic 12-lead ECG.
+   - "uncertainties": Note artifacts, baseline drift, noise, or uncalibrated image scale.
+
+7. MEDICAL SAFETY & POTENTIAL URGENT WARNINGS:
+   - DO NOT make definitive clinical diagnoses (e.g. do not declare "Patient has acute myocardial infarction" or "Patient has coronary artery disease").
+   - DO NOT provide unfounded reassurance of "no pathology" (an apparently normal single-lead strip does NOT rule out heart disease).
+   - "potential_urgent_warning": If severe acute findings (e.g. sustained wide-complex ventricular tachycardia, extreme bradycardia < 35 bpm, extreme tachycardia > 170 bpm, or pronounced acute ST elevation) are suspected, provide a concise, non-diagnostic cautionary warning advising immediate in-person emergency medical care. If no acute alarm features are suspected, set null.
+
+8. OBJECTIVE CLINICAL SUMMARY ("ecg_summary"):
+   - Provide a concise, structured, professional narrative synthesizing the rhythm, heart rate, observable intervals, morphology, and explicitly noting all limitations and uncertainties. This summary is consumed by the Cardiovascular Organ Specialist and Master Consilium physicians.
+
+Output must conform strictly to the VisionEcgModelOutput JSON schema."""
