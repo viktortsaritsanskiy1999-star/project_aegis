@@ -106,7 +106,7 @@ class LabRevisionConsiliumService:
     """
 
     _CYCLE_LOCKS: Dict[str, asyncio.Lock] = {}
-    _LEDGER_THREAD_LOCKS: Dict[str, threading.Lock] = {}
+    _LEDGER_THREAD_LOCKS: Dict[str, threading.RLock] = {}
     _LEDGER_META_LOCK = threading.Lock()
 
     def __init__(
@@ -115,7 +115,7 @@ class LabRevisionConsiliumService:
         gateway: Optional[GeminiGateway] = None,
         now_provider: Optional[Callable[[], datetime]] = None,
         lock_registry: Optional[Dict[str, asyncio.Lock]] = None,
-        ledger_lock_registry: Optional[Dict[str, threading.Lock]] = None,
+        ledger_lock_registry: Optional[Dict[str, threading.RLock]] = None,
         lease_ttl_seconds: int = LAB_REVISION_IN_FLIGHT_LOCK_TTL_SECONDS,
         lease_heartbeat_interval_seconds: float = LAB_REVISION_IN_FLIGHT_LOCK_HEARTBEAT_SECONDS,
     ):
@@ -141,11 +141,11 @@ class LabRevisionConsiliumService:
             self._lock_registry[cycle_id] = lock
         return lock
 
-    def _get_ledger_thread_lock(self, cycle_id: str) -> threading.Lock:
+    def _get_ledger_thread_lock(self, cycle_id: str) -> threading.RLock:
         with self._LEDGER_META_LOCK:
             lock = self._ledger_lock_registry.get(cycle_id)
             if lock is None:
-                lock = threading.Lock()
+                lock = threading.RLock()
                 self._ledger_lock_registry[cycle_id] = lock
             return lock
 
@@ -202,7 +202,9 @@ class LabRevisionConsiliumService:
     # 1. VERSIONED LABORATORY LEDGER & UNREVIEWED STATUS
     # ==========================================================================
 
-    def _ensure_baseline_ledger_seeded(self, cycle_id: str) -> Optional[ModelReport]:
+    def _ensure_baseline_ledger_seeded(
+        self, cycle_id: str, commit: bool = True
+    ) -> Optional[ModelReport]:
         """
         If `laboratory_ledger` has not been created yet for `cycle_id`, seeds v1 from
         the preparatory Vision OCR report (`preparatory_vision_ocr`) if present.
@@ -341,16 +343,18 @@ class LabRevisionConsiliumService:
                 },
                 expected_version=1,
                 max_retries=0,
+                commit=commit,
             )
         except (ReportVersionConflictError, IntegrityError):
-            self.db.rollback()
-            self.db.expire_all()
-            existing_ledgers = self.report_repo.list_server_only(
-                cycle_id=cycle_id,
-                report_type=LABORATORY_LEDGER_REPORT_TYPE,
-            )
-            if existing_ledgers:
-                return existing_ledgers[0]
+            if commit:
+                self.db.rollback()
+                self.db.expire_all()
+                existing_ledgers = self.report_repo.list_server_only(
+                    cycle_id=cycle_id,
+                    report_type=LABORATORY_LEDGER_REPORT_TYPE,
+                )
+                if existing_ledgers:
+                    return existing_ledgers[0]
             raise
 
     @staticmethod
@@ -397,11 +401,17 @@ class LabRevisionConsiliumService:
             return 0
         return 0
 
-    def get_lab_ledger_state(self, cycle_id: str) -> LabLedgerStateResponse:
+    def get_lab_ledger_state(
+        self, cycle_id: str, commit: bool = True
+    ) -> LabLedgerStateResponse:
         if not self.cycle_repo.get(cycle_id):
             raise ConsiliumCycleNotFoundError(f"Medical cycle '{cycle_id}' not found.")
 
-        latest_ledger_report = self._ensure_baseline_ledger_seeded(cycle_id)
+        latest_ledger_report = (
+            self._ensure_baseline_ledger_seeded(cycle_id, commit=False)
+            if not commit
+            else self._ensure_baseline_ledger_seeded(cycle_id)
+        )
         last_evaluated_ver = self._get_last_evaluated_ledger_version(cycle_id)
 
         if latest_ledger_report is None:
@@ -466,6 +476,7 @@ class LabRevisionConsiliumService:
         cycle_id: str,
         mutations: List[LabMarkerMutationItem | Dict[str, Any]],
         max_retries: int = 5,
+        commit: bool = True,
     ) -> LabLedgerStateResponse:
         """
         Saves new laboratory markers, new dated studies, corrections of erroneous values,
@@ -486,7 +497,7 @@ class LabRevisionConsiliumService:
             for m in mutations
         ]
 
-        effective_retries = max(0, int(max_retries))
+        effective_retries = max(0, int(max_retries)) if commit else 0
         with self._get_ledger_thread_lock(cycle_id):
             for attempt in range(effective_retries + 1):
                 if attempt > 0:
@@ -499,7 +510,11 @@ class LabRevisionConsiliumService:
                     if not cycle:
                         raise ConsiliumCycleNotFoundError(f"Medical cycle '{cycle_id}' not found.")
 
-                    current_state = self.get_lab_ledger_state(cycle_id)
+                    current_state = (
+                        self.get_lab_ledger_state(cycle_id, commit=False)
+                        if not commit
+                        else self.get_lab_ledger_state(cycle_id)
+                    )
                     next_ledger_ver = current_state.ledger_version + 1
                     now_iso = self._now_utc().isoformat()
 
@@ -664,14 +679,24 @@ class LabRevisionConsiliumService:
                         },
                         expected_version=next_ledger_ver,
                         max_retries=0,
+                        commit=commit,
                     )
-                    return self.get_lab_ledger_state(cycle_id)
+                    return (
+                        self.get_lab_ledger_state(cycle_id, commit=False)
+                        if not commit
+                        else self.get_lab_ledger_state(cycle_id)
+                    )
                 except (ReportVersionConflictError, OperationalError, IntegrityError) as exc:
-                    self.db.rollback()
-                    if attempt >= effective_retries:
+                    if commit:
+                        self.db.rollback()
+                        if attempt >= effective_retries:
+                            raise ConsiliumConcurrencyConflictError(
+                                f"Concurrent laboratory ledger update conflict for cycle '{cycle_id}' "
+                                f"after {effective_retries + 1} attempts: {exc}"
+                            ) from exc
+                    else:
                         raise ConsiliumConcurrencyConflictError(
-                            f"Concurrent laboratory ledger update conflict for cycle '{cycle_id}' "
-                            f"after {effective_retries + 1} attempts: {exc}"
+                            f"Concurrent laboratory ledger update conflict for cycle '{cycle_id}': {exc}"
                         ) from exc
 
     # ==========================================================================
