@@ -5,6 +5,8 @@ from sqlalchemy.orm import Session
 
 from app.database import get_db
 from app.schemas.consilium import (
+    AnamnesisIntakeRequest,
+    AnamnesisIntakeClientResponse,
     PrimaryConsiliumRunRequest,
     PrimaryConsiliumClientResponse,
     WeeklyConsiliumRunRequest,
@@ -23,6 +25,8 @@ from app.services.primary_consilium_service import (
     ConsiliumCycleNotFoundError,
     ConsiliumContextMissingError,
     ConsiliumQualityRejectionError,
+    ConsiliumAnamnesisLockedError,
+    ConsiliumConcurrencyConflictError,
 )
 from app.services.weekly_consilium_service import WeeklyConsiliumService
 from app.services.lab_revision_consilium_service import (
@@ -41,6 +45,52 @@ def get_gemini_gateway() -> GeminiGateway:
 def get_server_now_provider() -> Callable[[], datetime]:
     """Dependency provider for authoritative server UTC clock (overrideable in tests)."""
     return lambda: datetime.now(timezone.utc)
+
+
+@router.post(
+    "/intake/anamnesis",
+    response_model=AnamnesisIntakeClientResponse,
+    summary="Submit raw questionnaire answers and run server-side Anamnesis M1 in strict blind mode",
+    description=(
+        "Authorized endpoint receiving raw answers from Flutter anamnesis cards. "
+        "Strictly forbids AI conclusions, organ shelves, or laboratory data from the client. "
+        "Reconstructs context on the server, runs Gemini Flash (M1) in blind mode, and atomically "
+        "persists raw answers and verified M1 output under server_only privacy level. "
+        "Returns only client-facing summary and metadata."
+    ),
+)
+async def submit_anamnesis_intake_endpoint(
+    payload: AnamnesisIntakeRequest,
+    db: Session = Depends(get_db),
+    gateway: GeminiGateway = Depends(get_gemini_gateway),
+    _token: str = Depends(verify_client_token),
+) -> AnamnesisIntakeClientResponse:
+    service = PrimaryConsiliumService(db=db, gateway=gateway)
+    try:
+        return await service.process_anamnesis_intake(
+            cycle_id=payload.cycle_id,
+            answers=payload.answers,
+        )
+    except ConsiliumCycleNotFoundError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=str(exc),
+        )
+    except (ConsiliumAnamnesisLockedError, ConsiliumConcurrencyConflictError) as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=str(exc),
+        )
+    except GeminiGatewayError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Gemini Anamnesis M1 execution failed: {exc}",
+        )
+    except ConsiliumError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(exc),
+        )
 
 
 @router.post(

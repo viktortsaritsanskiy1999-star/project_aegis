@@ -119,6 +119,124 @@ class AnamnesisModelOutput(BaseModel):
     training_sandbox: AnamnesisTrainingSandbox
 
 
+class AnamnesisQuestionnaireAnswers(BaseModel):
+    """
+    Strict server-side validation schema for raw answers from the 17 Flutter anamnesis cards.
+    Rejects client injection of AI hypotheses, internal comments, organ shelves, or laboratory data.
+    """
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    # Card 0: Age Gate
+    age_confirmation: str = Field(..., max_length=64)
+
+    # Card 1: Biological Profile
+    gender: str = Field(..., max_length=32)
+    age: int = Field(..., ge=18, le=120)
+
+    # Card 2: Dimensions
+    height: int = Field(..., ge=50, le=260)
+    weight: int = Field(..., ge=30, le=350)
+
+    # Card 3: Nicotine
+    nicotine_status: str = Field(..., min_length=1, max_length=128)
+    nicotine_years: Optional[str] = Field(default=None, max_length=128)
+    nicotine_freq: Optional[str] = Field(default=None, max_length=128)
+
+    # Card 4: Alcohol
+    alcohol_status: str = Field(..., min_length=1, max_length=128)
+    alcohol_type: Optional[str] = Field(default=None, max_length=128)
+
+    # Card 5: Specific Factors
+    spec_factors: str = Field(..., min_length=1, max_length=512)
+
+    # Card 6: Sleep
+    sleep_quality: str = Field(..., min_length=1, max_length=128)
+
+    # Card 7: Diet Types
+    diet_types: str = Field(..., min_length=1, max_length=512)
+
+    # Card 8: Dietary Habits
+    diet_habits: str = Field(..., min_length=1, max_length=512)
+
+    # Card 9: GI Signals
+    gi_signals: str = Field(..., min_length=1, max_length=512)
+
+    # Card 10 & 10.1: Work Mode & Sport
+    work_type: str = Field(..., min_length=1, max_length=128)
+    work_schedule: Optional[str] = Field(default=None, max_length=128)
+    sport_level: Optional[str] = Field(default=None, max_length=128)
+
+    # Card 11: Chronic Conditions
+    chronic_diseases: str = Field(..., min_length=1, max_length=1024)
+    onco_status: Optional[str] = Field(default=None, max_length=128)
+
+    # Card 12: Recent Illness
+    recent_illness: str = Field(..., min_length=1, max_length=512)
+
+    # Card 13: Screening & Safe Space
+    critical_infections: str = Field(..., min_length=1, max_length=512)
+
+    # Card 14: Heredity
+    heredity_risks: str = Field(..., min_length=1, max_length=1024)
+
+    # Card 15: Medications & Supplements
+    medications: str = Field(..., min_length=1, max_length=1024)
+
+    # Optional custom user text inputs from Flutter cards
+    user_text_medications: Optional[str] = Field(default=None, max_length=1024)
+    user_text_heredity_risks: Optional[str] = Field(default=None, max_length=1024)
+    user_text_chronic_diseases: Optional[str] = Field(default=None, max_length=1024)
+    user_text_recent_illness: Optional[str] = Field(default=None, max_length=1024)
+    user_text_critical_infections: Optional[str] = Field(default=None, max_length=1024)
+    user_text_spec_factors: Optional[str] = Field(default=None, max_length=1024)
+    user_text_diet_habits: Optional[str] = Field(default=None, max_length=1024)
+    user_text_gi_signals: Optional[str] = Field(default=None, max_length=1024)
+
+    @field_validator("age_confirmation")
+    @classmethod
+    def validate_age_confirmation(cls, v: str) -> str:
+        s = v.strip().lower()
+        if s not in ("confirmed", "true", "1", "yes", "подтверждено"):
+            raise ValueError("Age confirmation must be 'Confirmed'.")
+        return "Confirmed"
+
+    @field_validator("gender")
+    @classmethod
+    def validate_gender(cls, v: str) -> str:
+        s = v.strip().lower()
+        if s in ("male", "m", "мужской", "м"):
+            return "Male"
+        if s in ("female", "f", "женский", "ж"):
+            return "Female"
+        raise ValueError("Gender must be 'Male' or 'Female'.")
+
+
+class AnamnesisIntakeRequest(BaseModel):
+    """Client request payload to submit raw questionnaire answers for server-side Anamnesis M1 processing."""
+    model_config = ConfigDict(extra="forbid")
+
+    cycle_id: str = Field(..., min_length=3, max_length=64)
+    answers: AnamnesisQuestionnaireAnswers
+
+
+class AnamnesisIntakeClientResponse(BaseModel):
+    """
+    Client-facing response returned after server-side Anamnesis M1 intake.
+    Returns only service-level confirmation metadata.
+    Zero leakage of preparatory AI conclusions, user_view.summary, system_logic,
+    or training_sandbox (all retained securely under server_only privacy level).
+    """
+    model_config = ConfigDict(extra="forbid")
+
+    cycle_id: str
+    status: str = Field(default="processed")
+    intake_version: int = Field(..., ge=1)
+    created_at_utc: str
+    privacy_notice: str = Field(
+        default="Anamnesis processed in strict blind mode; raw answers stored securely under server_only privacy level."
+    )
+
+
 # =====================================================================
 # 2. 8 ORGAN-SPECIFIC AGENTS (FLASH-LITE) SCHEMAS (SERVER ONLY)
 # =====================================================================

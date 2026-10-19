@@ -156,6 +156,7 @@ def _seed_preparatory_cycle_context(db_session, cycle_id: str = "cycle_consilium
             "creatinine": "82 umol/L",
             "glucose": "5.1 mmol/L",
         },
+        created_at=datetime(2026, 10, 18, 9, 0, tzinfo=timezone.utc),
     )
     service.save_preparatory_ecg_summary(
         cycle_id=cycle_id,

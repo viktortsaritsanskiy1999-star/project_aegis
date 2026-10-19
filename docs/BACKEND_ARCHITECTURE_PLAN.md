@@ -402,8 +402,8 @@ Project Aegis эволюционирует от автономного моби�
 ```
 
 ### Разграничение `privacy_level` в `model_reports`:
-* `server_only`: `internal_analysis`, `system_training_shelf`, `pro_training_shelf`, `athena_handoff`.
-* `client_facing`: `system_general_shelf`, `pro_general_shelf`, `user_workout_report`.
+* `server_only`: `raw_user_anamnesis`, `preparatory_anamnesis_m1`, `preparatory_vision_ocr`, `preparatory_vision_ecg`, `internal_analysis`, `system_training_shelf`, `flash_training_shelf`, `pro_training_shelf`, `athena_handoff`, `laboratory_ledger`, `laboratory_diff_audit`.
+* `client_facing`: `system_general_shelf`, `pro_general_shelf`, `user_workout_report`, `user_overall_report`, `anamnesis_intake_summary`.
 
 ---
 
@@ -427,10 +427,16 @@ Project Aegis эволюционирует от автономного моби�
 
 ## 12. План поэтапной реализации (Implementation Roadmap)
 
-1. **Этап 1 (Текущий):** Создание каркаса `backend/` с FastAPI, Pydantic v2, SQLite, миграциями Alembic, сущностями хранения (`MedicalCycle`, `WeeklySprint`, `WorkoutSession`, `HealthMeasurement`, `ModelReport`) и `GET /health`.
-2. **Этап 2:** Настройка защищенной конфигурации Windows, безопасного токена устройства и локального сетевого профиля (loopback + LAN).
-3. **Этап 3:** Реализация серверных эндпоинтов для каскада органов и разделения полок (`system_general_shelf` клиенту, `system_training_shelf` в защищенную БД).
-4. **Этап 4:** Реализация модуля Workout Intelligence на сервере (заполнение `internal_analysis`, `user_workout_report`, `athena_handoff`).
+1. **Этап 1 (Завершён):** Создание каркаса `backend/` с FastAPI, Pydantic v2, SQLite, миграциями Alembic, сущностями хранения (`MedicalCycle`, `WeeklySprint`, `WorkoutSession`, `HealthMeasurement`, `ModelReport`) и `GET /health`.
+2. **Этап 2 (Завершён):** Настройка защищенной конфигурации Windows, безопасного токена устройства и локального сетевого профиля (loopback + LAN).
+3. **Этап 3 (Завершён):**
+   * **Stage 3.1 & 3.2:** Первичный медицинский консилиум (Primary Consilium): 8 Gemini Flash-Lite $\rightarrow$ Deputy Flash $\rightarrow$ Chief Physician Pro.
+   * **Stage 3.3:** Недельный консилиум (Weekly Consilium) и версионирование стратегии Афины: Deputy Flash $\rightarrow$ Chief Physician Pro.
+   * **Stage 3.4:** Повторный полный консилиум при изменении лабораторных данных (Lab Revision Consilium): версионируемый лабораторный реестр (`laboratory_ledger`), детерминированный движок сравнения (`compute_laboratory_diff`), 168-часовой cooldown и атомарный пересмотр.
+4. **Этап 4:**
+   * **Stage 4.1A (Текущий — Реализован):** Защищённый серверный приём анкеты анамнеза (`POST /api/v1/cascade/intake/anamnesis`), строгий слепой режим Anamnesis M1 (`GeminiModelRole.FLASH`), исключение любых лабораторных маркеров, атомарное сохранение `raw_user_anamnesis` и `preparatory_anamnesis_m1` под `server_only`, возврат только безопасных служебных метаданных `AnamnesisIntakeClientResponse` (без summary и без AI-выводов). Блокировка изменения базового подготовительного снимка M1 после завершения первичного консилиума текущего цикла (версионированные обновления анамнеза при длительном наблюдении будут спроектированы отдельно).
+   * **Stage 4.1B:** Vision OCR лабораторных анализов и Vision ECG.
+   * **Stage 4.2:** Серверный модуль Workout Intelligence (анализ тренировок, `internal_analysis`, `user_workout_report`, `athena_handoff`).
 5. **Этап 5:** Перенос генерации клинического отчета наблюдений `hospital_referral_document.dart` в серверный генератор PDF/DOCX с обязательным дисклеймером.
 6. **Этап 6:** Интеграция клиентского `HealthDataProvider` и `VaultService` с локальным сервером по REST/WebSocket.
 

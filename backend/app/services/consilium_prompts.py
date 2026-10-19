@@ -1,6 +1,6 @@
 import json
 from typing import Any, Dict
-from app.schemas.consilium import SYSTEM_KEYS
+from app.schemas.consilium import SYSTEM_KEYS, AnamnesisQuestionnaireAnswers
 
 # ==============================================================================
 # 1. ANAMNESIS MODULE (M1) — STRICTLY BLIND MODE (NO LAB ACCESS)
@@ -35,6 +35,255 @@ def sanitize_blind_anamnesis_context(raw_context: Dict[str, Any]) -> Dict[str, A
         else:
             sanitized[k] = v
     return sanitized
+
+
+def build_anamnesis_m1_context_from_answers(
+    answers: AnamnesisQuestionnaireAnswers,
+) -> Dict[str, Any]:
+    """
+    Reconstructs the authoritative server-side Anamnesis context from validated questionnaire answers.
+    Enforces strict blind mode by construction:
+    - Only incorporates verified lifestyle, physiological, and demographic factors from the allowlist.
+    - Does NOT accept or process any laboratory results, ECG, or external AI outputs.
+    - Accurately reproduces the physiological system mapping originally defined in VaultService.saveAnamnesis.
+    """
+    system_folders: Dict[str, Dict[str, Any]] = {k: {} for k in SYSTEM_KEYS}
+
+    # 1. Demographic & Anthropometric (gender, age, height, weight)
+    gender = answers.gender
+    system_folders["endocrine"]["user_gender"] = gender
+    system_folders["kidneys"]["user_gender"] = gender
+    system_folders["cvs"]["user_gender"] = gender
+
+    system_folders["endocrine"]["physical_height"] = answers.height
+    system_folders["endocrine"]["physical_weight"] = answers.weight
+    system_folders["cvs"]["load_height"] = answers.height
+    system_folders["cvs"]["load_weight"] = answers.weight
+    system_folders["musculoskeletal"]["axial_load_height"] = answers.height
+    system_folders["musculoskeletal"]["axial_load_weight"] = answers.weight
+
+    # 2. Nicotine (respiratory, cvs, immune)
+    nic_status = answers.nicotine_status
+    system_folders["respiratory"]["smoking_nicotine_status"] = nic_status
+    system_folders["respiratory"]["smoking_status"] = nic_status
+    system_folders["cvs"]["vessel_nicotine_status"] = nic_status
+    system_folders["cvs"]["vessel_status"] = nic_status
+    if nic_status.lower() not in ("non-user", "не курю", "quit", "бросил"):
+        system_folders["immune"]["broncho_local_imm_disruption"] = True
+    if answers.nicotine_years:
+        system_folders["respiratory"]["smoking_nicotine_years"] = answers.nicotine_years
+        system_folders["respiratory"]["smoking_years"] = answers.nicotine_years
+        system_folders["cvs"]["vessel_nicotine_years"] = answers.nicotine_years
+        system_folders["cvs"]["vessel_years"] = answers.nicotine_years
+    if answers.nicotine_freq:
+        system_folders["respiratory"]["smoking_nicotine_freq"] = answers.nicotine_freq
+        system_folders["respiratory"]["smoking_freq"] = answers.nicotine_freq
+        system_folders["cvs"]["vessel_nicotine_freq"] = answers.nicotine_freq
+        system_folders["cvs"]["vessel_freq"] = answers.nicotine_freq
+
+    # 3. Alcohol (gi_tract, nervous, kidneys, endocrine, cvs)
+    alc_status = answers.alcohol_status
+    alc_lower = alc_status.lower()
+    alc_type = (answers.alcohol_type or "").lower()
+    if alc_lower not in ("non-user", "zero", "не пью", "0"):
+        system_folders["gi_tract"]["liver_tox_load"] = "Alcohol consumption recorded"
+        system_folders["nervous"]["gaba_neuro_load"] = "Ethanol-induced GABA modulation"
+    if "пиво" in alc_type or "beer" in alc_type:
+        system_folders["kidneys"]["uric_acid_risk"] = True
+        system_folders["endocrine"]["visceral_adipose_trigger"] = True
+    if any(s in alc_type for s in ("крепкое", "вино", "vodka", "wine", "spirits", "liquor", "hard liquor")):
+        system_folders["cvs"]["cardiomyopathy_risk"] = True
+
+    # 4. Specific Factors (nervous, cvs, gi_tract, respiratory)
+    spec_lower = f"{answers.spec_factors} {answers.user_text_spec_factors or ''}".lower()
+    if any(s in spec_lower for s in ("стимуляция", "кофеин", "предтреник", "spec_stim", "stim")):
+        system_folders["nervous"]["synaptic_overdrive"] = "Stimulation (caffeine, pre-workouts)"
+        system_folders["cvs"]["vasoconstriction_tachy_response"] = "Vasoconstrictor potential"
+        system_folders["gi_tract"]["mucosal_ischemia_hyperacidity"] = "Risk of hyperacidity / mucosal ischemia"
+    if any(s in spec_lower for s in ("седация", "антидепрессант", "spec_sed", "sed")):
+        system_folders["nervous"]["cns_stabilization_mod"] = "Pharmacological sedation (BP)"
+    if any(s in spec_lower for s in ("ингаляции", "вейп", "spec_inhale", "inhale", "vape")):
+        system_folders["respiratory"]["alveolar_stress"] = "Aerosol / respiratory alveolar stress"
+        system_folders["nervous"]["heb_psych_effect"] = "Active inhalation components"
+    if any(s in spec_lower for s in ("восстановление", "spec_recovery", "recovery")):
+        system_folders["nervous"]["receptor_downregulation_history"] = "Receptor apparatus recovery period"
+
+    # 5. Sleep (endocrine, nervous)
+    sleep = answers.sleep_quality
+    system_folders["endocrine"]["circadian_desynchronosis"] = f"Circadian desynchronosis (Sleep quality: {sleep})"
+    if sleep in ("Бессонница", "Сбит режим", "Schedule off", "Insomnia"):
+        system_folders["nervous"]["glymphatic_clearance_disruption"] = True
+
+    # 6. Diet Types (gi_tract, kidneys, endocrine, cvs, musculoskeletal, immune)
+    diet_types = answers.diet_types.lower()
+    if any(s in diet_types for s in ("мясо", "meat", "diet_meat")):
+        system_folders["gi_tract"]["protease_load"] = "High protease demand (meat diet)"
+        system_folders["kidneys"]["nitrogen_waste_load"] = "Increased nitrogen waste load"
+    if any(s in diet_types for s in ("овощи", "vegetables", "diet_veg")):
+        system_folders["gi_tract"]["microbiome_substrate"] = "Sufficient dietary fiber"
+    if any(s in diet_types for s in ("фастфуд", "fastfood", "diet_junk", "junk")):
+        system_folders["endocrine"]["insulin_spike_risk"] = "High glycemic load index (fast food)"
+        system_folders["cvs"]["endothelial_lipid_damage"] = "Atherogenic dietary profile (trans fats)"
+    if any(s in diet_types for s in ("рыба", "fish", "diet_fish")):
+        system_folders["cvs"]["omega3_cardioprotection"] = "Omega-3 protection active"
+    if any(s in diet_types for s in ("молочн", "milk", "dairy", "diet_milk")):
+        system_folders["gi_tract"]["lactase_check"] = "Consumption of lactose-containing products"
+        system_folders["musculoskeletal"]["minor_calcium_source"] = "Dietary calcium source in the diet"
+    if any(s in diet_types for s in ("vegan", "веган", "diet_vegan")):
+        system_folders["immune"]["leukopoiesis_deficiency_risk"] = True
+        system_folders["cvs"]["hyperhomocysteinemia_endothelial_destruction"] = True
+
+    # 7. Diet Habits (endocrine, cvs, kidneys, nervous, gi_tract)
+    diet_habits = f"{answers.diet_habits} {answers.user_text_diet_habits or ''}".lower()
+    if any(s in diet_habits for s in ("сладкое", "sugar", "hab_sugar")):
+        system_folders["endocrine"]["carb_metabolism_glycation"] = "Excess simple carbohydrates (glycation risk)"
+    if any(s in diet_habits for s in ("солен", "salt", "hab_salt")):
+        system_folders["cvs"]["volemic_hypertension_load"] = "Sodium-dependent volemic load"
+        system_folders["kidneys"]["tubular_osmotic_load"] = "Increased tubular osmotic load"
+    if any(s in diet_habits for s in ("кофе", "coffee", "hab_coffee")):
+        system_folders["nervous"]["adenosine_receptor_blockade"] = "Chronic adenosine receptor blockade"
+        system_folders["cvs"]["arrhythmogenic_potential_bp_fluctuation"] = "Catecholamine blood pressure shift (caffeine)"
+        system_folders["gi_tract"]["gastric_acid_stimulation"] = "Stimulation of HCl secretion by parietal cells"
+    if any(s in diet_habits for s in ("дожор", "night", "hab_night")):
+        system_folders["gi_tract"]["nocturnal_reflux_risk"] = "Risk of nocturnal reflux"
+        system_folders["endocrine"]["nocturnal_sth_blockade"] = "Risk of suppressing nocturnal GH (STH) secretion"
+    if any(s in diet_habits for s in ("мало воды", "water", "hab_water")):
+        system_folders["kidneys"]["hypersthenuria_urolithiasis_risk"] = "Risk of hypersthenuria and urolithiasis"
+        system_folders["cvs"]["hemoconcentration_viscosity_load"] = "Hemoconcentration syndrome (circulating blood volume deficit)"
+
+    # 8. GI Signals (gi_tract)
+    gi_signals = f"{answers.gi_signals} {answers.user_text_gi_signals or ''}".lower()
+    if not any(s in gi_signals for s in ("gi_ok", "no discomfort", "нет дискомфорта", "норма")) and gi_signals.strip():
+        system_folders["gi_tract"]["symptoms_motility_sibr"] = "Dyspepsia symptoms / GI motility disorders recorded"
+
+    # 9. Work & Sport (musculoskeletal, cvs, nervous, endocrine)
+    work_type = answers.work_type
+    system_folders["musculoskeletal"]["biomechanics_work_type"] = f"Biomechanics specificity: {work_type}"
+    system_folders["cvs"]["cardio_adaptation_index"] = f"Physiological adaptation level: {work_type}"
+    work_str = f"{work_type} {answers.work_schedule or ''}".lower()
+    if any(s in work_str for s in ("смен", "ноч", "без выходных", "shift", "no days off")):
+        system_folders["nervous"]["sympathicotonia_stress"] = "Chronic sympathicotonia (stress-induced)"
+        system_folders["endocrine"]["adrenal_distress_cortisol"] = "Signs of adrenal distress (cortisol shift)"
+    if answers.work_schedule:
+        system_folders["musculoskeletal"]["biomechanics_work_schedule"] = f"Biomechanics specificity: {answers.work_schedule}"
+    if answers.sport_level:
+        system_folders["musculoskeletal"]["biomechanics_sport_level"] = f"Biomechanics specificity: {answers.sport_level}"
+        system_folders["cvs"]["cardio_adaptation_index"] = (
+            f"Physiological adaptation level: {work_type} | Sport: {answers.sport_level}"
+        )
+
+    # 10. Chronic Diseases (endocrine, cvs, kidneys, respiratory, immune, musculoskeletal, nervous, gi_tract)
+    chr_dis = f"{answers.chronic_diseases} {answers.user_text_chronic_diseases or ''}".lower()
+    if any(s in chr_dis for s in ("диабет", "diabetes", "chr_diabetes")):
+        system_folders["endocrine"]["primary_defect_db"] = "History of diabetes mellitus"
+        system_folders["cvs"]["macroangiopathy_accelerated_atherosclerosis"] = "Accelerated atherosclerosis (diabetic macroangiopathy)"
+        system_folders["kidneys"]["diabetic_nephropathy_hyperfiltration"] = "Risk of diabetic nephropathy / hyperfiltration"
+    if any(s in chr_dis for s in ("давлен", "гипертенз", "сердце", "heart", "hypertension", "chr_heart")):
+        system_folders["cvs"]["chronic_cvs_pathology"] = "Arterial hypertension / Chronic cardiovascular pathology"
+    if any(s in chr_dis for s in ("астма", "аллерг", "asthma", "allergy", "chr_asthma")):
+        system_folders["respiratory"]["bronchial_hyperreactivity"] = "Bronchial hyperreactivity"
+        system_folders["immune"]["th2_atopic_shift_ige"] = "Atopic immune formula shift (Th2-profile)"
+        system_folders["immune"]["th2_atopic_shif_ige"] = "Atopic immune formula shift (Th2-profile)"
+    if any(s in chr_dis for s in ("сустав", "спина", "позвоночник", "bones", "joints", "spine", "chr_bones")):
+        system_folders["musculoskeletal"]["chronic_degradation_inflammation"] = "Chronic degenerative-inflammatory musculoskeletal lesion"
+    if any(s in chr_dis for s in ("невролог", "эпилепси", "neuro", "epilepsy", "chr_neuro")):
+        system_folders["nervous"]["chronic_cns_pns_pathology"] = "Organic or functional CNS/PNS pathology"
+    if any(s in chr_dis for s in ("chr_gi", "гастрит", "язв", "gastritis", "ulcer")):
+        system_folders["gi_tract"]["chronic_gi_pathology"] = "Chronic GI pathology recorded"
+
+    # 11. Oncology (immune)
+    if answers.onco_status:
+        system_folders["immune"]["antitumor_surveillance_deficit"] = "Increased oncological alertness"
+
+    # 12. Recent Illness (immune, respiratory, gi_tract, kidneys)
+    rec_ill = f"{answers.recent_illness} {answers.user_text_recent_illness or ''}".lower()
+    if not any(s in rec_ill for s in ("ill_ok", "healthy", "здоров")):
+        system_folders["immune"]["postviral_exhaustion_formula_shift"] = "Post-viral asthenia syndrome / leukogram shift"
+        system_folders["respiratory"]["residual_lung_markers"] = "Residual lung tissue changes"
+        if any(s in rec_ill for s in ("отравление", "кишечная", "poison", "ill_poison")):
+            system_folders["gi_tract"]["mucosal_barrier_destruction_malabsorption"] = "Destruction of the small intestine mucosal barrier"
+            system_folders["kidneys"]["prerenal_dehydration_risk"] = True
+
+    # 13. Critical Infections (gi_tract, immune, respiratory, nervous, cvs, kidneys)
+    infections = f"{answers.critical_infections} {answers.user_text_critical_infections or ''}".lower()
+    if any(s in infections for s in ("гепатит", "hepatitis", "safe_hep")):
+        system_folders["gi_tract"]["hepatocyte_cytolysis_fibrosis"] = "Chronic viral hepatitis (risk of liver fibrosis)"
+        system_folders["immune"]["chronic_viral_persistence_hep"] = "Prolonged viral persistence"
+    if any(s in infections for s in ("вич", "hiv", "safe_hiv")):
+        system_folders["immune"]["cd4_destruction_immunodeficiency"] = "HIV-positive status (risk of T-cell deficiency)"
+    if any(s in infections for s in ("туберкулез", "tbc", "safe_tub")):
+        system_folders["respiratory"]["tbc_lung_lesions"] = "History of specific pulmonary tuberculosis"
+        system_folders["immune"]["specific_cellular_response"] = "Activation of specific cellular response"
+    if any(s in infections for s in ("сифилис", "syphilis", "safe_siph")):
+        system_folders["immune"]["specific_treponema_antibodies"] = "Specific antibodies to Treponema pallidum"
+        system_folders["nervous"]["neurosyphilis_organic_risk"] = True
+        system_folders["cvs"]["mesoaortitis_vascular_risk"] = True
+        system_folders["kidneys"]["membranous_nephropathy_immune_complex"] = True
+
+    # 14. Heredity Risks (cvs, immune, endocrine, nervous)
+    heredity = f"{answers.heredity_risks} {answers.user_text_heredity_risks or ''}".lower()
+    if any(s in heredity for s in ("инфаркт", "инсульт", "heart", "stroke", "her_heart")):
+        system_folders["cvs"]["genetic_dyslipidemia_atherosclerosis"] = "Burdened family history of CVD (early myocardial infarctions/strokes)"
+    if any(s in heredity for s in ("онко", "рак", "cancer", "onco", "her_onco")):
+        system_folders["immune"]["genetic_tumor_surveillance_weakness"] = "Family oncological history"
+    if any(s in heredity for s in ("диабет", "diab", "her_diab")):
+        system_folders["endocrine"]["polygenic_diabetes_predisposition"] = "Polygenic predisposition to carbohydrate metabolism disorders"
+    if any(s in heredity for s in ("альцгеймер", "деменци", "alzheimer", "dementia", "her_brain")):
+        system_folders["nervous"]["tau_amyloidosis_genetic_risk"] = "Genetic risk of early neurodegeneration"
+
+    # 15. Medications (endocrine, cvs, gi_tract, kidneys)
+    meds = f"{answers.medications} {answers.user_text_medications or ''}".lower()
+    if any(s in meds for s in ("кок", "гормон", "horm", "med_horm")):
+        system_folders["endocrine"]["exogenous_hormonal_background"] = "Exogenous steroid intake / hormone therapy"
+        system_folders["cvs"]["estrogen_hypercoagulation_thrombosis_risk"] = "Estrogen-induced hypercoagulability (risk of thrombosis)"
+    if any(s in meds for s in ("статин", "stat", "med_stat")):
+        system_folders["cvs"]["lipid_management_pharmacology"] = "Pharmacological lipid profile control (statins)"
+        system_folders["gi_tract"]["statin_liver_transaminase_control"] = "Transaminase monitoring (risk of drug-induced hepatitis)"
+    if any(s in meds for s in ("нпвс", "обезбол", "ибупрофен", "аспирин", "nsaid", "pain", "med_pain")):
+        system_folders["gi_tract"]["cox1_inhibition_gastropathy_erosion"] = "NSAID-induced gastropathy (COX-1 blockade)"
+        system_folders["kidneys"]["prostaglandin_block_afferent_arteriole_spasm"] = "Afferent arteriole spasm (risk of GFR decrease)"
+        system_folders["cvs"]["nsaid_hypertension_thrombotic_shift"] = "Prohypertensive effect of NSAIDs / sodium retention"
+
+    # Global / Core Data Log
+    core_data_log = {
+        "age_confirmation": answers.age_confirmation,
+        "gender": answers.gender,
+        "age": answers.age,
+        "height": answers.height,
+        "weight": answers.weight,
+        "nicotine_status": answers.nicotine_status,
+        "nicotine_years": answers.nicotine_years,
+        "nicotine_freq": answers.nicotine_freq,
+        "alcohol_status": answers.alcohol_status,
+        "alcohol_type": answers.alcohol_type,
+        "spec_factors": answers.spec_factors,
+        "sleep_quality": answers.sleep_quality,
+        "diet_types": answers.diet_types,
+        "diet_habits": answers.diet_habits,
+        "gi_signals": answers.gi_signals,
+        "work_type": answers.work_type,
+        "work_schedule": answers.work_schedule,
+        "sport_level": answers.sport_level,
+        "chronic_diseases": answers.chronic_diseases,
+        "onco_status": answers.onco_status,
+        "recent_illness": answers.recent_illness,
+        "critical_infections": answers.critical_infections,
+        "heredity_risks": answers.heredity_risks,
+        "medications": answers.medications,
+    }
+    user_texts = {
+        k: v
+        for k, v in answers.model_dump().items()
+        if k.startswith("user_text_") and v
+    }
+    if user_texts:
+        core_data_log["user_custom_notes"] = user_texts
+
+    full_context = {
+        "system_folders": system_folders,
+        "core_data_log": core_data_log,
+    }
+    return sanitize_blind_anamnesis_context(full_context)
 
 
 def build_anamnesis_prompt(raw_context: Dict[str, Any]) -> str:

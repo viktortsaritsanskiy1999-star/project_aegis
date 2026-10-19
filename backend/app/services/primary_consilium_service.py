@@ -1,3 +1,4 @@
+import asyncio
 from datetime import datetime, timezone
 import json
 from typing import Any, Dict, Optional
@@ -12,6 +13,8 @@ from app.schemas.consilium import (
     SYSTEM_TITLES,
     AegisAgentRole,
     AnamnesisModelOutput,
+    AnamnesisQuestionnaireAnswers,
+    AnamnesisIntakeClientResponse,
     SystemAgentOutput,
     FlashMasterOutput,
     ProMasterOutput,
@@ -22,6 +25,7 @@ from app.schemas.privacy import PrivacyLevel
 from app.schemas.reports import ClientModelReportResponse
 from app.services.consilium_prompts import (
     build_anamnesis_prompt,
+    build_anamnesis_m1_context_from_answers,
     build_system_agent_prompt,
     build_flash_master_prompt,
     build_pro_master_prompt,
@@ -29,6 +33,7 @@ from app.services.consilium_prompts import (
 from app.services.gemini_gateway import GeminiGateway, GeminiModelRole
 
 
+RAW_USER_ANAMNESIS_REPORT_TYPE = "raw_user_anamnesis"
 PREPARATORY_ANAMNESIS_REPORT_TYPE = "preparatory_anamnesis_m1"
 PREPARATORY_OCR_REPORT_TYPE = "preparatory_vision_ocr"
 PREPARATORY_ECG_REPORT_TYPE = "preparatory_vision_ecg"
@@ -56,6 +61,22 @@ class ConsiliumQualityRejectionError(ConsiliumError):
     """
 
 
+class ConsiliumAnamnesisLockedError(ConsiliumError):
+    """
+    Raised when user attempts to modify or resubmit baseline preparatory Anamnesis
+    after Primary Consilium has already been executed for the medical cycle.
+    This protects the authoritative preparatory M1 snapshot of the current stage;
+    versioned anamnesis tracking across long-term cycles will be designed separately.
+    """
+
+
+class ConsiliumConcurrencyConflictError(ConsiliumError):
+    """
+    Raised when concurrent worker processes attempt to commit conflicting intake
+    versions or answers simultaneously.
+    """
+
+
 class PrimaryConsiliumService:
     """
     Server-side orchestrator for the Primary Medical Consilium:
@@ -66,12 +87,196 @@ class PrimaryConsiliumService:
     from server storage without re-running Anamnesis or Vision inside the consilium.
     """
 
-    def __init__(self, db: Session, gateway: Optional[GeminiGateway] = None):
+    def __init__(
+        self,
+        db: Session,
+        gateway: Optional[GeminiGateway] = None,
+        lock_registry: Optional[Dict[str, asyncio.Lock]] = None,
+    ):
         self.db = db
         self.gateway = gateway or GeminiGateway()
         self.cycle_repo = MedicalCycleRepository(db)
         self.report_repo = ModelReportRepository(db)
         self.measurement_repo = HealthMeasurementRepository(db)
+        self._intake_locks = lock_registry if lock_registry is not None else self._default_intake_locks
+
+    _default_intake_locks: Dict[str, asyncio.Lock] = {}
+
+    def _get_intake_lock(self, cycle_id: str) -> asyncio.Lock:
+        if cycle_id not in self._intake_locks:
+            self._intake_locks[cycle_id] = asyncio.Lock()
+        return self._intake_locks[cycle_id]
+
+    def is_primary_consilium_completed(self, cycle_id: str) -> bool:
+        """
+        Returns True if Primary Consilium has already been successfully executed
+        and published for this medical cycle.
+        """
+        count = self.report_repo.get_latest_version_number(
+            cycle_id=cycle_id,
+            report_type="user_overall_report",
+            privacy_level=PrivacyLevel.CLIENT_FACING,
+        )
+        return count > 0
+
+    def get_latest_raw_anamnesis(self, cycle_id: str) -> Optional[ModelReport]:
+        reports = self.report_repo.list_server_only(
+            cycle_id=cycle_id,
+            report_type=RAW_USER_ANAMNESIS_REPORT_TYPE,
+        )
+        return reports[0] if reports else None
+
+    async def process_anamnesis_intake(
+        self,
+        cycle_id: str,
+        answers: AnamnesisQuestionnaireAnswers,
+    ) -> AnamnesisIntakeClientResponse:
+        """
+        Processes raw questionnaire answers from the client:
+        1. Validates that the medical cycle exists.
+        2. Strictly blocks modification if Primary Consilium has already concluded for this cycle.
+        3. Idempotently returns existing version if identical answers are resubmitted.
+        4. Reconstructs blind Anamnesis M1 context deterministically on the server.
+        5. Invokes Gemini Flash (GeminiModelRole.FLASH) as the Anamnesis M1 agent.
+        6. Atomically persists:
+           - raw_user_anamnesis (server_only, raw answers)
+           - preparatory_anamnesis_m1 (server_only, verified M1 output, agent_role=anamnesis_m1)
+        7. Returns safe client response with only service-level confirmation metadata.
+        """
+        if not self.cycle_repo.get(cycle_id):
+            raise ConsiliumCycleNotFoundError(f"Medical cycle '{cycle_id}' not found.")
+
+        # 1. Reject any alteration of baseline preparatory anamnesis if Primary Consilium was already executed
+        if self.is_primary_consilium_completed(cycle_id):
+            raise ConsiliumAnamnesisLockedError(
+                f"Anamnesis baseline snapshot cannot be modified: Primary Consilium has already "
+                f"been executed and published for cycle '{cycle_id}'."
+            )
+
+        lock = self._get_intake_lock(cycle_id)
+        async with lock:
+            # Re-check completion under lock
+            if self.is_primary_consilium_completed(cycle_id):
+                raise ConsiliumAnamnesisLockedError(
+                    f"Anamnesis baseline snapshot cannot be modified: Primary Consilium has already "
+                    f"been executed and published for cycle '{cycle_id}'."
+                )
+
+            # 2. Check for duplicate/identical submission within this cycle (idempotency)
+            latest_raw = self.get_latest_raw_anamnesis(cycle_id)
+            if (
+                latest_raw
+                and isinstance(latest_raw.content, dict)
+                and latest_raw.content.get("answers") == answers.model_dump()
+            ):
+                m1_reports = self.report_repo.list_server_only(
+                    cycle_id=cycle_id,
+                    report_type=PREPARATORY_ANAMNESIS_REPORT_TYPE,
+                )
+                if m1_reports:
+                    return AnamnesisIntakeClientResponse(
+                        cycle_id=cycle_id,
+                        status="processed",
+                        intake_version=m1_reports[0].version,
+                        created_at_utc=(
+                            m1_reports[0].created_at.isoformat()
+                            if m1_reports[0].created_at
+                            else datetime.now(timezone.utc).isoformat()
+                        ),
+                    )
+
+            base_version = latest_raw.version if latest_raw is not None else 0
+            target_version = base_version + 1
+
+            # 3. Reconstruct blind M1 context deterministically on server from allowlisted answers
+            blind_context = build_anamnesis_m1_context_from_answers(answers)
+            prompt = build_anamnesis_prompt(blind_context)
+
+            # 4. Invoke Gemini Flash (M1)
+            parsed: AnamnesisModelOutput = await self.gateway.generate_structured(
+                prompt=prompt,
+                response_schema=AnamnesisModelOutput,
+                model=GeminiModelRole.FLASH,
+            )
+
+            # 5. Atomic database transaction with cross-process concurrency recovery
+            raw_version = target_version
+            prefix_raw = f"rep_{cycle_id}_{RAW_USER_ANAMNESIS_REPORT_TYPE}_v{raw_version}"
+            raw_id = prefix_raw if len(prefix_raw) <= 64 else f"rep_{raw_version}_{RAW_USER_ANAMNESIS_REPORT_TYPE}_{cycle_id}"[:64]
+            prefix_m1 = f"rep_{cycle_id}_{PREPARATORY_ANAMNESIS_REPORT_TYPE}_v{raw_version}"
+            m1_id = prefix_m1 if len(prefix_m1) <= 64 else f"rep_{raw_version}_{PREPARATORY_ANAMNESIS_REPORT_TYPE}_{cycle_id}"[:64]
+
+            try:
+                self.report_repo.create(
+                    report_id=raw_id,
+                    cycle_id=cycle_id,
+                    model="client-anamnesis-intake",
+                    report_type=RAW_USER_ANAMNESIS_REPORT_TYPE,
+                    privacy_level=PrivacyLevel.SERVER_ONLY,
+                    content={
+                        "answers": answers.model_dump(),
+                        "source": "client_intake_questionnaire",
+                    },
+                    version=raw_version,
+                    commit=False,
+                )
+
+                m1_payload = parsed.model_dump()
+                m1_payload["agent_role"] = AegisAgentRole.ANAMNESIS_M1.value
+                m1_report = self.report_repo.create(
+                    report_id=m1_id,
+                    cycle_id=cycle_id,
+                    model=self.gateway.flash_model,
+                    report_type=PREPARATORY_ANAMNESIS_REPORT_TYPE,
+                    privacy_level=PrivacyLevel.SERVER_ONLY,
+                    content=m1_payload,
+                    version=raw_version,
+                    commit=False,
+                )
+
+                self.db.commit()
+                self.db.refresh(m1_report)
+            except Exception as exc:
+                self.db.rollback()
+                # Cross-process idempotency check: if another process committed identical answers concurrently
+                concurrent_raw = self.get_latest_raw_anamnesis(cycle_id)
+                if (
+                    concurrent_raw
+                    and isinstance(concurrent_raw.content, dict)
+                    and concurrent_raw.content.get("answers") == answers.model_dump()
+                ):
+                    m1_reports = self.report_repo.list_server_only(
+                        cycle_id=cycle_id,
+                        report_type=PREPARATORY_ANAMNESIS_REPORT_TYPE,
+                    )
+                    if m1_reports:
+                        return AnamnesisIntakeClientResponse(
+                            cycle_id=cycle_id,
+                            status="processed",
+                            intake_version=m1_reports[0].version,
+                            created_at_utc=(
+                                m1_reports[0].created_at.isoformat()
+                                if m1_reports[0].created_at
+                                else datetime.now(timezone.utc).isoformat()
+                            ),
+                        )
+                # If answers are different or transaction failed, NEVER return false success
+                raise ConsiliumConcurrencyConflictError(
+                    f"Concurrent intake transaction conflict for cycle '{cycle_id}': {exc}"
+                ) from exc
+
+            created_at_utc = (
+                m1_report.created_at.isoformat()
+                if m1_report.created_at
+                else datetime.now(timezone.utc).isoformat()
+            )
+
+            return AnamnesisIntakeClientResponse(
+                cycle_id=cycle_id,
+                status="processed",
+                intake_version=m1_report.version,
+                created_at_utc=created_at_utc,
+            )
 
     # ==========================================================================
     # PREPARATORY CONTEXT HELPERS (STANDALONE — NEVER CALLED INSIDE CONSILIUM)
@@ -134,6 +339,7 @@ class PrimaryConsiliumService:
         self,
         cycle_id: str,
         shared_labs_table: Dict[str, Any],
+        created_at: Optional[datetime] = None,
     ) -> ModelReport:
         """
         Stores verified Vision OCR extracted laboratory table as a server_only report
@@ -151,6 +357,7 @@ class PrimaryConsiliumService:
                 "agent_role": AegisAgentRole.VISION_OCR.value,
                 "shared_labs_table": dict(shared_labs_table),
             },
+            created_at=created_at,
         )
 
     def save_preparatory_ecg_summary(
