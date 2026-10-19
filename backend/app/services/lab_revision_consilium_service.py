@@ -200,8 +200,9 @@ class LabRevisionConsiliumService:
             return None
 
         ocr_report = ocr_reports[0]
+        raw_confirmed_list = (ocr_report.content or {}).get("confirmed_observations")
         raw_table = (ocr_report.content or {}).get("shared_labs_table")
-        if not isinstance(raw_table, dict) or not raw_table:
+        if not raw_confirmed_list and (not isinstance(raw_table, dict) or not raw_table):
             return None
 
         recorded_at = (
@@ -214,12 +215,11 @@ class LabRevisionConsiliumService:
         observations_history: List[Dict[str, Any]] = []
         active_markers: Dict[str, Dict[str, Any]] = {}
 
-        for idx, (raw_key, raw_entry) in enumerate(raw_table.items(), start=1):
-            marker_key = self._normalize_marker_key(str(raw_key))
-            display_name = str(raw_key).strip()
-            obs_id = f"obs_{marker_key}_v1_{idx}"
-
-            if isinstance(raw_entry, dict):
+        if isinstance(raw_confirmed_list, list) and raw_confirmed_list:
+            for idx, raw_entry in enumerate(raw_confirmed_list, start=1):
+                marker_key = self._normalize_marker_key(str(raw_entry.get("marker_key", "")))
+                display_name = str(raw_entry.get("display_name") or marker_key).strip()
+                obs_id = f"obs_{marker_key}_v1_{idx}"
                 val = raw_entry.get("value", raw_entry.get("raw_value", ""))
                 explicit_unit = raw_entry.get("unit")
                 sample_date = raw_entry.get("sample_date") or sample_date_default
@@ -230,33 +230,78 @@ class LabRevisionConsiliumService:
                     else None
                 )
                 crit_flag = bool(raw_entry.get("is_critical_flag", False))
-                num_val, resolved_unit = self._parse_numeric_and_unit(val, explicit_unit)
-            else:
-                val = raw_entry
-                num_val, resolved_unit = self._parse_numeric_and_unit(val, None)
-                sample_date = sample_date_default
-                ref_obj = None
-                crit_flag = False
+                num_val = raw_entry.get("numeric_value")
+                if num_val is None:
+                    num_val, resolved_unit = self._parse_numeric_and_unit(val, explicit_unit)
+                else:
+                    resolved_unit = explicit_unit
 
-            entry = LabObservationEntry(
-                observation_id=obs_id,
-                marker_key=marker_key,
-                display_name=display_name,
-                value=val,
-                numeric_value=num_val,
-                unit=resolved_unit,
-                sample_date=sample_date,
-                reference_range=ref_obj,
-                event_type=LabEventType.INITIAL,
-                supersedes_observation_id=None,
-                correction_reason=None,
-                is_active=True,
-                is_critical_flag=self._detect_critical_deviation(num_val, ref_obj, crit_flag),
-                recorded_at=recorded_at,
-            )
-            dumped = entry.model_dump()
-            observations_history.append(dumped)
-            active_markers[marker_key] = dumped
+                prior_active = active_markers.get(marker_key)
+                event_type = LabEventType.INITIAL if prior_active is None else LabEventType.NEW_STUDY
+
+                entry = LabObservationEntry(
+                    observation_id=obs_id,
+                    marker_key=marker_key,
+                    display_name=display_name,
+                    value=val,
+                    numeric_value=num_val,
+                    unit=resolved_unit,
+                    sample_date=sample_date,
+                    reference_range=ref_obj,
+                    event_type=event_type,
+                    supersedes_observation_id=None,
+                    correction_reason=None,
+                    is_active=True,
+                    is_critical_flag=self._detect_critical_deviation(num_val, ref_obj, crit_flag),
+                    recorded_at=recorded_at,
+                )
+                dumped = entry.model_dump()
+                observations_history.append(dumped)
+                active_markers[marker_key] = dumped
+        else:
+            for idx, (raw_key, raw_entry) in enumerate(raw_table.items(), start=1):
+                marker_key = self._normalize_marker_key(str(raw_key))
+                display_name = str(raw_key).strip()
+                obs_id = f"obs_{marker_key}_v1_{idx}"
+
+                if isinstance(raw_entry, dict):
+                    val = raw_entry.get("value", raw_entry.get("raw_value", ""))
+                    explicit_unit = raw_entry.get("unit")
+                    sample_date = raw_entry.get("sample_date") or sample_date_default
+                    ref_raw = raw_entry.get("reference_range")
+                    ref_obj = (
+                        LabReferenceRange.model_validate(ref_raw)
+                        if isinstance(ref_raw, dict)
+                        else None
+                    )
+                    crit_flag = bool(raw_entry.get("is_critical_flag", False))
+                    num_val, resolved_unit = self._parse_numeric_and_unit(val, explicit_unit)
+                else:
+                    val = raw_entry
+                    num_val, resolved_unit = self._parse_numeric_and_unit(val, None)
+                    sample_date = sample_date_default
+                    ref_obj = None
+                    crit_flag = False
+
+                entry = LabObservationEntry(
+                    observation_id=obs_id,
+                    marker_key=marker_key,
+                    display_name=display_name,
+                    value=val,
+                    numeric_value=num_val,
+                    unit=resolved_unit,
+                    sample_date=sample_date,
+                    reference_range=ref_obj,
+                    event_type=LabEventType.INITIAL,
+                    supersedes_observation_id=None,
+                    correction_reason=None,
+                    is_active=True,
+                    is_critical_flag=self._detect_critical_deviation(num_val, ref_obj, crit_flag),
+                    recorded_at=recorded_at,
+                )
+                dumped = entry.model_dump()
+                observations_history.append(dumped)
+                active_markers[marker_key] = dumped
 
         shared_labs_table = self._build_shared_labs_table_from_active(active_markers)
         return self.report_repo.create_next_version(

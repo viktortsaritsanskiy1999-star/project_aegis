@@ -45,6 +45,10 @@ from app.schemas.consilium import (
     LabRevisionCooldownStatus,
     LabRevisionConsiliumRunRequest,
     LabRevisionConsiliumClientResponse,
+    VisionOcrMarkerItem,
+    VisionOcrDocumentMetadata,
+    VisionOcrModelOutput,
+    LabVisionIntakeClientResponse,
 )
 
 __all__ = [
@@ -98,4 +102,8 @@ __all__ = [
     "LabRevisionCooldownStatus",
     "LabRevisionConsiliumRunRequest",
     "LabRevisionConsiliumClientResponse",
+    "VisionOcrMarkerItem",
+    "VisionOcrDocumentMetadata",
+    "VisionOcrModelOutput",
+    "LabVisionIntakeClientResponse",
 ]

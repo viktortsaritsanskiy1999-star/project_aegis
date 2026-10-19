@@ -38,6 +38,11 @@ from app.services.lab_revision_consilium_service import (
     LABORATORY_DIFF_AUDIT_REPORT_TYPE,
     LAB_REVISION_EXECUTION_LOG_REPORT_TYPE,
 )
+from app.services.lab_vision_ocr_service import (
+    LabVisionOcrService,
+    LabVisionValidationError,
+    detect_image_mime_type_from_bytes,
+)
 
 __all__ = [
     "create_sqlite_backup",
@@ -53,11 +58,14 @@ __all__ = [
     "PrimaryConsiliumService",
     "WeeklyConsiliumService",
     "LabRevisionConsiliumService",
+    "LabVisionOcrService",
     "ConsiliumError",
     "ConsiliumCycleNotFoundError",
     "ConsiliumContextMissingError",
     "ConsiliumQualityRejectionError",
     "ConsiliumCooldownError",
+    "LabVisionValidationError",
+    "detect_image_mime_type_from_bytes",
     "PREPARATORY_ANAMNESIS_REPORT_TYPE",
     "PREPARATORY_OCR_REPORT_TYPE",
     "PREPARATORY_ECG_REPORT_TYPE",

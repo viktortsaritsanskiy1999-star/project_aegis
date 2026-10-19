@@ -1,6 +1,6 @@
 from datetime import datetime, timezone
-from typing import Callable
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from typing import Callable, List, Optional
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile, status
 from sqlalchemy.orm import Session
 
 from app.database import get_db
@@ -16,6 +16,7 @@ from app.schemas.consilium import (
     LabRevisionCooldownStatus,
     LabRevisionConsiliumRunRequest,
     LabRevisionConsiliumClientResponse,
+    LabVisionIntakeClientResponse,
 )
 from app.security.auth import verify_client_token
 from app.services.gemini_gateway import GeminiGateway, GeminiGatewayError
@@ -32,6 +33,10 @@ from app.services.weekly_consilium_service import WeeklyConsiliumService
 from app.services.lab_revision_consilium_service import (
     LabRevisionConsiliumService,
     ConsiliumCooldownError,
+)
+from app.services.lab_vision_ocr_service import (
+    LabVisionOcrService,
+    LabVisionValidationError,
 )
 
 router = APIRouter(prefix="/api/v1/cascade", tags=["Medical Consilium Cascade"])
@@ -320,4 +325,59 @@ async def run_lab_revision_consilium_endpoint(
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail=f"Gemini lab-revision cascade execution failed: {exc}",
+        )
+
+
+@router.post(
+    "/intake/lab-images",
+    response_model=LabVisionIntakeClientResponse,
+    summary="Upload multimodal laboratory report images and run server-side Vision OCR extraction",
+    description=(
+        "Authorized endpoint receiving 1 to 15 laboratory document images (JPEG, PNG, WEBP, HEIC/HEIF). "
+        "Validates magic bytes, enforces a 10MB per-image and 30MB total size limit, invokes Gemini Vision "
+        "to exhaustively extract laboratory markers, and synchronizes observations with the laboratory ledger "
+        "without triggering or consuming the 168-hour revision cooldown."
+    ),
+)
+async def submit_lab_images_intake_endpoint(
+    cycle_id: str = Form(...),
+    files: List[UploadFile] = File(...),
+    is_correction: bool = Form(default=False),
+    sample_date: Optional[str] = Form(default=None),
+    db: Session = Depends(get_db),
+    gateway: GeminiGateway = Depends(get_gemini_gateway),
+    now_provider: Callable[[], datetime] = Depends(get_server_now_provider),
+    _token: str = Depends(verify_client_token),
+) -> LabVisionIntakeClientResponse:
+    service = LabVisionOcrService(
+        db=db,
+        gateway=gateway,
+        now_provider=now_provider,
+    )
+    try:
+        return await service.process_lab_images(
+            cycle_id=cycle_id,
+            files=files,
+            is_correction=is_correction,
+            sample_date_override=sample_date,
+        )
+    except ConsiliumCycleNotFoundError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=str(exc),
+        )
+    except LabVisionValidationError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(exc),
+        )
+    except ConsiliumError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(exc),
+        )
+    except GeminiGatewayError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Gemini Vision OCR extraction failed: {exc}",
         )

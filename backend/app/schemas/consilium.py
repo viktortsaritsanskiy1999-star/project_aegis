@@ -1,3 +1,4 @@
+import re
 from enum import Enum
 from typing import Any, Dict, List, Optional
 from pydantic import BaseModel, Field, ConfigDict, field_validator, model_validator
@@ -971,3 +972,155 @@ class LabRevisionConsiliumClientResponse(BaseModel):
     system_reports: Dict[str, ClientModelReportResponse]
     vitals_thresholds: ClientVitalsThresholds
     cooldown: LabRevisionCooldownStatus
+
+
+class VisionOcrMarkerItem(BaseModel):
+    """
+    Single recognized laboratory marker from Vision OCR.
+    Captures complete laboratory indicators without hallucinations or omissions.
+    """
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    original_name: str = Field(..., min_length=1, max_length=128)
+    marker_key: str = Field(..., min_length=1, max_length=64)
+    raw_value: str = Field(..., min_length=1, max_length=64)
+    numeric_value: Optional[float] = None
+    unit: Optional[str] = Field(default=None, max_length=64)
+    reference_range: Optional[LabReferenceRange] = None
+    sample_date: Optional[str] = Field(default=None, max_length=32)
+    category: Optional[str] = Field(default="other", max_length=64)
+    is_uncertain: bool = Field(default=False)
+    uncertainty_note: Optional[str] = Field(default=None, max_length=256)
+    is_critical_flag: bool = Field(default=False)
+    requires_user_verification: bool = Field(default=False)
+
+    @field_validator("reference_range", mode="before")
+    @classmethod
+    def parse_reference_range(cls, v: Any) -> Optional[LabReferenceRange | Dict[str, Any]]:
+        if v is None:
+            return None
+        if isinstance(v, (LabReferenceRange, dict)):
+            return v
+        if isinstance(v, str):
+            cleaned = v.strip()
+            if not cleaned:
+                return None
+            m = re.match(r"^\s*([+-]?\d+(?:\.\d+)?)\s*[-–—]\s*([+-]?\d+(?:\.\d+)?)\s*$", cleaned)
+            if m:
+                return {"low": float(m.group(1)), "high": float(m.group(2)), "text": cleaned}
+            m_less = re.match(r"^\s*<\s*([+-]?\d+(?:\.\d+)?)\s*$", cleaned)
+            if m_less:
+                return {"high": float(m_less.group(1)), "text": cleaned}
+            m_greater = re.match(r"^\s*>\s*([+-]?\d+(?:\.\d+)?)\s*$", cleaned)
+            if m_greater:
+                return {"low": float(m_greater.group(1)), "text": cleaned}
+            return {"text": cleaned}
+        return None
+
+    @field_validator("numeric_value", mode="before")
+    @classmethod
+    def parse_numeric_value(cls, v: Any) -> Optional[float]:
+        if v is None:
+            return None
+        if isinstance(v, (int, float)) and not isinstance(v, bool):
+            return float(v)
+        if isinstance(v, str):
+            cleaned = v.strip().replace(",", ".")
+            try:
+                return float(cleaned)
+            except ValueError:
+                return None
+        return None
+
+    @model_validator(mode="after")
+    def validate_and_compute_verification_status(self) -> "VisionOcrMarkerItem":
+        self.evaluate_verification_requirement()
+        return self
+
+    def evaluate_verification_requirement(self) -> bool:
+        """
+        Determines whether this marker requires manual user review before entering
+        authoritative medical consilium ledgers:
+        - is_uncertain is True (smudged, blurry, doubtful)
+        - numeric_value is None and raw_value is not an established qualitative marker
+        - quantitative number without an explicit unit of measurement
+        - missing specimen collection date
+        """
+        if self.is_uncertain:
+            self.requires_user_verification = True
+            return True
+
+        if self.numeric_value is None:
+            cleaned_raw = self.raw_value.strip().lower()
+            valid_qualitative = {
+                "отрицательно", "положительно", "не обнаружено", "обнаружено",
+                "norm", "normal", "negative", "positive", "норма", "не выявлено", "выявлено",
+            }
+            if cleaned_raw not in valid_qualitative:
+                self.requires_user_verification = True
+                if not self.uncertainty_note:
+                    self.uncertainty_note = "Non-standard text value requiring client verification"
+                return True
+        else:
+            if not self.unit or not self.unit.strip():
+                self.requires_user_verification = True
+                if not self.uncertainty_note:
+                    self.uncertainty_note = "Missing unit of measurement for numeric value"
+                return True
+
+        if not self.sample_date or not self.sample_date.strip():
+            self.requires_user_verification = True
+            if not self.uncertainty_note:
+                self.uncertainty_note = "Missing specimen collection date"
+            return True
+
+        self.requires_user_verification = False
+        return False
+
+
+class VisionOcrDocumentMetadata(BaseModel):
+    """
+    Document-level metadata extracted from laboratory test report images.
+    """
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    sample_date: Optional[str] = Field(default=None, max_length=32)
+    issue_date: Optional[str] = Field(default=None, max_length=32)
+    laboratory_name: Optional[str] = Field(default=None, max_length=128)
+    page_count: int = Field(default=1, ge=1)
+    notes: Optional[str] = Field(default=None, max_length=512)
+
+
+class VisionOcrModelOutput(BaseModel):
+    """
+    Structured Pydantic output schema produced by Gemini Vision OCR agent.
+    Captures complete laboratory indicators without hallucinations or omissions.
+    """
+    model_config = ConfigDict(extra="forbid")
+
+    document_metadata: VisionOcrDocumentMetadata = Field(default_factory=VisionOcrDocumentMetadata)
+    markers: List[VisionOcrMarkerItem] = Field(default_factory=list)
+
+
+class LabVisionIntakeClientResponse(BaseModel):
+    """
+    Safe client-facing confirmation of laboratory Vision OCR processing.
+    Separates confirmed structured markers from results requiring user verification;
+    never exposes raw Gemini JSON, internal AI comments, or unverified hypotheses.
+    """
+    model_config = ConfigDict(extra="forbid")
+
+    cycle_id: str
+    status: str = "processed"
+    ledger_version: int = Field(..., ge=0)
+    extracted_count: int = Field(..., ge=0)
+    requires_verification_count: int = Field(default=0, ge=0)
+    document_metadata: VisionOcrDocumentMetadata
+    markers: List[VisionOcrMarkerItem]
+    confirmed_markers: List[VisionOcrMarkerItem] = Field(default_factory=list)
+    unconfirmed_markers: List[VisionOcrMarkerItem] = Field(default_factory=list)
+    has_unreviewed_lab_changes: bool = True
+    privacy_notice: str = (
+        "Laboratory documents processed server-side. Raw image bytes and unverified "
+        "OCR hypotheses are never logged or exposed to the client."
+    )

@@ -828,3 +828,55 @@ You are issuing the SUPREME COMPARATIVE VERDICT after laboratory results were up
    - Ensure systems without revision explicitly explain that available new data does not provide sufficient grounds to change the previous assessment, and NEVER claim that health is guaranteed unchanged.
    - Deterministically overwrite any flawed system summary via "corrected_user_system_reports" before publication, or set "approved_for_publication": false if unsafe."""
     return base_prompt + comparative_addendum
+
+
+def build_lab_vision_ocr_prompt(page_count: int = 1) -> str:
+    """
+    Constructs the prompt for Gemini Vision OCR agent (Gemini 3.8 Flash, role='vision_ocr').
+    Directs exhaustive recognition and extraction of absolutely ALL laboratory indicators,
+    including exact names, normalized slugs, values (numeric & raw string), units,
+    laboratory reference ranges (bounds & text), specimen collection dates vs issue dates,
+    and ambiguity/uncertainty markers.
+    Strictly forbids hallucinating missing information or guessing illegible values.
+    """
+    return f"""You are the Laboratory Vision OCR Extraction Engine for Project Aegis.
+You are analyzing {page_count} image page(s) containing official medical laboratory test reports.
+
+YOUR MANDATORY CLINICAL DIRECTIVES:
+1. EXHAUSTIVE EXTRACTION (NO OMISSIONS):
+   Extract absolutely EVERY clinical laboratory indicator present on the report pages.
+   Do NOT limit yourself to well-known tests (CBC, glucose). Extract all enzymes, lipids, renal markers,
+   hormones, vitamins, electrolytes, urinalysis parameters, coagulation factors, tumor markers,
+   and qualitative/serological findings.
+
+2. ACCURATE INDICATOR REPRESENTATION:
+   For EACH recognized indicator:
+   - "original_name": Exact name as printed on the form (e.g. "Гемоглобин (Hb)", "Аланинаминотрансфераза (АЛТ)").
+   - "marker_key": Normalized Latin slug in lowercase snake_case (e.g. "hemoglobin", "alt", "wbc", "glucose", "ferritin", "tsh", "crp", "total_protein").
+   - "raw_value": Exact text representation from the form (e.g. "145", "5.4", "< 0.05", "отрицательно", "не обнаружено", "1:80", "12-15").
+   - "numeric_value": Extracted float value if convertible (e.g. 145.0, 5.4, 0.05). If qualitative or purely textual ("отрицательно"), set null.
+   - "unit": Exact unit of measurement (e.g. "g/L", "г/л", "mmol/L", "ммоль/л", "U/L", "Ед/л", "ng/mL", "нг/мл", "%"). If not printed, set null. DO NOT invent units.
+   - "reference_range": Laboratory reference limits printed on the form:
+     {{ "low": <float or null>, "high": <float or null>, "text": "<exact reference text from form, e.g. '120.0 - 160.0' or '< 5.0' or 'не обнаружено'>" }}
+     If reference is not printed, set null.
+   - "sample_date": Date when the specimen/biomaterial was collected/taken (YYYY-MM-DD). If printed on the row or header, record it.
+   - "category": Choose one of: "blood_count", "biochemistry", "urinalysis", "coagulation", "hormones", "vitamins", "immunology", "other".
+   - "is_uncertain": Set true if handwriting, print, smudge, or tear makes the name or value ambiguous.
+   - "uncertainty_note": If is_uncertain is true, explain why (e.g. "Decimal point blurry, could be 1.4 or 14").
+   - "is_critical_flag": Set true if flagged on the form with '*', '!', 'H', 'L', 'CRIT', bolded alert, or significantly beyond reference range.
+
+3. DOCUMENT-LEVEL METADATA:
+   - "sample_date": Primary specimen collection date for this study (YYYY-MM-DD).
+   - "issue_date": Date when the laboratory generated/printed the report (YYYY-MM-DD).
+   - "laboratory_name": Name of the medical laboratory if visible (e.g. "Invitro", "Gemotest", "KDL", "Helix", etc.).
+   - "page_count": Total pages analyzed ({page_count}).
+   - "notes": Any observations regarding quality, legibility, or multiple dates.
+
+4. CRITICAL SAFETY RULES:
+   - NEVER hallucinate or guess missing dates, units, references, or values.
+   - If a value or date is missing, set it to null.
+   - Distinguish specimen collection date ("sample_date") from report printing date ("issue_date").
+   - Do NOT confuse blood and urine markers with similar names (e.g. "protein_urine" vs "total_protein_serum").
+   - Multi-page correlation: If multiple pages belong to the same study, link them together while strictly respecting row-level sample dates.
+
+Output must conform strictly to the VisionOcrModelOutput JSON schema."""

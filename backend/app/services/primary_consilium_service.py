@@ -112,12 +112,19 @@ class PrimaryConsiliumService:
         Returns True if Primary Consilium has already been successfully executed
         and published for this medical cycle.
         """
-        count = self.report_repo.get_latest_version_number(
+        client_facing = self.report_repo.get_latest_version_number(
             cycle_id=cycle_id,
             report_type="user_overall_report",
             privacy_level=PrivacyLevel.CLIENT_FACING,
         )
-        return count > 0
+        if client_facing > 0:
+            return True
+        internal = self.report_repo.get_latest_version_number(
+            cycle_id=cycle_id,
+            report_type="chief_physician_internal",
+            privacy_level=PrivacyLevel.SERVER_ONLY,
+        )
+        return internal > 0
 
     def get_latest_raw_anamnesis(self, cycle_id: str) -> Optional[ModelReport]:
         reports = self.report_repo.list_server_only(
@@ -552,6 +559,18 @@ class PrimaryConsiliumService:
         cycle = self.cycle_repo.get(cycle_id)
         if not cycle:
             raise ConsiliumCycleNotFoundError(f"Medical cycle '{cycle_id}' not found.")
+
+        if self.is_primary_consilium_completed(cycle_id):
+            from app.services.lab_revision_consilium_service import LabRevisionConsiliumService
+
+            lab_service = LabRevisionConsiliumService(db=self.db, gateway=self.gateway)
+            ledger_state = lab_service.get_lab_ledger_state(cycle_id)
+            if ledger_state.has_unreviewed_lab_changes:
+                raise ConsiliumError(
+                    f"Primary Consilium has already been completed for cycle '{cycle_id}', and new laboratory "
+                    f"markers (ledger v{ledger_state.ledger_version}) are pending review. "
+                    "These markers cannot be evaluated via Primary Consilium; run Full Lab-Revision Consilium instead."
+                )
 
         resolved_date = (
             report_date.strip()

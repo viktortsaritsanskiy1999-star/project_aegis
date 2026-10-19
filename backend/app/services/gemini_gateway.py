@@ -2,7 +2,7 @@ import asyncio
 import json
 import logging
 from enum import Enum
-from typing import Any, Awaitable, Callable, Dict, Optional, Type, TypeVar
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Type, TypeVar
 import httpx
 from pydantic import BaseModel, ValidationError
 from app.config import settings
@@ -17,6 +17,7 @@ class GeminiModelRole(str, Enum):
     FLASH_LITE = "flash_lite"
     FLASH = "flash"
     PRO = "pro"
+    VISION = "vision"
 
 
 class GeminiGatewayError(Exception):
@@ -75,6 +76,7 @@ class GeminiGateway:
         flash_lite_model: Optional[str] = None,
         flash_model: Optional[str] = None,
         pro_model: Optional[str] = None,
+        vision_model: Optional[str] = None,
         timeout_seconds: Optional[float] = None,
         max_retries: Optional[int] = None,
         initial_backoff_seconds: Optional[float] = None,
@@ -86,6 +88,7 @@ class GeminiGateway:
         self.flash_lite_model = flash_lite_model or settings.gemini_flash_lite_model
         self.flash_model = flash_model or settings.gemini_flash_model
         self.pro_model = pro_model or settings.gemini_pro_model
+        self.vision_model = vision_model or getattr(settings, "gemini_vision_model", "gemini-3.8-flash")
         self.timeout_seconds = (
             timeout_seconds if timeout_seconds is not None else settings.gemini_timeout_seconds
         )
@@ -125,6 +128,8 @@ class GeminiGateway:
             return self.flash_model
         if role == GeminiModelRole.PRO:
             return self.pro_model
+        if role == GeminiModelRole.VISION:
+            return self.vision_model
         raise GeminiValidationError(f"Unsupported model role: {model_or_role}")
 
     def _require_api_key(self) -> str:
@@ -256,9 +261,11 @@ class GeminiGateway:
         system_instruction: Optional[str] = None,
         response_mime_type: str = "application/json",
         max_output_tokens: int = 8192,
+        inline_images: Optional[List[Dict[str, str]]] = None,
     ) -> str:
         """
         Executes a call to Gemini generateContent endpoint with bounded retries on transient 429/503/timeout.
+        Supports multimodal requests with inline base64 images.
         Never retries auth, billing, or validation errors.
         """
         api_key = self._require_api_key()
@@ -268,11 +275,22 @@ class GeminiGateway:
         resolved_model = self.resolve_model_name(model)
         url = f"{self.base_url}/models/{resolved_model}:generateContent"
 
+        parts: List[Dict[str, Any]] = []
+        if inline_images:
+            for img in inline_images:
+                parts.append({
+                    "inlineData": {
+                        "mimeType": img["mime_type"],
+                        "data": img["data_base64"],
+                    }
+                })
+        parts.append({"text": prompt})
+
         request_body: Dict[str, Any] = {
             "contents": [
                 {
                     "role": "user",
-                    "parts": [{"text": prompt}],
+                    "parts": parts,
                 }
             ],
             "generationConfig": {
@@ -353,6 +371,7 @@ class GeminiGateway:
         model: GeminiModelRole | str = GeminiModelRole.FLASH,
         system_instruction: Optional[str] = None,
         max_output_tokens: int = 8192,
+        inline_images: Optional[List[Dict[str, str]]] = None,
     ) -> Dict[str, Any]:
         """Generates content and parses the response into a validated Python dictionary."""
         raw_text = await self.generate_raw_text(
@@ -361,6 +380,7 @@ class GeminiGateway:
             system_instruction=system_instruction,
             response_mime_type="application/json",
             max_output_tokens=max_output_tokens,
+            inline_images=inline_images,
         )
         return self.parse_json_object(raw_text)
 
@@ -371,6 +391,7 @@ class GeminiGateway:
         model: GeminiModelRole | str = GeminiModelRole.FLASH,
         system_instruction: Optional[str] = None,
         max_output_tokens: int = 8192,
+        inline_images: Optional[List[Dict[str, str]]] = None,
     ) -> T:
         """
         Generates content, parses JSON strictly, and validates against a Pydantic BaseModel schema.
@@ -381,6 +402,7 @@ class GeminiGateway:
             model=model,
             system_instruction=system_instruction,
             max_output_tokens=max_output_tokens,
+            inline_images=inline_images,
         )
         try:
             return response_schema.model_validate(parsed_dict)

@@ -45,6 +45,10 @@ class Settings(BaseSettings):
         default="gemini-3.1-pro-preview",
         alias="AEGIS_GEMINI_PRO_MODEL",
     )
+    gemini_vision_model: str = Field(
+        default="gemini-3.8-flash",
+        alias="AEGIS_GEMINI_VISION_MODEL",
+    )
     gemini_timeout_seconds: float = Field(
         default=60.0,
         ge=1.0,
