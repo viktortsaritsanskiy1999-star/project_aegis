@@ -1,3 +1,4 @@
+from typing import Optional
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from pydantic import Field
 
@@ -23,6 +24,10 @@ class Settings(BaseSettings):
     database_url: str = Field(
         default="sqlite:///./aegis_private_vault.db",
         alias="AEGIS_DATABASE_URL",
+    )
+    backup_dir: Optional[str] = Field(
+        default=None,
+        alias="AEGIS_BACKUP_DIR",
     )
     # Security: No working default secret! Must be configured explicitly in .env
     api_secret: str = Field(

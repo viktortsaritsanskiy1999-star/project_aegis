@@ -1,5 +1,10 @@
 import os
 import sys
+
+# Strictly isolate test environment before importing application modules
+os.environ["AEGIS_ENV"] = "testing"
+os.environ["AEGIS_DATABASE_URL"] = "sqlite:///:memory:"
+
 import pytest
 from typing import Generator
 from fastapi.testclient import TestClient
@@ -25,6 +30,9 @@ test_engine = create_engine(
     poolclass=StaticPool,
 )
 
+# Bind test engine to app.state so FastAPI lifespan never touches production database
+app.state.engine = test_engine
+
 TestingSessionLocal = sessionmaker(
     autocommit=False,
     autoflush=False,
@@ -34,11 +42,41 @@ TestingSessionLocal = sessionmaker(
 
 @pytest.fixture(scope="function", autouse=True)
 def configure_test_settings():
-    """Sets a deterministic non-empty test secret for authentication tests."""
+    """Sets deterministic test settings for isolated execution and strictly restores state."""
     original_secret = settings.api_secret
+    original_env = settings.env
+    original_db_url = settings.database_url
+    original_backup_dir = settings.backup_dir
+    original_state_engine = getattr(app.state, "engine", None)
+    original_state_backup_dir = getattr(app.state, "backup_dir", None)
+    original_env_vars = {
+        k: os.environ.get(k)
+        for k in ("AEGIS_ENV", "AEGIS_DATABASE_URL", "AEGIS_BACKUP_DIR", "AEGIS_API_SECRET")
+    }
+
     settings.api_secret = TEST_API_SECRET
-    yield
-    settings.api_secret = original_secret
+    settings.env = "testing"
+    settings.database_url = TEST_DATABASE_URL
+    app.state.engine = test_engine
+
+    try:
+        yield
+    finally:
+        settings.api_secret = original_secret
+        settings.env = original_env
+        settings.database_url = original_db_url
+        settings.backup_dir = original_backup_dir
+        app.state.engine = original_state_engine
+        if original_state_backup_dir is not None:
+            app.state.backup_dir = original_state_backup_dir
+        elif hasattr(app.state, "backup_dir"):
+            delattr(app.state, "backup_dir")
+
+        for k, v in original_env_vars.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
 
 
 @pytest.fixture(scope="function")
@@ -69,6 +107,9 @@ def client(db_session: Session) -> Generator[TestClient, None, None]:
             pass
 
     app.dependency_overrides[get_db] = override_get_db
-    with TestClient(app) as test_client:
-        yield test_client
-    app.dependency_overrides.clear()
+    app.state.engine = test_engine
+    try:
+        with TestClient(app) as test_client:
+            yield test_client
+    finally:
+        app.dependency_overrides.clear()

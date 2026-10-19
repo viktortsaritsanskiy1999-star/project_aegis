@@ -42,8 +42,16 @@ def create_sqlite_backup(
     if not src_path.exists():
         raise FileNotFoundError(f"Source database file not found: {src_path}")
 
-    # Default backup directory
-    target_dir = Path(backup_dir) if backup_dir else src_path.parent / "backups"
+    # Default backup directory: explicit backup_dir > settings.backup_dir > test isolation > default backups/ dir
+    if backup_dir:
+        target_dir = Path(backup_dir)
+    elif settings.backup_dir:
+        target_dir = Path(settings.backup_dir)
+    elif settings.env == "testing":
+        import tempfile
+        target_dir = Path(tempfile.gettempdir()) / "aegis_test_backups"
+    else:
+        target_dir = src_path.parent / "backups"
     target_dir.mkdir(parents=True, exist_ok=True)
 
     timestamp_str = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")

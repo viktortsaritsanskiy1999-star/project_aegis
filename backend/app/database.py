@@ -49,7 +49,7 @@ def get_db() -> Generator[Session, None, None]:
 
 
 def init_db(
-    db_engine: Engine = engine,
+    db_engine: Optional[Engine] = None,
     backup_dir: Optional[Path | str] = None,
     alembic_ini_path: Optional[Path | str] = None,
 ) -> Optional[Path]:
@@ -61,13 +61,14 @@ def init_db(
     - Runs Alembic upgrade to head and fails fast (raises RuntimeError) if migration fails,
       never masking migration errors with create_all().
     """
-    url_str = str(db_engine.url)
-    if ":memory:" in url_str or db_engine.url.database in (None, ":memory:"):
-        Base.metadata.create_all(bind=db_engine)
+    target_engine = db_engine if db_engine is not None else engine
+    url_str = str(target_engine.url)
+    if ":memory:" in url_str or target_engine.url.database in (None, ":memory:"):
+        Base.metadata.create_all(bind=target_engine)
         return None
 
-    if db_engine.url.database:
-        db_path: Optional[Path] = Path(db_engine.url.database).resolve()
+    if target_engine.url.database:
+        db_path: Optional[Path] = Path(target_engine.url.database).resolve()
     else:
         db_path = get_sqlite_path(url_str)
 
