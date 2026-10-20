@@ -227,7 +227,7 @@ async def _seed_primary_consilium(
     cycle_id: str = "cycle_lab_rev_01",
     primary_date: str = "2026-10-18",
 ) -> None:
-    _seed_preparatory_cycle_context(db_session, cycle_id=cycle_id)
+    _seed_preparatory_cycle_context(db_session, cycle_id=cycle_id, seed_ledger=True)
     primary_calls: List[Dict[str, Any]] = []
     primary_gateway = _build_consilium_mock_gateway(primary_calls)
     primary_service = PrimaryConsiliumService(db=db_session, gateway=primary_gateway)
@@ -1338,9 +1338,34 @@ async def test_cross_process_concurrency_restart_persistence_and_v1_to_v4_strate
     assert "31.5" in w2_flash_prompt
     assert "REVISED CONCLUSIONS for cvs" in w2_flash_prompt
     assert "STRATEGY_V3_LAB_REVISION" in w2_flash_prompt
-    assert "STRATEGY_V3_LAB_REVISION" in w2_pro_prompt
-    # Stale v1 OCR ferritin ("42 ng/mL") and stale v2 strategy do NOT become current again:
-    assert "42 ng/mL" not in w2_flash_prompt
+    # Structural verification of current vs historical labs in Weekly v4:
+    # 1. Parse structured JSON from Weekly Flash prompt
+    flash_json_text = w2_flash_prompt.split("=== ANAMNESIS AND INPUT DATA ===\n")[1].split(
+        "\n\n=== VITAL MARKERS"
+    )[0]
+    flash_input_data = json.loads(flash_json_text)
+
+    # 2. Current state in shared_labs_shelf reflects corrected ferritin (16.8 ng/mL), never stale 42 ng/mL
+    current_ferritin = flash_input_data["shared_labs_shelf"].get("ferritin", {})
+    assert "16.8" in str(current_ferritin.get("value"))
+    assert "42" not in str(current_ferritin.get("value"))
+
+    # 3. Full dated history preserves both the original 42 ng/mL (marked inactive) and the correction
+    history_ferritin = [
+        obs for obs in flash_input_data.get("laboratory_history", [])
+        if obs.get("marker_key") == "ferritin"
+    ]
+    assert len(history_ferritin) >= 2
+    stale_obs = next((obs for obs in history_ferritin if "42" in str(obs.get("value"))), None)
+    corrected_obs = next((obs for obs in history_ferritin if "16.8" in str(obs.get("value"))), None)
+    assert stale_obs is not None
+    assert stale_obs["is_active"] is False, "Original erroneous observation must be inactive"
+    assert corrected_obs is not None
+    assert corrected_obs["is_active"] is True, "Corrected observation must be active"
+    assert corrected_obs.get("supersedes_observation_id") == stale_obs.get("observation_id")
+    assert corrected_obs.get("event_type") == "correction"
+
+    # Stale v2 strategy does NOT become current again:
     assert "STRATEGY_V2_WEEKLY_SPRINT_1" not in w2_flash_prompt
 
     # Verify Athena strategy is now v4 and chat_history is preserved

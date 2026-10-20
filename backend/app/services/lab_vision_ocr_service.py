@@ -2,8 +2,10 @@ import asyncio
 import base64
 from datetime import datetime, timezone
 import logging
+import threading
 import time
 from typing import Any, Callable, Dict, List, Optional, Tuple
+import weakref
 from fastapi import UploadFile
 from sqlalchemy.exc import OperationalError, IntegrityError
 from sqlalchemy.orm import Session
@@ -48,7 +50,10 @@ class LabVisionValidationError(ConsiliumError):
     """Raised when uploaded lab images fail file format, size, or magic bytes validation."""
 
 
-_intake_locks: Dict[str, asyncio.Lock] = {}
+_GLOBAL_INTAKE_LOCKS: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, Dict[str, asyncio.Lock]]" = (
+    weakref.WeakKeyDictionary()
+)
+_INTAKE_LOCKS_META_LOCK = threading.Lock()
 
 
 def detect_image_mime_type_from_bytes(data: bytes) -> Optional[str]:
@@ -87,20 +92,21 @@ class LabVisionOcrService:
     6. Returns safe client confirmation metadata without exposing internal AI hypotheses or raw images.
     """
 
+    _GLOBAL_INTAKE_LOCKS = _GLOBAL_INTAKE_LOCKS
+    _INTAKE_META_LOCK = _INTAKE_LOCKS_META_LOCK
+
     def __init__(
         self,
         db: Session,
         gateway: Optional[GeminiGateway] = None,
         now_provider: Optional[Callable[[], datetime]] = None,
-        intake_lock_registry: Optional[Dict[str, asyncio.Lock]] = None,
+        intake_lock_registry: Optional[Any] = None,
         ledger_lock_registry: Optional[Dict[str, Any]] = None,
     ):
         self.db = db
         self.gateway = gateway or GeminiGateway()
         self.now_provider = now_provider or (lambda: datetime.now(timezone.utc))
-        self._intake_locks = (
-            intake_lock_registry if intake_lock_registry is not None else _intake_locks
-        )
+        self._intake_locks = intake_lock_registry
         self.cycle_repo = MedicalCycleRepository(db)
         self.report_repo = ModelReportRepository(db)
         self.lab_revision_service = LabRevisionConsiliumService(
@@ -111,9 +117,26 @@ class LabVisionOcrService:
         )
 
     def _get_intake_lock(self, cycle_id: str) -> asyncio.Lock:
-        if cycle_id not in self._intake_locks:
-            self._intake_locks[cycle_id] = asyncio.Lock()
-        return self._intake_locks[cycle_id]
+        """
+        Returns an asyncio.Lock for cycle_id isolated to the caller's running event loop.
+        Never shares asyncio.Lock across distinct event loops or threads.
+        """
+        loop = asyncio.get_running_loop()
+        with self._INTAKE_META_LOCK:
+            registry = (
+                self._intake_locks
+                if self._intake_locks is not None
+                else self._GLOBAL_INTAKE_LOCKS
+            )
+            loop_locks = registry.get(loop)
+            if loop_locks is None:
+                loop_locks = {}
+                registry[loop] = loop_locks
+            lock = loop_locks.get(cycle_id)
+            if lock is None:
+                lock = asyncio.Lock()
+                loop_locks[cycle_id] = lock
+            return lock
 
     def _now_utc(self) -> datetime:
         dt = self.now_provider()

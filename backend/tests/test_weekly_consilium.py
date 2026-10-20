@@ -173,7 +173,7 @@ async def _seed_completed_primary_consilium(
     cycle_id: str = "cycle_weekly_01",
     primary_date: str = "2026-10-18",
 ) -> None:
-    _seed_preparatory_cycle_context(db_session, cycle_id=cycle_id)
+    _seed_preparatory_cycle_context(db_session, cycle_id=cycle_id, seed_ledger=True)
     primary_calls: List[Dict[str, Any]] = []
     primary_gateway = _build_consilium_mock_gateway(primary_calls)
     primary_service = PrimaryConsiliumService(db=db_session, gateway=primary_gateway)

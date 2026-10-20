@@ -47,6 +47,12 @@ from app.services.ecg_vision_service import (
     EcgVisionService,
     EcgVisionValidationError,
 )
+from app.services.lab_context_service import (
+    LaboratoryConsiliumContext,
+    assemble_consilium_laboratory_context,
+    get_last_evaluated_ledger_version,
+    LaboratoryLedgerVersionNotFoundError,
+)
 
 __all__ = [
     "create_sqlite_backup",
@@ -64,6 +70,10 @@ __all__ = [
     "LabRevisionConsiliumService",
     "LabVisionOcrService",
     "EcgVisionService",
+    "LaboratoryConsiliumContext",
+    "assemble_consilium_laboratory_context",
+    "get_last_evaluated_ledger_version",
+    "LaboratoryLedgerVersionNotFoundError",
     "ConsiliumError",
     "ConsiliumCycleNotFoundError",
     "ConsiliumContextMissingError",

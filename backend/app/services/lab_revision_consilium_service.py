@@ -376,30 +376,9 @@ class LabRevisionConsiliumService:
         return table
 
     def _get_last_evaluated_ledger_version(self, cycle_id: str) -> int:
-        exec_logs = self.report_repo.list_server_only(
-            cycle_id=cycle_id,
-            report_type=LAB_REVISION_EXECUTION_LOG_REPORT_TYPE,
-        )
-        if exec_logs:
-            latest_exec = exec_logs[0].content or {}
-            return int(latest_exec.get("evaluated_ledger_version", 1))
+        from app.services.lab_context_service import get_last_evaluated_ledger_version
 
-        # Check if Primary Consilium has completed for this cycle
-        pro_primary = self.report_repo.list_server_only(
-            cycle_id=cycle_id,
-            report_type="chief_physician_internal",
-        )
-        if pro_primary:
-            # Primary Consilium evaluated baseline v1 (if seeded from preparatory_vision_ocr)
-            ledgers = self.report_repo.list_versions(
-                cycle_id=cycle_id,
-                report_type=LABORATORY_LEDGER_REPORT_TYPE,
-                privacy_level=PrivacyLevel.SERVER_ONLY,
-            )
-            if ledgers and (ledgers[0].content or {}).get("source") == "preparatory_vision_ocr":
-                return 1
-            return 0
-        return 0
+        return get_last_evaluated_ledger_version(self.db, cycle_id)
 
     def get_lab_ledger_state(
         self, cycle_id: str, commit: bool = True

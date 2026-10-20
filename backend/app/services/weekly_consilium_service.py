@@ -558,41 +558,111 @@ class WeeklyConsiliumService:
             cycle_id=cycle_id,
             report_type=PREPARATORY_ANAMNESIS_REPORT_TYPE,
         )
-        ocr_reports = self.report_repo.list_server_only(
-            cycle_id=cycle_id,
-            report_type=PREPARATORY_OCR_REPORT_TYPE,
-        )
         anamnesis_summary = (
             (anamnesis_reports[0].content or {}).get("user_view", {})
             if anamnesis_reports
             else {}
         )
-        shared_labs = (
-            (ocr_reports[0].content or {}).get("shared_labs_table", {})
-            if ocr_reports
-            else {}
-        )
 
-        # Prefer the latest evaluated laboratory_ledger version (if a Full Lab-Revision Consilium completed)
-        # so stale OCR values never reappear after a lab revision, while unreviewed pending edits are not
-        # prematurely treated as evaluated by the full consilium.
-        lab_exec_logs = self.report_repo.list_server_only(
-            cycle_id=cycle_id,
-            report_type="lab_revision_execution_log",
-        )
-        if lab_exec_logs:
-            eval_ver = int((lab_exec_logs[0].content or {}).get("evaluated_ledger_version", 0))
-            if eval_ver > 0:
-                ledger_versions = self.report_repo.list_versions(
-                    cycle_id=cycle_id,
-                    report_type="laboratory_ledger",
-                    privacy_level=PrivacyLevel.SERVER_ONLY,
+        # Determine the latest laboratory state and distinguish data evaluated by the
+        # last Full Consilium (Primary or Lab-Revision) from new unreviewed lab changes.
+        from app.services.lab_context_service import assemble_consilium_laboratory_context
+
+        latest_lab_ctx = assemble_consilium_laboratory_context(self.db, cycle_id)
+
+        from app.services.lab_context_service import get_last_evaluated_ledger_version
+
+        last_evaluated_ver = get_last_evaluated_ledger_version(self.db, cycle_id)
+
+        unreviewed_pending_labs: Dict[str, Any] = {}
+        pending_removed_marker_keys: List[str] = []
+
+        if latest_lab_ctx.ledger_version > last_evaluated_ver and last_evaluated_ver > 0:
+            from app.services.lab_context_service import LaboratoryLedgerVersionNotFoundError
+
+            eval_lab_ctx = None
+            try:
+                eval_lab_ctx = assemble_consilium_laboratory_context(
+                    self.db, cycle_id, ledger_version=last_evaluated_ver
                 )
-                for l_rep in ledger_versions:
-                    l_ver = int((l_rep.content or {}).get("ledger_version", l_rep.version))
-                    if l_ver == eval_ver:
-                        shared_labs = (l_rep.content or {}).get("shared_labs_table", shared_labs)
-                        break
+            except LaboratoryLedgerVersionNotFoundError:
+                eval_lab_ctx = None
+
+            if eval_lab_ctx is not None:
+                shared_labs_shelf = eval_lab_ctx.shared_labs_table
+
+                # 1. Detect removed or invalidated markers (previously active in evaluated shelf, now missing)
+                pending_removed_marker_keys = [
+                    k for k in shared_labs_shelf if k not in latest_lab_ctx.shared_labs_table
+                ]
+
+                # 2. Collect signatures of all observations evaluated by previous consilium
+                evaluated_obs_keys = {
+                    obs.get("observation_id")
+                    or (
+                        obs.get("marker_key"),
+                        str(obs.get("value")),
+                        str(obs.get("sample_date")),
+                        str(obs.get("recorded_at")),
+                    )
+                    for obs in eval_lab_ctx.laboratory_history
+                }
+
+                # 3. Detect new observations in history (new dated studies, corrections, etc.)
+                new_observations = [
+                    obs
+                    for obs in latest_lab_ctx.laboratory_history
+                    if (
+                        obs.get("observation_id")
+                        or (
+                            obs.get("marker_key"),
+                            str(obs.get("value")),
+                            str(obs.get("sample_date")),
+                            str(obs.get("recorded_at")),
+                        )
+                    )
+                    not in evaluated_obs_keys
+                ]
+                new_obs_marker_keys = {
+                    obs.get("marker_key") for obs in new_observations if obs.get("marker_key")
+                }
+
+                # 4. Form unreviewed_pending_labs:
+                # - newly added active markers
+                # - mutated active markers (value, unit, date, ref range, etc.)
+                # - active markers that received new dated observations in history (even if active value is identical)
+                for k, marker_val in latest_lab_ctx.shared_labs_table.items():
+                    if (
+                        k not in shared_labs_shelf
+                        or shared_labs_shelf[k] != marker_val
+                        or k in new_obs_marker_keys
+                    ):
+                        unreviewed_pending_labs[k] = marker_val
+
+                # Since ledger_version > last_evaluated_ver, new lab data was committed to ledger
+                has_unreviewed_lab_changes = True
+            else:
+                # Safe indeterminate fallback if requested evaluated ledger version is missing from database
+                shared_labs_shelf = {}
+                unreviewed_pending_labs = dict(latest_lab_ctx.shared_labs_table)
+                pending_removed_marker_keys = []
+                has_unreviewed_lab_changes = bool(
+                    latest_lab_ctx.shared_labs_table or latest_lab_ctx.laboratory_history
+                )
+        elif last_evaluated_ver == 0 and latest_lab_ctx.ledger_version > 0:
+            # Audit Remediation C-4:
+            # Ledger exists, but has NEVER been evaluated by a full consilium (or Primary ran on fallback).
+            # Safe indeterminate state: do not invent evaluated markers.
+            shared_labs_shelf = {}
+            unreviewed_pending_labs = dict(latest_lab_ctx.shared_labs_table)
+            pending_removed_marker_keys = []
+            has_unreviewed_lab_changes = bool(latest_lab_ctx.shared_labs_table or latest_lab_ctx.laboratory_history)
+        else:
+            shared_labs_shelf = latest_lab_ctx.shared_labs_table
+            has_unreviewed_lab_changes = False
+
+        # Full chronological observations history is always provided so no dated studies are lost
+        laboratory_history = latest_lab_ctx.laboratory_history
 
         initial_context_lines = [
             "=== ANAMNESIS AND INPUT DATA ===",
@@ -600,7 +670,13 @@ class WeeklyConsiliumService:
                 {
                     "cycle_id": cycle_id,
                     "anamnesis_user_view": anamnesis_summary,
-                    "shared_labs_shelf": shared_labs,
+                    "shared_labs_shelf": shared_labs_shelf,
+                    "evaluated_ledger_version": last_evaluated_ver,
+                    "latest_ledger_version": latest_lab_ctx.ledger_version,
+                    "has_unreviewed_lab_changes": has_unreviewed_lab_changes,
+                    "unreviewed_pending_labs": unreviewed_pending_labs,
+                    "pending_removed_marker_keys": pending_removed_marker_keys,
+                    "laboratory_history": laboratory_history,
                 },
                 ensure_ascii=False,
             ),
@@ -634,6 +710,13 @@ class WeeklyConsiliumService:
             "primary_flash_general": str(flash_initial.get("flash_general_shelf", "")),
             "primary_pro_general": str(pro_initial.get("pro_general_shelf", "")),
             "primary_pro_training": str(pro_initial.get("pro_training_shelf", "")),
+            "shared_labs_shelf": shared_labs_shelf,
+            "unreviewed_pending_labs": unreviewed_pending_labs,
+            "pending_removed_marker_keys": pending_removed_marker_keys,
+            "has_unreviewed_lab_changes": has_unreviewed_lab_changes,
+            "laboratory_history": laboratory_history,
+            "evaluated_ledger_version": last_evaluated_ver,
+            "latest_ledger_version": latest_lab_ctx.ledger_version,
         }
 
     # ==========================================================================

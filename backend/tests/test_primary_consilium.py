@@ -128,7 +128,11 @@ def _sample_pro_output(
     }
 
 
-def _seed_preparatory_cycle_context(db_session, cycle_id: str = "cycle_consilium_01") -> None:
+def _seed_preparatory_cycle_context(
+    db_session,
+    cycle_id: str = "cycle_consilium_01",
+    seed_ledger: bool = False,
+) -> None:
     cycle_repo = MedicalCycleRepository(db_session)
     cycle_repo.create(cycle_id=cycle_id, status="active")
 
@@ -158,6 +162,12 @@ def _seed_preparatory_cycle_context(db_session, cycle_id: str = "cycle_consilium
         },
         created_at=datetime(2026, 10, 18, 9, 0, tzinfo=timezone.utc),
     )
+    if seed_ledger:
+        from app.services.lab_revision_consilium_service import LabRevisionConsiliumService
+
+        rev_service = LabRevisionConsiliumService(db=db_session)
+        rev_service._ensure_baseline_ledger_seeded(cycle_id)
+
     service.save_preparatory_ecg_summary(
         cycle_id=cycle_id,
         ecg_summary="Sinus rhythm, HR 64 bpm, normal electrical axis, no ST-T shifts.",
@@ -490,7 +500,7 @@ def test_api_run_primary_and_client_reports_strict_privacy_and_versioning(
       without overwriting v1.
     """
     cycle_id = "cycle_api_e2e"
-    _seed_preparatory_cycle_context(db_session, cycle_id=cycle_id)
+    _seed_preparatory_cycle_context(db_session, cycle_id=cycle_id, seed_ledger=True)
 
     recorded_calls: List[Dict[str, Any]] = []
     app.dependency_overrides[get_gemini_gateway] = lambda: _build_consilium_mock_gateway(

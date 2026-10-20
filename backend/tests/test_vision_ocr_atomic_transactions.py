@@ -483,13 +483,15 @@ def test_scenario_7_concurrent_ocr_uploads_zero_lost_markers_across_threads(tmp_
             loop.close()
 
     threads = [
-        threading.Thread(target=_ocr_worker, args=(p,))
+        threading.Thread(target=_ocr_worker, args=(p,), daemon=True)
         for p in worker_payloads
     ]
     for t in threads:
         t.start()
     for t in threads:
         t.join(timeout=15.0)
+    for t in threads:
+        assert not t.is_alive(), f"Thread {t.name} did not terminate cleanly within timeout"
 
     assert errors == [], f"Unexpected errors during concurrent OCR: {errors}"
     assert len(results) == 2
@@ -584,3 +586,201 @@ async def test_scenario_8_compatibility_standalone_upsert_and_ledger_state(tmp_p
         assert reports[0].version == 1
         assert reports[1].version == 2
         assert "ferritin" in reports[1].content["active_markers"]
+
+
+def test_scenario_9_cross_event_loop_shared_registry_no_deadlock(tmp_path: Path):
+    """
+    9. Регрессионный тест кросс-event-loop блокировок с явно переданным общим registry:
+    Два системных потока с РАЗНЫМИ asyncio event loop используют ОДИН общий registry словарь.
+    Благодаря loop-изоляции в LabVisionOcrService deadlock не возникает, оба запроса
+    успешно завершаются, и в registry формируются раздельные записи по реальным объектам loop.
+    """
+    db_path = tmp_path / "scenario_9.db"
+    engine, SessionFactory = _create_file_session_factory(db_path)
+    cycle_id = "cycle_c6_scen9_shared_reg"
+
+    with SessionFactory() as init_session:
+        _seed_cycle(init_session, cycle_id)
+
+    shared_registry: Dict[Any, Any] = {}
+    barrier = threading.Barrier(2)
+    errors: List[Exception] = []
+    results: List[LabVisionIntakeClientResponse] = []
+    lock = threading.Lock()
+
+    worker_payloads = [
+        _sample_vision_ocr_payload(
+            sample_date="2026-10-15",
+            markers=[
+                {
+                    "original_name": "ALT",
+                    "marker_key": "alt",
+                    "raw_value": "20.0",
+                    "numeric_value": 20.0,
+                    "unit": "U/L",
+                    "reference_range": {"low": 0.0, "high": 40.0, "text": "0 - 40"},
+                    "sample_date": "2026-10-15",
+                    "category": "biochemistry",
+                    "is_uncertain": False,
+                    "uncertainty_note": None,
+                    "is_critical_flag": False,
+                }
+            ],
+        ),
+        _sample_vision_ocr_payload(
+            sample_date="2026-10-16",
+            markers=[
+                {
+                    "original_name": "AST",
+                    "marker_key": "ast",
+                    "raw_value": "22.0",
+                    "numeric_value": 22.0,
+                    "unit": "U/L",
+                    "reference_range": {"low": 0.0, "high": 40.0, "text": "0 - 40"},
+                    "sample_date": "2026-10-16",
+                    "category": "biochemistry",
+                    "is_uncertain": False,
+                    "uncertainty_note": None,
+                    "is_critical_flag": False,
+                }
+            ],
+        ),
+    ]
+
+    def _worker(payload: Dict[str, Any]):
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        session = SessionFactory()
+        try:
+            gateway = _build_mock_gateway(payload)
+            # Shared intake_lock_registry explicitly passed to both workers across distinct loops
+            service = LabVisionOcrService(
+                db=session,
+                gateway=gateway,
+                intake_lock_registry=shared_registry,
+            )
+            barrier.wait(timeout=5.0)
+            res = loop.run_until_complete(
+                service.process_lab_images(
+                    cycle_id=cycle_id,
+                    files=[_make_upload_file()],
+                )
+            )
+            with lock:
+                results.append(res)
+        except Exception as exc:
+            with lock:
+                errors.append(exc)
+        finally:
+            session.close()
+            loop.close()
+
+    threads = [
+        threading.Thread(target=_worker, args=(p,), daemon=True)
+        for p in worker_payloads
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=10.0)
+    for t in threads:
+        assert not t.is_alive(), f"Thread {t.name} did not terminate cleanly within timeout"
+
+    assert errors == [], f"Unexpected errors during cross-loop shared registry OCR: {errors}"
+    assert len(results) == 2
+    # Verify both loops were recorded separately in the shared registry
+    assert len(shared_registry) == 2
+    for loop_obj, locks in shared_registry.items():
+        assert isinstance(locks, dict)
+        assert cycle_id in locks
+        assert isinstance(locks[cycle_id], asyncio.Lock)
+
+
+@pytest.mark.anyio
+async def test_scenario_10_single_event_loop_coroutine_serialization(tmp_path: Path):
+    """
+    10. Регрессионный тест сериализации двух корутин внутри одного event loop:
+    Две корутины запускаются конкурентно (asyncio.gather) с ОДИНАКОВЫМ cycle_id
+    внутри одного event loop. Обе сериализуются через _get_intake_lock(cycle_id),
+    выполняются без взаимных коллизий и последовательно увеличивают версию ledger (v1, затем v2).
+    """
+    db_path = tmp_path / "scenario_10.db"
+    engine, SessionFactory = _create_file_session_factory(db_path)
+    cycle_id = "cycle_c6_scen10_single_loop_serialization"
+
+    with SessionFactory() as init_session:
+        _seed_cycle(init_session, cycle_id)
+
+    payload_1 = _sample_vision_ocr_payload(
+        sample_date="2026-10-15",
+        markers=[
+            {
+                "original_name": "ALT",
+                "marker_key": "alt",
+                "raw_value": "35.0",
+                "numeric_value": 35.0,
+                "unit": "U/L",
+                "reference_range": {"low": 0.0, "high": 40.0, "text": "0 - 40"},
+                "sample_date": "2026-10-15",
+                "category": "biochemistry",
+                "is_uncertain": False,
+                "uncertainty_note": None,
+                "is_critical_flag": False,
+            }
+        ],
+    )
+    payload_2 = _sample_vision_ocr_payload(
+        sample_date="2026-10-16",
+        markers=[
+            {
+                "original_name": "AST",
+                "marker_key": "ast",
+                "raw_value": "42.0",
+                "numeric_value": 42.0,
+                "unit": "U/L",
+                "reference_range": {"low": 0.0, "high": 40.0, "text": "0 - 40"},
+                "sample_date": "2026-10-16",
+                "category": "biochemistry",
+                "is_uncertain": False,
+                "uncertainty_note": None,
+                "is_critical_flag": False,
+            }
+        ],
+    )
+
+    shared_intake_locks: Dict[Any, Any] = {}
+    shared_ledger_locks: Dict[str, Any] = {}
+
+    async def _run_intake(payload: Dict[str, Any]) -> LabVisionIntakeClientResponse:
+        with SessionFactory() as session:
+            gateway = _build_mock_gateway(payload)
+            service = LabVisionOcrService(
+                db=session,
+                gateway=gateway,
+                intake_lock_registry=shared_intake_locks,
+                ledger_lock_registry=shared_ledger_locks,
+            )
+            return await service.process_lab_images(
+                cycle_id=cycle_id,
+                files=[_make_upload_file()],
+            )
+
+    res_1, res_2 = await asyncio.gather(_run_intake(payload_1), _run_intake(payload_2))
+
+    assert {res_1.ledger_version, res_2.ledger_version} == {1, 2}
+    assert res_1.status == "processed"
+    assert res_2.status == "processed"
+
+    with SessionFactory() as verify_session:
+        reports = verify_session.execute(
+            select(ModelReport)
+            .where(ModelReport.cycle_id == cycle_id, ModelReport.report_type == LABORATORY_LEDGER_REPORT_TYPE)
+            .order_by(ModelReport.version.asc())
+        ).scalars().all()
+
+        assert len(reports) == 2
+        assert reports[0].version == 1
+        assert reports[1].version == 2
+        final_content = reports[1].content
+        assert "alt" in final_content["active_markers"]
+        assert "ast" in final_content["active_markers"]

@@ -1,7 +1,7 @@
 import asyncio
 from datetime import datetime, timezone
 import json
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 from sqlalchemy.orm import Session
 
 from app.models.model_report import ModelReport
@@ -414,20 +414,10 @@ class PrimaryConsiliumService:
         return AnamnesisModelOutput.model_validate(latest_content)
 
     def _load_preparatory_labs(self, cycle_id: str) -> Dict[str, Any]:
-        reports = self.report_repo.list_server_only(
-            cycle_id=cycle_id,
-            report_type=PREPARATORY_OCR_REPORT_TYPE,
-        )
-        if not reports:
-            return {}
-        content = reports[0].content or {}
-        if content.get("agent_role") != AegisAgentRole.VISION_OCR.value:
-            raise ConsiliumContextMissingError(
-                f"Invalid agent_role '{content.get('agent_role')}' on preparatory Vision OCR report; "
-                f"expected '{AegisAgentRole.VISION_OCR.value}'."
-            )
-        labs = content.get("shared_labs_table")
-        return dict(labs) if isinstance(labs, dict) else {}
+        from app.services.lab_context_service import assemble_consilium_laboratory_context
+
+        lab_ctx = assemble_consilium_laboratory_context(self.db, cycle_id)
+        return dict(lab_ctx.shared_labs_table)
 
     def _load_preparatory_ecg(self, cycle_id: str) -> str:
         reports = self.report_repo.list_server_only(
@@ -477,18 +467,24 @@ class PrimaryConsiliumService:
         shared_labs_table: Dict[str, Any],
         vitals_stream: Dict[str, str],
         system_outputs: Dict[str, SystemAgentOutput],
+        laboratory_history: Optional[List[Dict[str, Any]]] = None,
     ) -> str:
         """
-        Mirrors VaultService.getAggregatedContextForMaster() from Flutter.
+        Mirrors VaultService.getAggregatedContextForMaster() from Flutter, extended with
+        full laboratory_history for complete multi-date trajectory audit.
         """
+        payload = {
+            "user_view": anamnesis.user_view.model_dump(),
+            "training_sandbox": anamnesis.training_sandbox.model_dump(),
+            "shared_labs_shelf": shared_labs_table,
+        }
+        if laboratory_history is not None:
+            payload["laboratory_history"] = laboratory_history
+
         lines = [
             "=== ANAMNESIS AND INPUT DATA ===",
             json.dumps(
-                {
-                    "user_view": anamnesis.user_view.model_dump(),
-                    "training_sandbox": anamnesis.training_sandbox.model_dump(),
-                    "shared_labs_shelf": shared_labs_table,
-                },
+                payload,
                 ensure_ascii=False,
             ),
             "",
@@ -579,8 +575,12 @@ class PrimaryConsiliumService:
         )
 
         # 1. Load already-saved preparatory results from DB (never re-run M1 or Vision here)
+        from app.services.lab_context_service import assemble_consilium_laboratory_context
+
         anamnesis_m1 = self._load_preparatory_anamnesis(cycle_id)
-        shared_labs_table = self._load_preparatory_labs(cycle_id)
+        lab_context = assemble_consilium_laboratory_context(self.db, cycle_id)
+        shared_labs_table = lab_context.shared_labs_table
+        laboratory_history = lab_context.laboratory_history
         ecg_summary = self._load_preparatory_ecg(cycle_id)
         vitals_stream = self._load_latest_vitals_stream(cycle_id, ecg_summary)
 
@@ -593,6 +593,7 @@ class PrimaryConsiliumService:
                 "facts": organ_fact.data,
                 "first_model_short_summary": organ_fact.internal_comment,
                 "shared_labs_table": shared_labs_table,
+                "laboratory_history": laboratory_history,
                 "vitals_stream": vitals_stream,
             }
             system_prompt = build_system_agent_prompt(system_key, input_package)
@@ -609,6 +610,7 @@ class PrimaryConsiliumService:
             shared_labs_table=shared_labs_table,
             vitals_stream=vitals_stream,
             system_outputs=system_outputs,
+            laboratory_history=laboratory_history,
         )
         flash_prompt = build_flash_master_prompt(initial_master_context)
         flash_output: FlashMasterOutput = await self.gateway.generate_structured(
@@ -696,6 +698,10 @@ class PrimaryConsiliumService:
                 commit=False,
             )
 
+            evaluated_ledger_version = (
+                lab_context.ledger_version if not lab_context.is_synthetic_fallback else 0
+            )
+
             self.report_repo.create_next_version(
                 cycle_id=cycle_id,
                 model=self.gateway.pro_model,
@@ -707,6 +713,8 @@ class PrimaryConsiliumService:
                     "pro_training_shelf": pro_output.pro_training_shelf,
                     "vitals_thresholds": pro_output.vitals_thresholds.model_dump(),
                     "flash_quality_review": pro_output.flash_quality_review.model_dump(),
+                    "evaluated_ledger_version": evaluated_ledger_version,
+                    "is_synthetic_fallback": bool(lab_context.is_synthetic_fallback),
                 },
                 commit=False,
             )
