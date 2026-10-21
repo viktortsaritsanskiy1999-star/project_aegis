@@ -1,6 +1,7 @@
+import math
 import re
 from enum import Enum
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from pydantic import BaseModel, Field, ConfigDict, field_validator, model_validator
 from app.schemas.reports import ClientModelReportResponse
 
@@ -1142,6 +1143,217 @@ class EcgRecordingQuality(str, Enum):
     UNREADABLE = "unreadable"
 
 
+def _parse_hr_metric(val: Any) -> Tuple[Optional[float], Optional[str], Optional[Dict[str, Any]]]:
+    """
+    Safely parses heart rate metric from int, float, or formatted strings (e.g. '72 bpm', '72.4').
+    Validates units: accepts bpm or unitless; rejects mismatched time units (ms, s).
+    Fractional heart rates are rounded to the nearest integer and documented in conversion metadata.
+    Returns (parsed_float, error_reason, raw_info_metadata).
+    """
+    if val is None:
+        return (None, None, None)
+    if isinstance(val, bool):
+        return (None, "Boolean value cannot be used as heart rate", None)
+    if isinstance(val, (int, float)):
+        if math.isnan(val) or math.isinf(val):
+            return (None, "NaN or Infinite numerical value", None)
+        if isinstance(val, float) and abs(val - round(val)) > 1e-4:
+            rounded_val = int(round(val))
+            raw_info = {
+                "raw_value": val,
+                "conversion": f"Fractional heart rate ({val}) rounded to nearest integer ({rounded_val} bpm).",
+            }
+            return (float(rounded_val), None, raw_info)
+        return (float(val), None, None)
+    if isinstance(val, str):
+        val_clean = val.strip()
+        if not val_clean:
+            return (None, "Empty string value", None)
+        if re.search(r"\b(ms|мс|sec|сек|s|с)\b", val_clean, re.IGNORECASE):
+            return (None, f"Mismatched unit for heart rate: found time unit in '{val_clean}' (expected bpm).", None)
+        m = re.match(r"^([+-]?[0-9]+(?:\.[0-9]+)?)\s*(?:bpm|уд/?мин|уд)?$", val_clean, re.IGNORECASE)
+        if m:
+            try:
+                num = float(m.group(1))
+                if math.isnan(num) or math.isinf(num):
+                    return (None, "NaN or Infinite string value", None)
+                if abs(num - round(num)) > 1e-4:
+                    rounded_val = int(round(num))
+                    raw_info = {
+                        "raw_value": val,
+                        "conversion": f"Fractional heart rate string ({val_clean!r}) rounded to nearest integer ({rounded_val} bpm).",
+                    }
+                    return (float(rounded_val), None, raw_info)
+                return (num, None, None)
+            except (ValueError, TypeError):
+                pass
+        return (None, f"Non-numeric or unrecognized heart rate string value '{val_clean}'", None)
+    return (None, f"Unsupported value type '{type(val).__name__}'", None)
+
+
+def _parse_interval_metric(val: Any) -> Tuple[Optional[float], Optional[str], Optional[Dict[str, Any]]]:
+    """
+    Safely parses ECG intervals (PR, QRS, QT, QTc) from int, float, or formatted strings.
+    Validates units: accepts ms/мс, explicit seconds (s/sec/с/сек) converted to ms, or unitless.
+    Rejects mismatched frequency units (bpm).
+    Returns (parsed_float_in_ms, error_reason, raw_info_metadata).
+    """
+    if val is None:
+        return (None, None, None)
+    if isinstance(val, bool):
+        return (None, "Boolean value cannot be used as interval metric", None)
+    if isinstance(val, (int, float)):
+        if math.isnan(val) or math.isinf(val):
+            return (None, "NaN or Infinite numerical value", None)
+        return (float(val), None, None)
+    if isinstance(val, str):
+        val_clean = val.strip()
+        if not val_clean:
+            return (None, "Empty string value", None)
+        if re.search(r"\b(bpm|уд/?мин|уд)\b", val_clean, re.IGNORECASE):
+            return (None, f"Mismatched unit for ECG interval: found frequency unit in '{val_clean}' (expected ms).", None)
+        # Explicit seconds conversion to milliseconds
+        m_sec = re.match(r"^([+-]?[0-9]+(?:\.[0-9]+)?)\s*(?:s|sec|сек|с)$", val_clean, re.IGNORECASE)
+        if m_sec:
+            try:
+                sec_num = float(m_sec.group(1))
+                if math.isnan(sec_num) or math.isinf(sec_num):
+                    return (None, "NaN or Infinite string value", None)
+                ms_num = round(sec_num * 1000.0, 1)
+                raw_info = {
+                    "raw_value": val,
+                    "conversion": f"Converted from seconds ({val_clean}) to milliseconds ({ms_num} ms).",
+                }
+                return (ms_num, None, raw_info)
+            except (ValueError, TypeError):
+                pass
+        m_ms = re.match(r"^([+-]?[0-9]+(?:\.[0-9]+)?)\s*(?:ms|мс)?$", val_clean, re.IGNORECASE)
+        if m_ms:
+            try:
+                num = float(m_ms.group(1))
+                if math.isnan(num) or math.isinf(num):
+                    return (None, "NaN or Infinite string value", None)
+                return (num, None, None)
+            except (ValueError, TypeError):
+                pass
+        return (None, f"Non-numeric or unrecognized interval string value '{val_clean}'", None)
+    return (None, f"Unsupported value type '{type(val).__name__}'", None)
+
+
+def classify_lead_setup(
+    recording_type: Optional[str],
+    lead_name: Optional[str],
+) -> Dict[str, Any]:
+    """
+    Deterministically evaluates lead setup configuration and detects conflicts
+    between recording_type and lead_name without relying solely on device brand names.
+    Distinguishes:
+    - Study recording type (e.g. standard_12_lead vs single-lead)
+    - Specific individual lead name (e.g. "Lead I", "Lead II", "V1")
+    - Available lead configuration (full 12-lead vs single-channel vs contradictory)
+    """
+    rec_clean = (recording_type or "").lower().strip()
+    lead_clean = (lead_name or "").lower().strip()
+
+    is_12_lead_claimed = (
+        rec_clean == EcgRecordingType.STANDARD_12_LEAD.value
+        or "12-lead" in rec_clean
+        or "12 lead" in rec_clean
+        or "12lead" in rec_clean
+        or "12-канальн" in rec_clean
+    )
+
+    single_descriptors = (
+        "single_lead",
+        "single-lead",
+        "single lead",
+        "1-lead",
+        "1 lead",
+        "1lead",
+        "one-lead",
+        "single_channel",
+        "single channel",
+        "одноканальн",
+        "smartwatch",
+        "watch",
+    )
+
+    is_single_lead_rec = (
+        rec_clean in (
+            EcgRecordingType.SINGLE_LEAD_SMARTWATCH.value,
+            "single_lead",
+            "single-lead",
+            "single lead",
+            "1-lead",
+            "1 lead",
+            "1lead",
+            "single_channel",
+            "single channel",
+        )
+        or any(d in rec_clean for d in single_descriptors)
+    )
+
+    has_single_lead_descriptor_in_lead = any(d in lead_clean for d in single_descriptors)
+
+    # 1. Contradiction: claimed 12-lead study but explicit single-lead/smartwatch indicators present
+    if is_12_lead_claimed and (is_single_lead_rec or has_single_lead_descriptor_in_lead):
+        return {
+            "category": "conflict",
+            "can_compute_axis": False,
+            "is_single_lead": False,
+            "is_confirmed_12_lead": False,
+            "reason": (
+                f"Contradictory ECG lead metadata: recording_type claims 12-lead study, "
+                f"but descriptors indicate single-lead configuration ('{lead_name}'). "
+                "Frontal plane electrical axis cannot be calculated from contradictory metadata."
+            ),
+        }
+
+    # 2. Confirmed 12-lead setup (Lead I is a valid lead in 12-lead study)
+    if is_12_lead_claimed:
+        return {
+            "category": "confirmed_12_lead",
+            "can_compute_axis": True,
+            "is_single_lead": False,
+            "is_confirmed_12_lead": True,
+            "reason": None,
+        }
+
+    # 3. Confirmed single-lead setup
+    multi_indicators = ("12-lead", "12 lead", "12lead", "multi", "precordial", ",", ";", "/", "v1-v6", "i-iii")
+    has_multi = any(m in lead_clean for m in multi_indicators)
+    is_isolated_lead = False
+    if not has_multi and lead_clean:
+        if re.search(r"\b(lead\s*(?:i{1,3}|[1-3]|avr|avl|avf|v[1-6])|v[1-6])\b", lead_clean):
+            is_isolated_lead = True
+
+    if is_single_lead_rec or has_single_lead_descriptor_in_lead or is_isolated_lead:
+        return {
+            "category": "single_lead",
+            "can_compute_axis": False,
+            "is_single_lead": True,
+            "is_confirmed_12_lead": False,
+            "reason": "Single-lead recording cannot determine electrical heart axis.",
+        }
+
+    # 4. Undetermined / unknown lead setup
+    return {
+        "category": "undetermined",
+        "can_compute_axis": False,
+        "is_single_lead": False,
+        "is_confirmed_12_lead": False,
+        "reason": (
+            "Recording device lead configuration is undetermined; findings cannot be "
+            "interpreted as a full 12-lead ECG or used to calculate frontal plane electrical axis."
+        ),
+    }
+
+
+def _is_single_lead_setup(recording_type: Optional[str], lead_name: Optional[str]) -> bool:
+    """Backward compatibility helper for single-lead classification."""
+    return classify_lead_setup(recording_type, lead_name)["is_single_lead"]
+
+
 class VisionEcgModelOutput(BaseModel):
     """
     Structured Pydantic model produced by Gemini Vision ECG (role='vision_ecg').
@@ -1149,6 +1361,7 @@ class VisionEcgModelOutput(BaseModel):
     - Single-lead recordings (e.g. smartwatch Lead I) CANNOT determine electrical axis.
     - If recording quality is unreadable, speculative intervals/rates must be null.
     - No fabricated measurements or premature categorical clinical diagnoses.
+    - Technical context preserves raw uncomputable metrics with uncertainty reasons.
     """
     model_config = ConfigDict(extra="forbid")
 
@@ -1167,32 +1380,136 @@ class VisionEcgModelOutput(BaseModel):
     t_wave_findings: Optional[str] = None
     limitations: List[str] = Field(default_factory=list)
     uncertainties: List[str] = Field(default_factory=list)
+    raw_unresolved_metrics: Dict[str, Any] = Field(default_factory=dict)
     ecg_summary: str = Field(..., min_length=5)
     potential_urgent_warning: Optional[str] = None
 
+    @model_validator(mode="before")
+    @classmethod
+    def sanitize_unusual_metrics(cls, data: Any) -> Any:
+        if not isinstance(data, dict):
+            return data
+
+        raw_unresolved = dict(data.get("raw_unresolved_metrics") or {})
+        uncertainties = list(data.get("uncertainties") or [])
+        urgent_warning = data.get("potential_urgent_warning")
+
+        metrics_specs = [
+            ("heart_rate_bpm", 20.0, 300.0, "bpm", True, _parse_hr_metric),
+            ("pr_interval_ms", 40.0, 600.0, "ms", False, _parse_interval_metric),
+            ("qrs_duration_ms", 30.0, 400.0, "ms", False, _parse_interval_metric),
+            ("qt_interval_ms", 150.0, 800.0, "ms", False, _parse_interval_metric),
+            ("qtc_interval_ms", 200.0, 800.0, "ms", False, _parse_interval_metric),
+        ]
+
+        for field_name, min_v, max_v, unit, is_int, parser in metrics_specs:
+            if field_name not in data:
+                continue
+            orig_val = data[field_name]
+            if orig_val is None:
+                continue
+
+            parsed_num, parse_err, raw_info = parser(orig_val)
+
+            if parse_err is not None:
+                if field_name not in raw_unresolved:
+                    raw_unresolved[field_name] = {
+                        "raw_value": orig_val,
+                        "reason": parse_err,
+                    }
+                data[field_name] = None
+                note = f"Metric '{field_name}' reading (raw: {orig_val!r}) cannot be verified: {parse_err}."
+                if note not in uncertainties:
+                    uncertainties.append(note)
+                continue
+
+            assert parsed_num is not None
+            if parsed_num < min_v or parsed_num > max_v:
+                if field_name not in raw_unresolved:
+                    reason = (
+                        f"Reading ({orig_val}) is outside standard computational range "
+                        f"({min_v}-{max_v} {unit}); requires clinical verification."
+                    )
+                    raw_unresolved[field_name] = {
+                        "raw_value": orig_val,
+                        "reason": reason,
+                    }
+                data[field_name] = None
+                note = (
+                    f"Reading of '{field_name}' (raw: {orig_val}) is outside standard computational "
+                    f"range ({min_v}-{max_v} {unit}); requires verification."
+                )
+                if note not in uncertainties:
+                    uncertainties.append(note)
+
+
+            else:
+                if raw_info is not None and field_name not in raw_unresolved:
+                    raw_unresolved[field_name] = raw_info
+                data[field_name] = int(round(parsed_num)) if is_int else round(parsed_num, 1)
+
+        data["raw_unresolved_metrics"] = raw_unresolved
+        data["uncertainties"] = uncertainties
+        if urgent_warning:
+            data["potential_urgent_warning"] = urgent_warning
+
+        return data
+
     @model_validator(mode="after")
     def enforce_clinical_safety_rules(self) -> "VisionEcgModelOutput":
-        # 1. Single-lead recordings (smartwatches) cannot determine electrical heart axis
-        rec_type_lower = (self.recording_type or "").lower()
-        if (
-            "single" in rec_type_lower
-            or "watch" in rec_type_lower
-            or "lead_i" in rec_type_lower
-            or self.recording_type == EcgRecordingType.SINGLE_LEAD_SMARTWATCH.value
-        ):
+        lead_classification = classify_lead_setup(self.recording_type, self.lead_name)
+
+        if lead_classification["category"] == "conflict":
+            # Metadata contradiction: preserve recording_type, nullify axis, record uncertainty
+            self.electrical_axis = None
+            unc = (
+                lead_classification["reason"]
+                or f"Contradictory ECG lead metadata between '{self.recording_type}' and '{self.lead_name}'; "
+                "frontal plane electrical axis cannot be calculated."
+            )
+            if not any("contradict" in u.lower() or "conflict" in u.lower() for u in self.uncertainties):
+                self.uncertainties.append(unc)
+            axis_lim = "Electrical heart axis cannot be determined from contradictory or unverified lead configuration."
+            if not any("axis" in lim.lower() for lim in self.limitations):
+                self.limitations.append(axis_lim)
+
+        elif lead_classification["is_single_lead"]:
+            # Confirmed single-lead recordings cannot determine electrical heart axis
             self.electrical_axis = None
             axis_lim = "Electrical heart axis cannot be determined from single-lead recording."
             if not any("axis" in lim.lower() for lim in self.limitations):
                 self.limitations.append(axis_lim)
 
+            single_lead_lim = (
+                "Single-lead recording cannot evaluate electrical axis, chamber hypertrophy, "
+                "transmural ischemia, or localize myocardial infarctions, and cannot replace "
+                "a standard diagnostic 12-lead ECG."
+            )
+            if not any("cannot replace" in lim.lower() for lim in self.limitations):
+                self.limitations.append(single_lead_lim)
+
+        elif not lead_classification["is_confirmed_12_lead"]:
+            # Undetermined lead setup: preserve lead setup uncertainty
+            self.electrical_axis = None
+            unc = (
+                "Recording device lead configuration is undetermined; findings cannot be "
+                "interpreted as a full 12-lead ECG or used to calculate frontal plane electrical axis."
+            )
+            if not any("undetermined" in u.lower() for u in self.uncertainties):
+                self.uncertainties.append(unc)
+
         # 2. If unreadable quality, strip speculative numeric measurements
         if (self.recording_quality or "").lower() in ("unreadable", EcgRecordingQuality.UNREADABLE.value):
-            self.heart_rate_bpm = None
-            self.pr_interval_ms = None
-            self.qrs_duration_ms = None
-            self.qt_interval_ms = None
-            self.qtc_interval_ms = None
-            self.electrical_axis = None
+            for field in ("heart_rate_bpm", "pr_interval_ms", "qrs_duration_ms", "qt_interval_ms", "qtc_interval_ms", "electrical_axis"):
+                val = getattr(self, field, None)
+                if val is not None:
+                    if field not in self.raw_unresolved_metrics:
+                        self.raw_unresolved_metrics[field] = {
+                            "raw_value": val,
+                            "reason": "Tracing quality is unreadable; numeric value cannot be verified.",
+                        }
+                    setattr(self, field, None)
+
             unreadable_note = "ECG tracing is unreadable or heavily corrupted by noise."
             if not any("unreadable" in u.lower() for u in self.uncertainties):
                 self.uncertainties.append(unreadable_note)

@@ -1350,17 +1350,11 @@ class LabRevisionConsiliumService:
             )
         return AnamnesisModelOutput.model_validate(latest_content)
 
-    def _load_preparatory_ecg_and_vitals(self, cycle_id: str) -> Dict[str, str]:
-        ecg_reports = self.report_repo.list_server_only(
-            cycle_id=cycle_id,
-            report_type=PREPARATORY_ECG_REPORT_TYPE,
-        )
-        ecg_summary = "Not conducted"
-        if ecg_reports:
-            c = ecg_reports[0].content or {}
-            if c.get("agent_role") != AegisAgentRole.VISION_ECG.value:
-                raise ConsiliumContextMissingError("Invalid agent_role on preparatory Vision ECG report.")
-            ecg_summary = str(c.get("ecg_summary") or "Not conducted").strip()
+    def _load_preparatory_ecg_and_vitals(self, cycle_id: str) -> Dict[str, Any]:
+        from app.services.ecg_context_service import assemble_consilium_ecg_context
+
+        ecg_ctx = assemble_consilium_ecg_context(self.db, cycle_id)
+        ecg_summary = ecg_ctx.ecg_summary
 
         measurements = self.measurement_repo.list_by_cycle(cycle_id=cycle_id)
         systolic = next((m.systolic for m in reversed(measurements) if m.systolic is not None), None)
@@ -1373,6 +1367,7 @@ class LabRevisionConsiliumService:
             "heart_rate": f"{pulse if pulse is not None else '--'} bpm",
             "spo2": f"{spo2 if spo2 is not None else '--'}%",
             "ecg_summary": ecg_summary,
+            "ecg_context": ecg_ctx.to_dict(),
         }
 
     def _load_previous_models_state(self, cycle_id: str) -> Dict[str, Any]:
@@ -1520,6 +1515,7 @@ class LabRevisionConsiliumService:
                 }
                 shared_labs_table = self._build_shared_labs_table_from_active(active_markers_raw)
                 prev_models = self._load_previous_models_state(cycle_id)
+                ecg_context_dict = vitals_stream.get("ecg_context") or {}
 
                 # 3. STAGE 1: Execute 8 Organ Specialists (Gemini Flash-Lite)
                 system_outputs: Dict[str, SystemAgentOutput] = {}
@@ -1531,6 +1527,7 @@ class LabRevisionConsiliumService:
                         "first_model_short_summary": organ_fact.internal_comment,
                         "shared_labs_table": shared_labs_table,
                         "vitals_stream": vitals_stream,
+                        "ecg_context": ecg_context_dict,
                     }
                     previous_organ_output = prev_models["previous_organs"].get(system_key, {})
                     previous_consilium_summary = {
@@ -1568,6 +1565,7 @@ class LabRevisionConsiliumService:
                             "user_view": anamnesis_m1.user_view.model_dump(),
                             "training_sandbox": anamnesis_m1.training_sandbox.model_dump(),
                             "shared_labs_shelf": shared_labs_table,
+                            "ecg_context": ecg_context_dict,
                         },
                         ensure_ascii=False,
                     ),

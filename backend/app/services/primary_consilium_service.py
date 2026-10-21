@@ -419,23 +419,20 @@ class PrimaryConsiliumService:
         lab_ctx = assemble_consilium_laboratory_context(self.db, cycle_id)
         return dict(lab_ctx.shared_labs_table)
 
-    def _load_preparatory_ecg(self, cycle_id: str) -> str:
-        reports = self.report_repo.list_server_only(
-            cycle_id=cycle_id,
-            report_type=PREPARATORY_ECG_REPORT_TYPE,
-        )
-        if not reports:
-            return "Not conducted"
-        content = reports[0].content or {}
-        if content.get("agent_role") != AegisAgentRole.VISION_ECG.value:
-            raise ConsiliumContextMissingError(
-                f"Invalid agent_role '{content.get('agent_role')}' on preparatory Vision ECG report; "
-                f"expected '{AegisAgentRole.VISION_ECG.value}'."
-            )
-        ecg = content.get("ecg_summary")
-        return str(ecg).strip() if isinstance(ecg, str) and ecg.strip() else "Not conducted"
+    def _load_preparatory_ecg_context(self, cycle_id: str):
+        from app.services.ecg_context_service import assemble_consilium_ecg_context
 
-    def _load_latest_vitals_stream(self, cycle_id: str, ecg_summary: str) -> Dict[str, str]:
+        return assemble_consilium_ecg_context(self.db, cycle_id)
+
+    def _load_preparatory_ecg(self, cycle_id: str) -> str:
+        return self._load_preparatory_ecg_context(cycle_id).ecg_summary
+
+    def _load_latest_vitals_stream(
+        self,
+        cycle_id: str,
+        ecg_summary: str,
+        ecg_context: Optional[Any] = None,
+    ) -> Dict[str, Any]:
         measurements = self.measurement_repo.list_by_cycle(cycle_id=cycle_id)
         systolic: Optional[int] = None
         diastolic: Optional[int] = None
@@ -454,32 +451,42 @@ class PrimaryConsiliumService:
             if all(v is not None for v in (systolic, diastolic, pulse, spo2)):
                 break
 
-        return {
+        res: Dict[str, Any] = {
             "blood_pressure": f"{systolic if systolic is not None else '--'}/{diastolic if diastolic is not None else '--'} mmHg",
             "heart_rate": f"{pulse if pulse is not None else '--'} bpm",
             "spo2": f"{spo2 if spo2 is not None else '--'}%",
             "ecg_summary": ecg_summary or "Not conducted",
         }
+        if ecg_context is not None:
+            res["ecg_context"] = (
+                ecg_context.to_dict() if hasattr(ecg_context, "to_dict") else dict(ecg_context)
+            )
+        return res
 
     @staticmethod
     def _assemble_context_for_flash(
         anamnesis: AnamnesisModelOutput,
         shared_labs_table: Dict[str, Any],
-        vitals_stream: Dict[str, str],
+        vitals_stream: Dict[str, Any],
         system_outputs: Dict[str, SystemAgentOutput],
         laboratory_history: Optional[List[Dict[str, Any]]] = None,
+        ecg_context: Optional[Any] = None,
     ) -> str:
         """
         Mirrors VaultService.getAggregatedContextForMaster() from Flutter, extended with
-        full laboratory_history for complete multi-date trajectory audit.
+        full laboratory_history for complete multi-date trajectory audit and structured ecg_context.
         """
-        payload = {
+        payload: Dict[str, Any] = {
             "user_view": anamnesis.user_view.model_dump(),
             "training_sandbox": anamnesis.training_sandbox.model_dump(),
             "shared_labs_shelf": shared_labs_table,
         }
         if laboratory_history is not None:
             payload["laboratory_history"] = laboratory_history
+        if ecg_context is not None:
+            payload["ecg_context"] = (
+                ecg_context.to_dict() if hasattr(ecg_context, "to_dict") else dict(ecg_context)
+            )
 
         lines = [
             "=== ANAMNESIS AND INPUT DATA ===",
@@ -576,13 +583,18 @@ class PrimaryConsiliumService:
 
         # 1. Load already-saved preparatory results from DB (never re-run M1 or Vision here)
         from app.services.lab_context_service import assemble_consilium_laboratory_context
+        from app.services.ecg_context_service import assemble_consilium_ecg_context
 
         anamnesis_m1 = self._load_preparatory_anamnesis(cycle_id)
         lab_context = assemble_consilium_laboratory_context(self.db, cycle_id)
         shared_labs_table = lab_context.shared_labs_table
         laboratory_history = lab_context.laboratory_history
-        ecg_summary = self._load_preparatory_ecg(cycle_id)
-        vitals_stream = self._load_latest_vitals_stream(cycle_id, ecg_summary)
+        ecg_context = self._load_preparatory_ecg_context(cycle_id)
+        ecg_summary = ecg_context.ecg_summary
+        vitals_stream = self._load_latest_vitals_stream(
+            cycle_id, ecg_summary, ecg_context=ecg_context
+        )
+        ecg_context_dict = ecg_context.to_dict()
 
         # 2. Execute 8 Organ Specialists (Gemini Flash-Lite)
         system_outputs: Dict[str, SystemAgentOutput] = {}
@@ -595,6 +607,7 @@ class PrimaryConsiliumService:
                 "shared_labs_table": shared_labs_table,
                 "laboratory_history": laboratory_history,
                 "vitals_stream": vitals_stream,
+                "ecg_context": ecg_context_dict,
             }
             system_prompt = build_system_agent_prompt(system_key, input_package)
             organ_result: SystemAgentOutput = await self.gateway.generate_structured(
@@ -611,6 +624,7 @@ class PrimaryConsiliumService:
             vitals_stream=vitals_stream,
             system_outputs=system_outputs,
             laboratory_history=laboratory_history,
+            ecg_context=ecg_context,
         )
         flash_prompt = build_flash_master_prompt(initial_master_context)
         flash_output: FlashMasterOutput = await self.gateway.generate_structured(

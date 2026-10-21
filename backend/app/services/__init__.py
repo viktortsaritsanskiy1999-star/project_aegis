@@ -53,6 +53,10 @@ from app.services.lab_context_service import (
     get_last_evaluated_ledger_version,
     LaboratoryLedgerVersionNotFoundError,
 )
+from app.services.ecg_context_service import (
+    EcgConsiliumContext,
+    assemble_consilium_ecg_context,
+)
 
 __all__ = [
     "create_sqlite_backup",
@@ -74,6 +78,8 @@ __all__ = [
     "assemble_consilium_laboratory_context",
     "get_last_evaluated_ledger_version",
     "LaboratoryLedgerVersionNotFoundError",
+    "EcgConsiliumContext",
+    "assemble_consilium_ecg_context",
     "ConsiliumError",
     "ConsiliumCycleNotFoundError",
     "ConsiliumContextMissingError",

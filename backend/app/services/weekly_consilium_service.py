@@ -544,15 +544,10 @@ class WeeklyConsiliumService:
         pulse = next((m.pulse for m in reversed(measurements) if m.pulse is not None), None)
         spo2 = next((m.spo2 for m in reversed(measurements) if m.spo2 is not None), None)
 
-        ecg_reports = self.report_repo.list_server_only(
-            cycle_id=cycle_id,
-            report_type=PREPARATORY_ECG_REPORT_TYPE,
-        )
-        ecg_summary = (
-            str(ecg_reports[0].content.get("ecg_summary", "Not performed"))
-            if ecg_reports
-            else "Not performed"
-        )
+        from app.services.ecg_context_service import assemble_consilium_ecg_context
+
+        ecg_ctx = assemble_consilium_ecg_context(self.db, cycle_id)
+        ecg_summary = ecg_ctx.ecg_summary
 
         anamnesis_reports = self.report_repo.list_server_only(
             cycle_id=cycle_id,
@@ -677,6 +672,7 @@ class WeeklyConsiliumService:
                     "unreviewed_pending_labs": unreviewed_pending_labs,
                     "pending_removed_marker_keys": pending_removed_marker_keys,
                     "laboratory_history": laboratory_history,
+                    "ecg_context": ecg_ctx.to_dict(),
                 },
                 ensure_ascii=False,
             ),
@@ -798,7 +794,8 @@ class WeeklyConsiliumService:
         # 3. STAGE 2: Execute Weekly Chief Physician (Gemini Pro)
         previous_strategy_context = (
             f"Current Active Strategy:\n{prev_ctx['latest_pro_strategy']}\n\n"
-            f"Clinical Background:\n{prev_ctx['latest_pro_training']}"
+            f"Clinical Background:\n{prev_ctx['latest_pro_training']}\n\n"
+            f"Baseline & Current Input Context:\n{prev_ctx['initial_context']}"
         )
         draft_weekly_reports_dict = flash_output.user_system_reports.to_dict()
         pro_prompt = build_weekly_pro_prompt(

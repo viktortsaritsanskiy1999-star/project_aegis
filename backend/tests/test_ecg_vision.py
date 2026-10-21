@@ -939,3 +939,637 @@ async def test_new_ecg_leaves_published_pro_consilium_reports_untouched(client: 
     assert len(ecg_versions) == 2
     assert ecg_versions[0].version == 2
     assert ecg_versions[1].version == 1
+
+
+# ==============================================================================
+# C-10: SINGLE-LEAD SAFETY & UNUSUAL HR / INTERVALS VALIDATION
+# ==============================================================================
+
+@pytest.mark.parametrize(
+    "rec_type, lead_name",
+    [
+        ("single_lead_smartwatch", "Lead I (Samsung Galaxy Watch)"),
+        ("unknown", "Lead I"),
+        ("unknown", "Lead 1"),
+        ("unknown", "Lead II"),
+        ("unknown", "Lead 2"),
+        ("single_lead", "Lead I"),
+    ],
+)
+def test_c10_single_lead_classification_variations(
+    client: TestClient,
+    db_session: Session,
+    auth_headers: dict[str, str],
+    rec_type: str,
+    lead_name: str,
+):
+    cycle_id = f"test-cycle-c10-single-{abs(hash(rec_type + lead_name)) % 100000}"
+    MedicalCycleRepository(db_session).create(cycle_id=cycle_id, status="active")
+
+    recorded_calls: List[Dict[str, Any]] = []
+    sample_output = {
+        "recording_type": rec_type,
+        "recording_quality": "good",
+        "lead_name": lead_name,
+        "heart_rate_bpm": 74,
+        "rhythm_type": "sinus",
+        "rhythm_regularity": "regular",
+        "pr_interval_ms": 160.0,
+        "qrs_duration_ms": 88.0,
+        "qt_interval_ms": 380.0,
+        "qtc_interval_ms": 415.0,
+        "electrical_axis": "normal (~60 deg)",  # Must be stripped to None!
+        "st_segment_findings": "isoelectric",
+        "t_wave_findings": "normal",
+        "limitations": [],
+        "uncertainties": [],
+        "ecg_summary": "Single-lead rhythm tracing.",
+        "potential_urgent_warning": None,
+    }
+    mock_gateway = _build_ecg_mock_gateway(recorded_calls, ecg_override=sample_output)
+    app.dependency_overrides[get_gemini_gateway] = lambda: mock_gateway
+
+    jpeg_data = _create_dummy_jpeg_bytes(512)
+    files = {"file": ("ecg.jpg", io.BytesIO(jpeg_data), "image/jpeg")}
+    resp = client.post(
+        "/api/v1/cascade/intake/ecg-image",
+        data={"cycle_id": cycle_id},
+        files=files,
+        headers=auth_headers,
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["status"] == "processed"
+    assert body["recording_type"] != "standard_12_lead"  # Cannot masquerade as 12-lead!
+
+    reports = ModelReportRepository(db_session).list_server_only(cycle_id, PREPARATORY_ECG_REPORT_TYPE)
+    assert len(reports) == 1
+    content = reports[0].content
+    assert content["electrical_axis"] is None
+    assert any("axis" in lim.lower() for lim in content["limitations"])
+    assert any("single-lead" in lim.lower() or "cannot replace" in lim.lower() for lim in content["limitations"])
+
+
+def test_c10_unknown_recording_type_preserves_uncertainty(
+    client: TestClient,
+    db_session: Session,
+    auth_headers: dict[str, str],
+):
+    cycle_id = "test-cycle-c10-unknown-setup"
+    MedicalCycleRepository(db_session).create(cycle_id=cycle_id, status="active")
+
+    recorded_calls: List[Dict[str, Any]] = []
+    sample_output = {
+        "recording_type": "unknown",
+        "recording_quality": "moderate",
+        "lead_name": "unknown",
+        "heart_rate_bpm": 70,
+        "rhythm_type": "sinus",
+        "rhythm_regularity": "regular",
+        "pr_interval_ms": 150.0,
+        "qrs_duration_ms": 90.0,
+        "qt_interval_ms": 390.0,
+        "qtc_interval_ms": 420.0,
+        "electrical_axis": "left axis deviation",
+        "st_segment_findings": "indeterminate",
+        "t_wave_findings": "flat",
+        "limitations": [],
+        "uncertainties": [],
+        "ecg_summary": "Unspecified lead ECG tracing.",
+        "potential_urgent_warning": None,
+    }
+    mock_gateway = _build_ecg_mock_gateway(recorded_calls, ecg_override=sample_output)
+    app.dependency_overrides[get_gemini_gateway] = lambda: mock_gateway
+
+    jpeg_data = _create_dummy_jpeg_bytes(512)
+    files = {"file": ("ecg.jpg", io.BytesIO(jpeg_data), "image/jpeg")}
+    resp = client.post(
+        "/api/v1/cascade/intake/ecg-image",
+        data={"cycle_id": cycle_id},
+        files=files,
+        headers=auth_headers,
+    )
+    assert resp.status_code == 200, resp.text
+    reports = ModelReportRepository(db_session).list_server_only(cycle_id, PREPARATORY_ECG_REPORT_TYPE)
+    content = reports[0].content
+    assert content["electrical_axis"] is None
+    assert any("undetermined" in u.lower() for u in content["uncertainties"])
+
+
+def test_c10_genuine_12_lead_preserves_axis_and_features(
+    client: TestClient,
+    db_session: Session,
+    auth_headers: dict[str, str],
+):
+    cycle_id = "test-cycle-c10-genuine-12lead"
+    MedicalCycleRepository(db_session).create(cycle_id=cycle_id, status="active")
+
+    recorded_calls: List[Dict[str, Any]] = []
+    sample_output = {
+        "recording_type": "standard_12_lead",
+        "recording_quality": "good",
+        "lead_name": "12-lead (I, II, III, aVR, aVL, aVF, V1-V6)",
+        "heart_rate_bpm": 65,
+        "rhythm_type": "sinus",
+        "rhythm_regularity": "regular",
+        "pr_interval_ms": 160.0,
+        "qrs_duration_ms": 85.0,
+        "qt_interval_ms": 390.0,
+        "qtc_interval_ms": 405.0,
+        "electrical_axis": "normal (~45 degrees)",
+        "st_segment_findings": "isoelectric",
+        "t_wave_findings": "upright",
+        "limitations": [],
+        "uncertainties": [],
+        "ecg_summary": "Full diagnostic 12-lead electrocardiogram.",
+        "potential_urgent_warning": None,
+    }
+    mock_gateway = _build_ecg_mock_gateway(recorded_calls, ecg_override=sample_output)
+    app.dependency_overrides[get_gemini_gateway] = lambda: mock_gateway
+
+    png_data = _create_dummy_png_bytes(512)
+    files = {"file": ("ecg.png", io.BytesIO(png_data), "image/png")}
+    resp = client.post(
+        "/api/v1/cascade/intake/ecg-image",
+        data={"cycle_id": cycle_id},
+        files=files,
+        headers=auth_headers,
+    )
+    assert resp.status_code == 200, resp.text
+    reports = ModelReportRepository(db_session).list_server_only(cycle_id, PREPARATORY_ECG_REPORT_TYPE)
+    content = reports[0].content
+    assert content["electrical_axis"] == "normal (~45 degrees)"
+    assert not any("single-lead" in lim.lower() for lim in content["limitations"])
+
+
+@pytest.mark.parametrize(
+    "raw_hr, expected_hr, expected_raw, model_warning, expect_warning",
+    [
+        (0, None, 0, None, False),       # Extreme HR does NOT synthesize warning without Vision model flag
+        (15, None, 15, None, False),     # Extreme bradycardia does NOT synthesize warning without Vision model flag
+        (320, None, 320, None, False),   # Extreme tachycardia does NOT synthesize warning without Vision model flag
+        ("72 bpm", 72, None, None, False),
+        ("N/A", None, "N/A", None, False),
+        (None, None, None, None, False),
+        (15, None, 15, "Critical vital observation: severe bradycardia", True), # Model warning is preserved
+    ],
+)
+def test_c10_heart_rate_unusual_values_handling(
+    client: TestClient,
+    db_session: Session,
+    auth_headers: dict[str, str],
+    raw_hr: Any,
+    expected_hr: Optional[int],
+    expected_raw: Any,
+    model_warning: Optional[str],
+    expect_warning: bool,
+):
+    cycle_id = f"test-cycle-c10-hr-{abs(hash(str(raw_hr))) % 100000}"
+    MedicalCycleRepository(db_session).create(cycle_id=cycle_id, status="active")
+
+    recorded_calls: List[Dict[str, Any]] = []
+    sample_output = {
+        "recording_type": "standard_12_lead",
+        "recording_quality": "good",
+        "lead_name": "12-lead (I, II, III, aVR, aVL, aVF, V1-V6)",
+        "heart_rate_bpm": raw_hr,
+        "rhythm_type": "sinus",
+        "rhythm_regularity": "regular",
+        "pr_interval_ms": 160.0,
+        "qrs_duration_ms": 85.0,
+        "qt_interval_ms": 390.0,
+        "qtc_interval_ms": 405.0,
+        "electrical_axis": "normal",
+        "st_segment_findings": "isoelectric",
+        "t_wave_findings": "upright",
+        "limitations": [],
+        "uncertainties": [],
+        "ecg_summary": f"ECG study with test HR={raw_hr}.",
+        "potential_urgent_warning": model_warning,
+    }
+    mock_gateway = _build_ecg_mock_gateway(recorded_calls, ecg_override=sample_output)
+    app.dependency_overrides[get_gemini_gateway] = lambda: mock_gateway
+
+    jpeg_data = _create_dummy_jpeg_bytes(512)
+    files = {"file": ("ecg.jpg", io.BytesIO(jpeg_data), "image/jpeg")}
+    resp = client.post(
+        "/api/v1/cascade/intake/ecg-image",
+        data={"cycle_id": cycle_id},
+        files=files,
+        headers=auth_headers,
+    )
+    assert resp.status_code == 200, resp.text
+    reports = ModelReportRepository(db_session).list_server_only(cycle_id, PREPARATORY_ECG_REPORT_TYPE)
+    assert len(reports) == 1
+    content = reports[0].content
+
+    # Key C-10 assertion: all OTHER fields are preserved intact!
+    assert content["rhythm_type"] == "sinus"
+    assert content["st_segment_findings"] == "isoelectric"
+    assert content["t_wave_findings"] == "upright"
+    assert content["heart_rate_bpm"] == expected_hr
+
+    raw_unresolved = content.get("raw_unresolved_metrics", {})
+    if expected_raw is not None:
+        assert "heart_rate_bpm" in raw_unresolved
+        assert raw_unresolved["heart_rate_bpm"]["raw_value"] == expected_raw
+        assert "reason" in raw_unresolved["heart_rate_bpm"]
+        assert any("heart_rate_bpm" in u.lower() or "heart rate" in u.lower() for u in content["uncertainties"])
+    else:
+        assert "heart_rate_bpm" not in raw_unresolved
+
+    if expect_warning:
+        assert content["potential_urgent_warning"] == model_warning
+    else:
+        assert content["potential_urgent_warning"] is None
+
+
+def test_c10_intervals_out_of_range_handling(
+    client: TestClient,
+    db_session: Session,
+    auth_headers: dict[str, str],
+):
+    cycle_id = "test-cycle-c10-intervals-out"
+    MedicalCycleRepository(db_session).create(cycle_id=cycle_id, status="active")
+
+    recorded_calls: List[Dict[str, Any]] = []
+    # PR too short (15 ms < 40), QRS too wide (450 ms > 400), QTc extremely prolonged (850 ms > 800)
+    sample_output = {
+        "recording_type": "standard_12_lead",
+        "recording_quality": "good",
+        "lead_name": "12-lead (I, II, III, aVR, aVL, aVF, V1-V6)",
+        "heart_rate_bpm": 60,
+        "rhythm_type": "sinus",
+        "rhythm_regularity": "regular",
+        "pr_interval_ms": 15.0,     # < 40.0 ms
+        "qrs_duration_ms": 450.0,   # > 400.0 ms
+        "qt_interval_ms": "390.0 ms", # String formatted with unit -> parsed to 390.0
+        "qtc_interval_ms": 850.0,   # > 800.0 ms (extreme, triggers warning)
+        "electrical_axis": "normal",
+        "st_segment_findings": "isoelectric",
+        "t_wave_findings": "upright",
+        "limitations": [],
+        "uncertainties": [],
+        "ecg_summary": "ECG tracing with out of range intervals.",
+        "potential_urgent_warning": None,
+    }
+    mock_gateway = _build_ecg_mock_gateway(recorded_calls, ecg_override=sample_output)
+    app.dependency_overrides[get_gemini_gateway] = lambda: mock_gateway
+
+    jpeg_data = _create_dummy_jpeg_bytes(512)
+    files = {"file": ("ecg.jpg", io.BytesIO(jpeg_data), "image/jpeg")}
+    resp = client.post(
+        "/api/v1/cascade/intake/ecg-image",
+        data={"cycle_id": cycle_id},
+        files=files,
+        headers=auth_headers,
+    )
+    assert resp.status_code == 200, resp.text
+    reports = ModelReportRepository(db_session).list_server_only(cycle_id, PREPARATORY_ECG_REPORT_TYPE)
+    content = reports[0].content
+    intervals = content["intervals"]
+
+    # PR and QRS out of bounds are set to None
+    assert intervals["pr_interval_ms"] is None
+    assert intervals["qrs_duration_ms"] is None
+    # QT with unit was safely parsed to float
+    assert intervals["qt_interval_ms"] == 390.0
+    # QTc out of bounds is set to None, but triggered urgency warning
+    assert intervals["qtc_interval_ms"] is None
+
+    raw_unresolved = content.get("raw_unresolved_metrics", {})
+    assert "pr_interval_ms" in raw_unresolved
+    assert raw_unresolved["pr_interval_ms"]["raw_value"] == 15.0
+    assert "qrs_duration_ms" in raw_unresolved
+    assert raw_unresolved["qrs_duration_ms"]["raw_value"] == 450.0
+    assert "qtc_interval_ms" in raw_unresolved
+    assert raw_unresolved["qtc_interval_ms"]["raw_value"] == 850.0
+
+    # Extreme QTc does NOT synthesize new warning when model gave None (Task 2: no hardcoded threshold warnings)
+    assert content["potential_urgent_warning"] is None
+
+
+def test_c10_absence_of_false_diagnostic_claims(
+    client: TestClient,
+    db_session: Session,
+    auth_headers: dict[str, str],
+):
+    cycle_id = "test-cycle-c10-no-false-diag"
+    MedicalCycleRepository(db_session).create(cycle_id=cycle_id, status="active")
+
+    recorded_calls: List[Dict[str, Any]] = []
+    sample_output = {
+        "recording_type": "single_lead_smartwatch",
+        "recording_quality": "good",
+        "lead_name": "Lead I",
+        "heart_rate_bpm": 15,
+        "rhythm_type": "unknown",
+        "rhythm_regularity": "irregular",
+        "pr_interval_ms": None,
+        "qrs_duration_ms": None,
+        "qt_interval_ms": None,
+        "qtc_interval_ms": None,
+        "electrical_axis": None,
+        "st_segment_findings": "undetermined",
+        "t_wave_findings": "undetermined",
+        "limitations": [],
+        "uncertainties": [],
+        "ecg_summary": "Bradycardia recorded on Lead I.",
+        "potential_urgent_warning": None,
+    }
+    mock_gateway = _build_ecg_mock_gateway(recorded_calls, ecg_override=sample_output)
+    app.dependency_overrides[get_gemini_gateway] = lambda: mock_gateway
+
+    jpeg_data = _create_dummy_jpeg_bytes(512)
+    files = {"file": ("ecg.jpg", io.BytesIO(jpeg_data), "image/jpeg")}
+    resp = client.post(
+        "/api/v1/cascade/intake/ecg-image",
+        data={"cycle_id": cycle_id},
+        files=files,
+        headers=auth_headers,
+    )
+    assert resp.status_code == 200, resp.text
+    reports = ModelReportRepository(db_session).list_server_only(cycle_id, PREPARATORY_ECG_REPORT_TYPE)
+    content = reports[0].content
+
+    # Verify no premature categorical clinical diagnosis in technical reasons
+    reason = content["raw_unresolved_metrics"]["heart_rate_bpm"]["reason"].lower()
+    for forbidden in ["asystole", "ventricular fibrillation", "myocardial infarction", "artifact"]:
+        assert forbidden not in reason, f"Forbidden diagnostic claim '{forbidden}' in technical reason: {reason}"
+
+
+def test_c10_genuine_12_lead_with_lead_i_preserves_axis(
+    client: TestClient,
+    db_session: Session,
+    auth_headers: dict[str, str],
+):
+    """
+    Rule 1: A genuine 12-lead study must NOT be turned into single-lead or flagged as conflict
+    simply because lead_name='Lead I' is specified (Lead I is a valid lead in a 12-lead study).
+    Electrical axis from the 12-lead study is preserved intact.
+    """
+    cycle_id = "test-cycle-c10-genuine-12lead-lead1"
+    MedicalCycleRepository(db_session).create(cycle_id=cycle_id, status="active")
+
+    recorded_calls: List[Dict[str, Any]] = []
+    sample_output = {
+        "recording_type": "standard_12_lead",
+        "recording_quality": "good",
+        "lead_name": "Lead I",
+        "heart_rate_bpm": 74,
+        "rhythm_type": "sinus",
+        "rhythm_regularity": "regular",
+        "pr_interval_ms": 160.0,
+        "qrs_duration_ms": 88.0,
+        "qt_interval_ms": 380.0,
+        "qtc_interval_ms": 415.0,
+        "electrical_axis": "normal (~45 deg)",
+        "st_segment_findings": "isoelectric",
+        "t_wave_findings": "normal",
+        "limitations": [],
+        "uncertainties": [],
+        "ecg_summary": "12-lead study with Lead I inspected.",
+        "potential_urgent_warning": None,
+    }
+    mock_gateway = _build_ecg_mock_gateway(recorded_calls, ecg_override=sample_output)
+    app.dependency_overrides[get_gemini_gateway] = lambda: mock_gateway
+
+    jpeg_data = _create_dummy_jpeg_bytes(512)
+    files = {"file": ("ecg.jpg", io.BytesIO(jpeg_data), "image/jpeg")}
+    resp = client.post(
+        "/api/v1/cascade/intake/ecg-image",
+        data={"cycle_id": cycle_id},
+        files=files,
+        headers=auth_headers,
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["status"] == "processed"
+    assert body["recording_type"] == "standard_12_lead"
+
+    reports = ModelReportRepository(db_session).list_server_only(cycle_id, PREPARATORY_ECG_REPORT_TYPE)
+    assert len(reports) == 1
+    content = reports[0].content
+    # Preserves 12-lead electrical axis!
+    assert content["electrical_axis"] == "normal (~45 deg)"
+    assert content["recording_type"] == "standard_12_lead"
+    # No spurious conflict or single-lead limitation added!
+    assert not any("conflict" in u.lower() or "contradict" in u.lower() for u in content["uncertainties"])
+    assert not any("single-lead" in lim.lower() for lim in content["limitations"])
+
+
+@pytest.mark.parametrize(
+    "rec_type, lead_name",
+    [
+        ("standard_12_lead", "Lead I (smartwatch)"),
+        ("standard_12_lead", "single-lead watch strip"),
+        ("standard_12_lead", "Lead I (1-lead channel)"),
+    ],
+)
+def test_c10_contradictory_lead_metadata_blocks_axis(
+    client: TestClient,
+    db_session: Session,
+    auth_headers: dict[str, str],
+    rec_type: str,
+    lead_name: str,
+):
+    """
+    Rule 3: Contradictory metadata (e.g. 12-lead claimed, but device/lead explicitly single-lead)
+    preserves metadata without silent mutation, sets electrical_axis to None, and records uncertainty.
+    """
+    cycle_id = f"test-cycle-c10-contradict-{abs(hash(rec_type + lead_name)) % 100000}"
+    MedicalCycleRepository(db_session).create(cycle_id=cycle_id, status="active")
+
+    recorded_calls: List[Dict[str, Any]] = []
+    sample_output = {
+        "recording_type": rec_type,
+        "recording_quality": "good",
+        "lead_name": lead_name,
+        "heart_rate_bpm": 74,
+        "rhythm_type": "sinus",
+        "rhythm_regularity": "regular",
+        "pr_interval_ms": 160.0,
+        "qrs_duration_ms": 88.0,
+        "qt_interval_ms": 380.0,
+        "qtc_interval_ms": 415.0,
+        "electrical_axis": "normal (~45 deg)",  # Must be stripped due to contradiction
+        "st_segment_findings": "isoelectric",
+        "t_wave_findings": "normal",
+        "limitations": [],
+        "uncertainties": [],
+        "ecg_summary": "Contradictory lead metadata study.",
+        "potential_urgent_warning": None,
+    }
+    mock_gateway = _build_ecg_mock_gateway(recorded_calls, ecg_override=sample_output)
+    app.dependency_overrides[get_gemini_gateway] = lambda: mock_gateway
+
+    jpeg_data = _create_dummy_jpeg_bytes(512)
+    files = {"file": ("ecg.jpg", io.BytesIO(jpeg_data), "image/jpeg")}
+    resp = client.post(
+        "/api/v1/cascade/intake/ecg-image",
+        data={"cycle_id": cycle_id},
+        files=files,
+        headers=auth_headers,
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["status"] == "processed"
+    # Metadata is preserved (not lost or mutated)
+    assert body["recording_type"] == "standard_12_lead"
+
+    reports = ModelReportRepository(db_session).list_server_only(cycle_id, PREPARATORY_ECG_REPORT_TYPE)
+    assert len(reports) == 1
+    content = reports[0].content
+    assert content["recording_type"] == "standard_12_lead"
+    assert content["electrical_axis"] is None
+    assert any("contradict" in u.lower() or "conflict" in u.lower() for u in content["uncertainties"])
+
+
+def test_c10_urgent_warning_preservation_and_no_synthetic_threshold_generation(
+    client: TestClient,
+    db_session: Session,
+    auth_headers: dict[str, str],
+):
+    """
+    Task 2:
+    - Preserves potential_urgent_warning when provided by Vision ECG.
+    - Does NOT synthesize new warnings from preliminary thresholds (35/180/550).
+    """
+    cycle_id = "test-cycle-c10-urgent-preserve"
+    MedicalCycleRepository(db_session).create(cycle_id=cycle_id, status="active")
+
+    recorded_calls: List[Dict[str, Any]] = []
+    model_urgent = "Critical observation from Vision ECG: acute ST elevation in anterior leads."
+    sample_output = {
+        "recording_type": "standard_12_lead",
+        "recording_quality": "good",
+        "lead_name": "12-lead (I, II, III, aVR, aVL, aVF, V1-V6)",
+        "heart_rate_bpm": 60,
+        "rhythm_type": "sinus",
+        "rhythm_regularity": "regular",
+        "pr_interval_ms": 160.0,
+        "qrs_duration_ms": 85.0,
+        "qt_interval_ms": 390.0,
+        "qtc_interval_ms": 405.0,
+        "electrical_axis": "normal",
+        "st_segment_findings": "marked ST elevation",
+        "t_wave_findings": "hyperacute",
+        "limitations": [],
+        "uncertainties": [],
+        "ecg_summary": "Urgent finding study.",
+        "potential_urgent_warning": model_urgent,
+    }
+    mock_gateway = _build_ecg_mock_gateway(recorded_calls, ecg_override=sample_output)
+    app.dependency_overrides[get_gemini_gateway] = lambda: mock_gateway
+
+    jpeg_data = _create_dummy_jpeg_bytes(512)
+    files = {"file": ("ecg.jpg", io.BytesIO(jpeg_data), "image/jpeg")}
+    resp = client.post(
+        "/api/v1/cascade/intake/ecg-image",
+        data={"cycle_id": cycle_id},
+        files=files,
+        headers=auth_headers,
+    )
+    assert resp.status_code == 200, resp.text
+    reports = ModelReportRepository(db_session).list_server_only(cycle_id, PREPARATORY_ECG_REPORT_TYPE)
+    content = reports[0].content
+    assert content["potential_urgent_warning"] == model_urgent
+
+
+def test_c10_numeric_parsing_mismatched_units_and_conversions(
+    client: TestClient,
+    db_session: Session,
+    auth_headers: dict[str, str],
+):
+    cycle_id = "test-cycle-c10-mismatched-units"
+    MedicalCycleRepository(db_session).create(cycle_id=cycle_id, status="active")
+
+    recorded_calls: List[Dict[str, Any]] = []
+    sample_output = {
+        "recording_type": "standard_12_lead",
+        "recording_quality": "good",
+        "lead_name": "12-lead (I, II, III, aVR, aVL, aVF, V1-V6)",
+        "heart_rate_bpm": "72 ms",    # Mismatched unit (time instead of rate) -> must be rejected
+        "rhythm_type": "sinus",
+        "rhythm_regularity": "regular",
+        "pr_interval_ms": "160 bpm",  # Mismatched unit (rate instead of time) -> must be rejected
+        "qrs_duration_ms": 85.0,
+        "qt_interval_ms": "0.39 s",   # Seconds unit -> must be converted to 390.0 ms
+        "qtc_interval_ms": 410.0,
+        "electrical_axis": "normal",
+        "st_segment_findings": "isoelectric",
+        "t_wave_findings": "upright",
+        "limitations": [],
+        "uncertainties": [],
+        "ecg_summary": "ECG tracing with unit mismatch and seconds conversion.",
+        "potential_urgent_warning": None,
+    }
+    mock_gateway = _build_ecg_mock_gateway(recorded_calls, ecg_override=sample_output)
+    app.dependency_overrides[get_gemini_gateway] = lambda: mock_gateway
+
+    jpeg_data = _create_dummy_jpeg_bytes(512)
+    files = {"file": ("ecg.jpg", io.BytesIO(jpeg_data), "image/jpeg")}
+    resp = client.post(
+        "/api/v1/cascade/intake/ecg-image",
+        data={"cycle_id": cycle_id},
+        files=files,
+        headers=auth_headers,
+    )
+    assert resp.status_code == 200, resp.text
+    reports = ModelReportRepository(db_session).list_server_only(cycle_id, PREPARATORY_ECG_REPORT_TYPE)
+    content = reports[0].content
+
+    # Mismatched units rejected to None
+    assert content["heart_rate_bpm"] is None
+    assert content["intervals"]["pr_interval_ms"] is None
+
+    # Explicit seconds converted to ms
+    assert content["intervals"]["qt_interval_ms"] == 390.0
+
+    raw = content["raw_unresolved_metrics"]
+    assert "heart_rate_bpm" in raw
+    assert "mismatched" in raw["heart_rate_bpm"]["reason"].lower()
+
+    assert "pr_interval_ms" in raw
+    assert "mismatched" in raw["pr_interval_ms"]["reason"].lower()
+
+    assert "qt_interval_ms" in raw
+    assert "converted from seconds" in raw["qt_interval_ms"]["conversion"].lower()
+
+
+def test_c10_fractional_heart_rate_and_revalidation_idempotency():
+    from app.schemas.consilium import VisionEcgModelOutput
+
+    data = {
+        "recording_type": "standard_12_lead",
+        "recording_quality": "good",
+        "lead_name": "12-lead (I, II, III, aVR, aVL, aVF, V1-V6)",
+        "heart_rate_bpm": "72.4 bpm",
+        "rhythm_type": "sinus",
+        "rhythm_regularity": "regular",
+        "pr_interval_ms": "0.16 sec",
+        "qrs_duration_ms": 86.0,
+        "qt_interval_ms": 380.0,
+        "qtc_interval_ms": 410.0,
+        "electrical_axis": "normal (~45 deg)",
+        "st_segment_findings": "isoelectric",
+        "t_wave_findings": "upright",
+        "limitations": [],
+        "uncertainties": [],
+        "ecg_summary": "Test fractional HR and idempotency.",
+    }
+
+    model = VisionEcgModelOutput.model_validate(data)
+    assert model.heart_rate_bpm == 72
+    assert model.pr_interval_ms == 160.0
+    assert "heart_rate_bpm" in model.raw_unresolved_metrics
+    assert "pr_interval_ms" in model.raw_unresolved_metrics
+    assert "fractional" in model.raw_unresolved_metrics["heart_rate_bpm"]["conversion"].lower()
+
+    dumped = model.model_dump()
+    revalidated = VisionEcgModelOutput.model_validate(dumped)
+    assert revalidated.model_dump() == dumped
+    assert revalidated.heart_rate_bpm == 72
+    assert revalidated.pr_interval_ms == 160.0
+    assert len(revalidated.uncertainties) == len(model.uncertainties)
+    assert len(revalidated.limitations) == len(model.limitations)

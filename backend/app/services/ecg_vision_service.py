@@ -212,6 +212,7 @@ class EcgVisionService:
                 "limitations": parsed_output.limitations,
                 "uncertainties": parsed_output.uncertainties,
                 "potential_urgent_warning": parsed_output.potential_urgent_warning,
+                "raw_unresolved_metrics": parsed_output.raw_unresolved_metrics,
                 "record_date": resolved_record_date,
                 "image_hash": image_hash,
                 "ingested_at": now_iso,
