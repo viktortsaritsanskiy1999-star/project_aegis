@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'package:flutter/foundation.dart';
 import 'vault_service.dart';
+import 'sync/vitals_sync_queue.dart';
 import 'vitals_monitor_service.dart';
 
 /// Explicit sources for all incoming biometric health data
@@ -127,6 +128,8 @@ class HealthMeasurement {
 class HealthDataProvider extends ChangeNotifier {
   VaultService _vaultService;
   VitalsMonitorService _vitalsMonitorService;
+  /// Optional outbound persistent synchronization queue
+  VitalsSyncQueue? syncQueue;
 
   final StreamController<HealthMeasurement> _vitalsStreamController =
       StreamController<HealthMeasurement>.broadcast();
@@ -134,6 +137,30 @@ class HealthDataProvider extends ChangeNotifier {
 
   HealthMeasurement? _latestMeasurement;
   HealthMeasurement? get latestMeasurement => _latestMeasurement;
+
+  Object? _lastEnqueueError;
+  DateTime? _lastEnqueueErrorAt;
+
+  /// Whether the most recent outbound sync queue enqueue attempt failed
+  bool get hasEnqueueError => _lastEnqueueError != null;
+
+  /// The most recent error encountered when attempting to enqueue into syncQueue
+  Object? get lastEnqueueError => _lastEnqueueError;
+
+  /// Formatted message of the most recent enqueue error
+  String? get lastEnqueueErrorMessage => _lastEnqueueError?.toString();
+
+  /// Timestamp when the most recent enqueue error occurred
+  DateTime? get lastEnqueueErrorAt => _lastEnqueueErrorAt;
+
+  /// Clears any recorded enqueue error state
+  void clearEnqueueError() {
+    if (_lastEnqueueError != null || _lastEnqueueErrorAt != null) {
+      _lastEnqueueError = null;
+      _lastEnqueueErrorAt = null;
+      notifyListeners();
+    }
+  }
 
   /// Asynchronous broadcast stream for future smartwatch sensors and UI listeners
   Stream<HealthMeasurement> get vitalsStream => _vitalsStreamController.stream;
@@ -144,6 +171,7 @@ class HealthDataProvider extends ChangeNotifier {
   HealthDataProvider({
     required VaultService vaultService,
     required VitalsMonitorService vitalsMonitorService,
+    this.syncQueue,
   })  : _vaultService = vaultService,
         _vitalsMonitorService = vitalsMonitorService;
 
@@ -151,17 +179,20 @@ class HealthDataProvider extends ChangeNotifier {
   void updateDependencies({
     required VaultService vaultService,
     required VitalsMonitorService vitalsMonitorService,
+    VitalsSyncQueue? syncQueue,
   }) {
     _vaultService = vaultService;
     _vitalsMonitorService = vitalsMonitorService;
+    if (syncQueue != null) {
+      this.syncQueue = syncQueue;
+    }
   }
 
   /// Core ingestion pipeline for incoming biometric measurements
-  Future<void> ingestMeasurement(HealthMeasurement measurement) async {
+  Future<bool> ingestMeasurement(HealthMeasurement measurement) async {
     // If tagged as historical data, route directly to historical ingestion
     if (measurement.isHistorical) {
-      await ingestHistoricalMeasurement(measurement);
-      return;
+      return await ingestHistoricalMeasurement(measurement);
     }
 
     _latestMeasurement = measurement;
@@ -210,12 +241,28 @@ class HealthDataProvider extends ChangeNotifier {
       );
     }
 
+    // 4. Enqueue into persistent outbound sync queue if bound
+    bool enqueueSuccess = true;
+    if (syncQueue != null) {
+      try {
+        await syncQueue!.enqueue(measurement);
+        _lastEnqueueError = null;
+        _lastEnqueueErrorAt = null;
+      } catch (e) {
+        enqueueSuccess = false;
+        _lastEnqueueError = e;
+        _lastEnqueueErrorAt = DateTime.now();
+        debugPrint('⚠️ [HealthDataProvider]: Outbound vitals enqueue failed: $e');
+      }
+    }
+
     notifyListeners();
+    return enqueueSuccess;
   }
 
   /// Ingest an individual historical measurement directly into SmartWatch Vault
   /// Preserves measurement timestamp without launching current tachycardia alarms or workouts
-  Future<void> ingestHistoricalMeasurement(HealthMeasurement measurement) async {
+  Future<bool> ingestHistoricalMeasurement(HealthMeasurement measurement) async {
     // 1. Broadcast to any subscribers interested in historical stream
     if (!_vitalsStreamController.isClosed) {
       _vitalsStreamController.add(measurement);
@@ -234,7 +281,23 @@ class HealthDataProvider extends ChangeNotifier {
       );
     }
 
+    // 3. Enqueue into persistent outbound sync queue if bound
+    bool enqueueSuccess = true;
+    if (syncQueue != null) {
+      try {
+        await syncQueue!.enqueue(measurement);
+        _lastEnqueueError = null;
+        _lastEnqueueErrorAt = null;
+      } catch (e) {
+        enqueueSuccess = false;
+        _lastEnqueueError = e;
+        _lastEnqueueErrorAt = DateTime.now();
+        debugPrint('⚠️ [HealthDataProvider]: Outbound historical vitals enqueue failed: $e');
+      }
+    }
+
     notifyListeners();
+    return enqueueSuccess;
   }
 
   /// Ingest a batch of measurements asynchronously.
@@ -275,7 +338,7 @@ class HealthDataProvider extends ChangeNotifier {
 
   /// Convenience dispatch for manual user inputs (e.g. manual vitals dialogs, forms)
   /// Explicitly marks source as HealthDataSource.manualInput, never defaulting to watch_sensor!
-  Future<void> dispatchManualInput({
+  Future<bool> dispatchManualInput({
     int? pulse,
     int? systolic,
     int? diastolic,
@@ -296,11 +359,11 @@ class HealthDataProvider extends ChangeNotifier {
       isSimulated: isSimulated,
       note: note,
     );
-    await ingestMeasurement(measurement);
+    return await ingestMeasurement(measurement);
   }
 
   /// Convenience dispatch for quick test chips on UI
-  Future<void> dispatchTestChip({
+  Future<bool> dispatchTestChip({
     required int pulse,
     DateTime? timestamp,
     String note = '',
@@ -312,11 +375,11 @@ class HealthDataProvider extends ChangeNotifier {
       isSimulated: true,
       note: note,
     );
-    await ingestMeasurement(measurement);
+    return await ingestMeasurement(measurement);
   }
 
   /// Convenience dispatch for simulated / virtual time measurements
-  Future<void> dispatchSimulated({
+  Future<bool> dispatchSimulated({
     required int pulse,
     DateTime? timestamp,
     String note = '',
@@ -328,11 +391,11 @@ class HealthDataProvider extends ChangeNotifier {
       isSimulated: true,
       note: note,
     );
-    await ingestMeasurement(measurement);
+    return await ingestMeasurement(measurement);
   }
 
   /// Convenience dispatch for real smartwatch sensor readings
-  Future<void> dispatchWatchSensor({
+  Future<bool> dispatchWatchSensor({
     required int pulse,
     DateTime? timestamp,
     int? systolic,
@@ -354,7 +417,7 @@ class HealthDataProvider extends ChangeNotifier {
       note: note,
       metadata: metadata,
     );
-    await ingestMeasurement(measurement);
+    return await ingestMeasurement(measurement);
   }
 
   @override
