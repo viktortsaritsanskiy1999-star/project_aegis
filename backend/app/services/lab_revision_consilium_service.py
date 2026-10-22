@@ -38,6 +38,10 @@ from app.schemas.consilium import (
     LabRevisionCooldownStatus,
     LabRevisionConsiliumClientResponse,
     validate_lab_revision_unchanged_explanation,
+    normalize_lab_date,
+    is_dimensionless_marker,
+    are_lab_values_equivalent,
+    to_decimal,
 )
 from app.schemas.privacy import PrivacyLevel
 from app.schemas.reports import ClientModelReportResponse
@@ -234,7 +238,6 @@ class LabRevisionConsiliumService:
             if ocr_report.created_at.tzinfo is None
             else ocr_report.created_at.astimezone(timezone.utc).isoformat()
         )
-        sample_date_default = recorded_at[:10]
 
         observations_history: List[Dict[str, Any]] = []
         active_markers: Dict[str, Dict[str, Any]] = {}
@@ -246,7 +249,9 @@ class LabRevisionConsiliumService:
                 obs_id = f"obs_{marker_key}_v1_{idx}"
                 val = raw_entry.get("value", raw_entry.get("raw_value", ""))
                 explicit_unit = raw_entry.get("unit")
-                sample_date = raw_entry.get("sample_date") or sample_date_default
+                raw_s_date = raw_entry.get("sample_date")
+                norm_s_date, is_valid_date = normalize_lab_date(raw_s_date) if raw_s_date else (None, True)
+                sample_date = norm_s_date if is_valid_date else None
                 ref_raw = raw_entry.get("reference_range")
                 ref_obj = (
                     LabReferenceRange.model_validate(ref_raw)
@@ -263,6 +268,15 @@ class LabRevisionConsiliumService:
                 prior_active = active_markers.get(marker_key)
                 event_type = LabEventType.INITIAL if prior_active is None else LabEventType.NEW_STUDY
 
+                is_unc = bool(raw_entry.get("is_uncertain", False)) or (sample_date is None)
+                unc_note = raw_entry.get("uncertainty_note")
+                if sample_date is None and (not unc_note or "Missing specimen collection date" not in unc_note):
+                    unc_note = f"{unc_note}; Missing specimen collection date on laboratory report" if unc_note else "Missing specimen collection date on laboratory report"
+                if num_val is not None and not resolved_unit and not is_dimensionless_marker(marker_key):
+                    is_unc = True
+                    if not unc_note or "Missing unit of measurement" not in unc_note:
+                        unc_note = f"{unc_note}; Missing unit of measurement for numeric value on laboratory report" if unc_note else "Missing unit of measurement for numeric value on laboratory report"
+
                 entry = LabObservationEntry(
                     observation_id=obs_id,
                     marker_key=marker_key,
@@ -277,7 +291,11 @@ class LabRevisionConsiliumService:
                     correction_reason=None,
                     is_active=True,
                     is_critical_flag=self._detect_critical_deviation(num_val, ref_obj, crit_flag),
+                    is_uncertain=is_unc,
+                    uncertainty_note=unc_note,
+                    is_recognition_ambiguous=bool(raw_entry.get("is_recognition_ambiguous", False)),
                     recorded_at=recorded_at,
+                    study_id=raw_entry.get("study_id") or raw_entry.get("order_id"),
                 )
                 dumped = entry.model_dump()
                 observations_history.append(dumped)
@@ -291,7 +309,9 @@ class LabRevisionConsiliumService:
                 if isinstance(raw_entry, dict):
                     val = raw_entry.get("value", raw_entry.get("raw_value", ""))
                     explicit_unit = raw_entry.get("unit")
-                    sample_date = raw_entry.get("sample_date") or sample_date_default
+                    raw_s_date = raw_entry.get("sample_date")
+                    norm_s_date, is_valid_date = normalize_lab_date(raw_s_date) if raw_s_date else (None, True)
+                    sample_date = norm_s_date if is_valid_date else None
                     ref_raw = raw_entry.get("reference_range")
                     ref_obj = (
                         LabReferenceRange.model_validate(ref_raw)
@@ -300,12 +320,24 @@ class LabRevisionConsiliumService:
                     )
                     crit_flag = bool(raw_entry.get("is_critical_flag", False))
                     num_val, resolved_unit = self._parse_numeric_and_unit(val, explicit_unit)
+                    is_unc = bool(raw_entry.get("is_uncertain", False)) or (sample_date is None)
+                    unc_note = raw_entry.get("uncertainty_note")
+                    if sample_date is None and (not unc_note or "Missing specimen collection date" not in unc_note):
+                        unc_note = f"{unc_note}; Missing specimen collection date on laboratory report" if unc_note else "Missing specimen collection date on laboratory report"
+                    if num_val is not None and not resolved_unit and not is_dimensionless_marker(marker_key):
+                        is_unc = True
+                        if not unc_note or "Missing unit of measurement" not in unc_note:
+                            unc_note = f"{unc_note}; Missing unit of measurement for numeric value on laboratory report" if unc_note else "Missing unit of measurement for numeric value on laboratory report"
+                    is_rec_amb = bool(raw_entry.get("is_recognition_ambiguous", False))
                 else:
                     val = raw_entry
                     num_val, resolved_unit = self._parse_numeric_and_unit(val, None)
-                    sample_date = sample_date_default
+                    sample_date = None
                     ref_obj = None
                     crit_flag = False
+                    is_unc = True
+                    unc_note = "Missing specimen collection date on laboratory report"
+                    is_rec_amb = False
 
                 entry = LabObservationEntry(
                     observation_id=obs_id,
@@ -321,7 +353,11 @@ class LabRevisionConsiliumService:
                     correction_reason=None,
                     is_active=True,
                     is_critical_flag=self._detect_critical_deviation(num_val, ref_obj, crit_flag),
+                    is_uncertain=is_unc,
+                    uncertainty_note=unc_note,
+                    is_recognition_ambiguous=is_rec_amb,
                     recorded_at=recorded_at,
+                    study_id=raw_entry.get("study_id") or raw_entry.get("order_id") if isinstance(raw_entry, dict) else None,
                 )
                 dumped = entry.model_dump()
                 observations_history.append(dumped)
@@ -372,6 +408,9 @@ class LabRevisionConsiliumService:
                 "reference_range": obs.get("reference_range"),
                 "event_type": obs.get("event_type"),
                 "observation_id": obs.get("observation_id"),
+                "is_uncertain": bool(obs.get("is_uncertain", False)),
+                "uncertainty_note": obs.get("uncertainty_note"),
+                "is_recognition_ambiguous": bool(obs.get("is_recognition_ambiguous", False)),
             }
         return table
 
@@ -450,6 +489,134 @@ class LabRevisionConsiliumService:
             observations_history=observations_history,
         )
 
+    def is_reliable_study_duplicate(
+        self,
+        markers: List[Any],
+        sample_date: Optional[str],
+        study_id: Optional[str],
+        observations_history: List[Dict[str, Any] | LabObservationEntry],
+    ) -> bool:
+        """
+        Determines whether an incoming set of markers on sample_date (and optional study_id)
+        is an exact duplicate of ONE concrete previously registered study in the ledger history.
+
+        Whole-Study Identity Rules (C-7/C-8 V3):
+        1. Date identity: sample_date must be present and non-empty. Unknown date is never merged.
+        2. Single-marker ambiguous update: if len(markers) < 2 and not study_id, never merge automatically.
+        3. One-to-one study matching: Candidate historical studies are partitioned by:
+           - Explicit study_id: ("study_id", sample_date, study_id)
+           - Ingestion transaction: ("recorded_at", sample_date, root_recorded_at)
+           Matches are NEVER assembled by cherry-picking individual observations across different studies.
+        4. Composition match: The set of normalized marker keys in the incoming study must match
+           the candidate historical study's marker key set EXACTLY (in_keys == h_keys).
+        5. Value equivalence: All marker values and units must match using exact Decimal comparison
+           (are_lab_values_equivalent).
+        """
+        if not markers:
+            return False
+        if not sample_date or not sample_date.strip():
+            return False
+
+        norm_s_date, is_valid_date = normalize_lab_date(sample_date)
+        if not is_valid_date or not norm_s_date:
+            return False
+
+        # Single marker without explicit study_id / order_id cannot be safely deduplicated
+        clean_sid = str(study_id).strip() if (study_id and str(study_id).strip()) else None
+        if len(markers) < 2 and not clean_sid:
+            return False
+
+        # Build lookup of history entries by observation_id to trace root recorded_at for corrections
+        history_by_id: Dict[str, Dict[str, Any]] = {}
+        for h in observations_history:
+            h_dict = h.model_dump() if hasattr(h, "model_dump") else h
+            obs_id = h_dict.get("observation_id")
+            if obs_id:
+                history_by_id[obs_id] = h_dict
+
+        def _get_root_recorded_at(obs: Dict[str, Any]) -> str:
+            curr = obs
+            visited = set()
+            while curr.get("supersedes_observation_id") and curr.get("supersedes_observation_id") in history_by_id:
+                prev_id = curr["supersedes_observation_id"]
+                if prev_id in visited:
+                    break
+                visited.add(prev_id)
+                curr = history_by_id[prev_id]
+            return curr.get("recorded_at") or obs.get("recorded_at") or ""
+
+        # Group currently ACTIVE historical observations by their concrete registered study
+        hist_studies: Dict[Tuple[str, str, str], Dict[str, Dict[str, Any]]] = {}
+        for h in observations_history:
+            h_dict = h.model_dump() if hasattr(h, "model_dump") else h
+            if not h_dict.get("is_active", True):
+                continue
+
+            h_date = h_dict.get("sample_date")
+            if h_date != norm_s_date:
+                continue
+
+            h_sid_raw = h_dict.get("study_id")
+            h_sid = str(h_sid_raw).strip() if (h_sid_raw and str(h_sid_raw).strip()) else None
+            if h_sid:
+                study_key = ("study_id", norm_s_date, h_sid)
+            else:
+                root_rec = _get_root_recorded_at(h_dict)
+                study_key = ("recorded_at", norm_s_date, root_rec)
+
+            norm_k = self._normalize_marker_key(h_dict.get("marker_key", ""))
+            hist_studies.setdefault(study_key, {})[norm_k] = h_dict
+
+        # Collect incoming study normalized markers
+        in_markers_map: Dict[str, Tuple[Any, Optional[float], Optional[str]]] = {}
+        for m in markers:
+            m_k = getattr(m, "marker_key", "")
+            norm_k = self._normalize_marker_key(m_k)
+            val = getattr(m, "value", None)
+            if val is None:
+                val = getattr(m, "raw_value", "")
+            unit = getattr(m, "unit", None)
+            num_val = getattr(m, "numeric_value", None)
+            if num_val is None:
+                num_val, resolved_unit = self._parse_numeric_and_unit(val, unit)
+                if unit is None:
+                    unit = resolved_unit
+            in_markers_map[norm_k] = (val, num_val, unit)
+
+        in_keys = set(in_markers_map.keys())
+
+        # Check against each concrete registered historical study
+        for h_study_key, h_markers in hist_studies.items():
+            # 1. Study ID check
+            key_type, _, key_id = h_study_key
+            if clean_sid:
+                if key_type != "study_id" or key_id != clean_sid:
+                    continue
+            else:
+                if key_type == "study_id":
+                    continue
+
+            # 2. Composition check: sets of markers must match EXACTLY
+            h_keys = set(h_markers.keys())
+            if in_keys != h_keys:
+                continue
+
+            # 3. Values and units must match for all markers
+            all_match = True
+            for k, (in_val, in_num, in_unit) in in_markers_map.items():
+                h_obs = h_markers[k]
+                h_val = h_obs.get("value")
+                h_num = h_obs.get("numeric_value")
+                h_unit = h_obs.get("unit")
+                if not are_lab_values_equivalent(in_val, in_num, in_unit, h_val, h_num, h_unit):
+                    all_match = False
+                    break
+
+            if all_match:
+                return True
+
+        return False
+
     def upsert_laboratory_markers(
         self,
         cycle_id: str,
@@ -504,6 +671,22 @@ class LabRevisionConsiliumService:
                         k: obs.model_dump() for k, obs in current_state.active_markers.items()
                     }
 
+                    # Determine duplicate studies across validated_mutations as whole studies (Task 1):
+                    study_groups: Dict[Tuple[Optional[str], Optional[str]], List[LabMarkerMutationItem]] = {}
+                    for mut in validated_mutations:
+                        if mut.event_type not in (LabEventType.INVALIDATED, LabEventType.CORRECTION):
+                            study_groups.setdefault((mut.sample_date, mut.study_id), []).append(mut)
+
+                    duplicate_study_keys = set()
+                    for (s_date, study_id), group in study_groups.items():
+                        if self.is_reliable_study_duplicate(
+                            markers=group,
+                            sample_date=s_date,
+                            study_id=study_id,
+                            observations_history=history_list,
+                        ):
+                            duplicate_study_keys.add((s_date, study_id))
+
                     for idx, mut in enumerate(validated_mutations, start=1):
                         marker_key = self._normalize_marker_key(mut.marker_key)
                         prior_active = active_map.get(marker_key)
@@ -546,6 +729,9 @@ class LabRevisionConsiliumService:
                                 correction_reason=mut.correction_reason or "Marked as erroneous/invalidated",
                                 is_active=False,
                                 is_critical_flag=False,
+                                is_uncertain=prior_active.get("is_uncertain", False) if prior_active else mut.is_uncertain,
+                                uncertainty_note=prior_active.get("uncertainty_note") if prior_active else mut.uncertainty_note,
+                                is_recognition_ambiguous=prior_active.get("is_recognition_ambiguous", False) if prior_active else mut.is_recognition_ambiguous,
                                 recorded_at=now_iso,
                             )
                             history_list.append(inv_entry.model_dump())
@@ -572,15 +758,38 @@ class LabRevisionConsiliumService:
                                     f"Observation '{target_prev_id}' not found in history for marker '{marker_key}'."
                                 )
 
-                            fallback_unit = mut.unit if mut.unit is not None else superseded_obs.get("unit")
-                            num_val, resolved_unit = self._parse_numeric_and_unit(mut.value, fallback_unit)
-                            resolved_date = mut.sample_date or superseded_obs.get("sample_date") or now_iso[:10]
+                            # CORRECTION explicit unit semantics (Task 3):
+                            # 1. Field unit omitted in request -> preserve superseded observation's unit
+                            # 2. Field unit explicitly passed as null -> reset unit to None
+                            # 3. Field unit explicitly passed as string -> set specified unit
+                            if "unit" not in mut.model_fields_set:
+                                fallback_unit = superseded_obs.get("unit")
+                                num_val, resolved_unit = self._parse_numeric_and_unit(mut.value, fallback_unit)
+                            elif mut.unit is None:
+                                num_val, _ = self._parse_numeric_and_unit(mut.value, None)
+                                resolved_unit = None
+                            else:
+                                num_val, resolved_unit = self._parse_numeric_and_unit(mut.value, mut.unit)
+                            resolved_date = mut.sample_date or superseded_obs.get("sample_date")
                             resolved_ref = mut.reference_range or (
                                 LabReferenceRange.model_validate(superseded_obs["reference_range"])
                                 if superseded_obs.get("reference_range")
                                 else None
                             )
                             crit = self._detect_critical_deviation(num_val, resolved_ref, mut.is_critical_flag)
+
+                            is_unc = mut.is_uncertain or (resolved_date is None)
+                            unc_note = mut.uncertainty_note
+                            if resolved_date is None and (not unc_note or "Missing specimen collection date" not in unc_note):
+                                unc_note = f"{unc_note}; Missing specimen collection date on laboratory report" if unc_note else "Missing specimen collection date on laboratory report"
+                            if (
+                                num_val is not None
+                                and not resolved_unit
+                                and not is_dimensionless_marker(marker_key)
+                                and (not unc_note or "Missing unit of measurement" not in unc_note)
+                            ):
+                                is_unc = True
+                                unc_note = f"{unc_note}; Missing unit of measurement for numeric value on laboratory report" if unc_note else "Missing unit of measurement for numeric value on laboratory report"
 
                             corr_entry = LabObservationEntry(
                                 observation_id=obs_id,
@@ -596,7 +805,11 @@ class LabRevisionConsiliumService:
                                 correction_reason=mut.correction_reason or "Correction of prior input/OCR value",
                                 is_active=True,
                                 is_critical_flag=crit,
+                                is_uncertain=is_unc,
+                                uncertainty_note=unc_note,
+                                is_recognition_ambiguous=mut.is_recognition_ambiguous,
                                 recorded_at=now_iso,
+                                study_id=mut.study_id,
                             )
                             dumped_corr = corr_entry.model_dump()
                             history_list.append(dumped_corr)
@@ -604,24 +817,39 @@ class LabRevisionConsiliumService:
                             continue
 
                         # LabEventType.INITIAL or LabEventType.NEW_STUDY
-                        # Note: If a prior active study exists on an earlier date, it remains a valid historical
-                        # study (NOT marked as an error), while the new study becomes the current active marker.
+                        # Whole-study duplicate check (Task 1):
+                        # Deduplication operates on the whole study group, not marker-by-marker.
+                        if (mut.sample_date, mut.study_id) in duplicate_study_keys:
+                            continue
+
+                        # Strictly forbid inheriting units from prior_active for initial/new study (Task 2)
+                        num_val, resolved_unit = self._parse_numeric_and_unit(mut.value, mut.unit)
+                        resolved_date = mut.sample_date
+
                         effective_event = (
                             LabEventType.INITIAL if prior_active is None and mut.event_type == LabEventType.INITIAL else (
                                 LabEventType.NEW_STUDY if prior_active is not None else mut.event_type
                             )
                         )
-                        fallback_unit = mut.unit if mut.unit is not None else (
-                            prior_active.get("unit") if prior_active else None
-                        )
-                        num_val, resolved_unit = self._parse_numeric_and_unit(mut.value, fallback_unit)
-                        resolved_date = mut.sample_date or now_iso[:10]
                         resolved_ref = mut.reference_range or (
                             LabReferenceRange.model_validate(prior_active["reference_range"])
                             if prior_active and prior_active.get("reference_range")
                             else None
                         )
                         crit = self._detect_critical_deviation(num_val, resolved_ref, mut.is_critical_flag)
+
+                        is_unc = mut.is_uncertain or (resolved_date is None)
+                        unc_note = mut.uncertainty_note
+                        if resolved_date is None and (not unc_note or "Missing specimen collection date" not in unc_note):
+                            unc_note = f"{unc_note}; Missing specimen collection date on laboratory report" if unc_note else "Missing specimen collection date on laboratory report"
+                        if (
+                            num_val is not None
+                            and not resolved_unit
+                            and not is_dimensionless_marker(marker_key)
+                            and (not unc_note or "Missing unit of measurement" not in unc_note)
+                        ):
+                            is_unc = True
+                            unc_note = f"{unc_note}; Missing unit of measurement for numeric value on laboratory report" if unc_note else "Missing unit of measurement for numeric value on laboratory report"
 
                         new_entry = LabObservationEntry(
                             observation_id=obs_id,
@@ -637,11 +865,25 @@ class LabRevisionConsiliumService:
                             correction_reason=None,
                             is_active=True,
                             is_critical_flag=crit,
+                            is_uncertain=is_unc,
+                            uncertainty_note=unc_note,
+                            is_recognition_ambiguous=mut.is_recognition_ambiguous,
                             recorded_at=now_iso,
+                            study_id=mut.study_id,
                         )
                         dumped_new = new_entry.model_dump()
                         history_list.append(dumped_new)
-                        active_map[marker_key] = dumped_new
+                        if (
+                            prior_active is None
+                            or prior_active.get("sample_date") is None
+                            or resolved_date is None
+                            or str(resolved_date) >= str(prior_active.get("sample_date", ""))
+                        ):
+                            active_map[marker_key] = dumped_new
+
+                    # If all mutations were exact active duplicates and no changes were made:
+                    if len(history_list) == len(current_state.observations_history):
+                        return current_state
 
                     shared_labs_table = self._build_shared_labs_table_from_active(active_map)
                     self.report_repo.create_next_version(
@@ -871,7 +1113,7 @@ class LabRevisionConsiliumService:
             is_error_correction = (not same_observation) and (
                 curr_obs.event_type == LabEventType.CORRECTION or had_intermediate_correction
             )
-            is_new_study_event = (not same_observation) and (
+            is_new_study_event = (not same_observation) and (not is_error_correction) and (
                 date_changed or curr_obs.event_type == LabEventType.NEW_STUDY
             )
 
@@ -939,7 +1181,7 @@ class LabRevisionConsiliumService:
                     "Updated value recorded; evaluate in clinical context without assuming automatic improvement or deterioration."
                 )
 
-            if is_error_correction and not is_new_study_event:
+            if is_error_correction:
                 primary_change_type = "error_correction"
             elif unit_changed:
                 primary_change_type = "unit_changed"

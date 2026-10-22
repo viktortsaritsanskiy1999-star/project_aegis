@@ -1,3 +1,5 @@
+from datetime import date, datetime
+from decimal import Decimal, InvalidOperation
 import math
 import re
 from enum import Enum
@@ -722,6 +724,108 @@ class LabReferenceRange(BaseModel):
     text: Optional[str] = Field(default=None, max_length=128)
 
 
+def _parse_bool_strict(val: Any) -> bool:
+    """Safely coerces boolean inputs including string representations ('true', 'false', '0', '1')."""
+    if isinstance(val, bool):
+        return val
+    if isinstance(val, (int, float)):
+        return bool(val)
+    if isinstance(val, str):
+        cleaned = val.strip().lower()
+        if cleaned in ("true", "1", "yes", "t"):
+            return True
+        if cleaned in ("false", "0", "no", "f", ""):
+            return False
+    return bool(val)
+
+
+def normalize_lab_date(raw_val: Any) -> Tuple[Optional[str], bool]:
+    """
+    Normalizes laboratory date to canonical ISO format 'YYYY-MM-DD',
+    strictly verifying calendar correctness (leap years, month bounds 1..12, day bounds 1..31).
+    Accepts:
+    - ISO date: 'YYYY-MM-DD'
+    - ISO datetime: 'YYYY-MM-DDTHH:MM:SS...' or 'YYYY-MM-DD HH:MM:SS...'
+    - European/Russian: 'DD.MM.YYYY', 'DD/MM/YYYY', 'DD-MM-YYYY'
+    - Slash/Dot: 'YYYY/MM/DD', 'YYYY.MM.DD'
+    - datetime.date / datetime.datetime objects
+    Rejects:
+    - Invalid calendar dates (e.g. 2026-02-30, 2026-13-45) -> returns (None, False)
+    - Free text / unverified strings -> returns (None, False)
+    - Empty / None -> returns (None, True)
+    Returns: (normalized_date_str, is_valid)
+    """
+    if raw_val is None:
+        return (None, True)
+    if isinstance(raw_val, datetime):
+        return (raw_val.strftime("%Y-%m-%d"), True)
+    if isinstance(raw_val, date):
+        return (raw_val.strftime("%Y-%m-%d"), True)
+    if not isinstance(raw_val, str):
+        return (None, False)
+    val_str = raw_val.strip()
+    if not val_str:
+        return (None, True)
+
+    # 1. Strict ISO date: YYYY-MM-DD
+    m_iso = re.match(r"^(\d{4})-(\d{2})-(\d{2})$", val_str)
+    if m_iso:
+        y, m, d = int(m_iso.group(1)), int(m_iso.group(2)), int(m_iso.group(3))
+        try:
+            parsed_d = date(y, m, d)
+            if 1900 <= parsed_d.year <= 2100:
+                return (parsed_d.isoformat(), True)
+        except ValueError:
+            return (None, False)
+
+    # 2. Strict ISO datetime: YYYY-MM-DD[T ]HH:MM(:SS)?(Z|[+-]HH:MM)?$
+    m_dt = re.match(
+        r"^(\d{4})-(\d{2})-(\d{2})[T\s](\d{2}):(\d{2})(?::(\d{2})(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})?$",
+        val_str,
+    )
+    if m_dt:
+        y, m, d = int(m_dt.group(1)), int(m_dt.group(2)), int(m_dt.group(3))
+        hr, mn = int(m_dt.group(4)), int(m_dt.group(5))
+        sec = int(m_dt.group(6)) if m_dt.group(6) else 0
+        if 0 <= hr <= 23 and 0 <= mn <= 59 and 0 <= sec <= 59:
+            try:
+                parsed_d = date(y, m, d)
+                if 1900 <= parsed_d.year <= 2100:
+                    return (parsed_d.isoformat(), True)
+            except ValueError:
+                return (None, False)
+
+    # 3. European/Russian: DD.MM.YYYY or DD/MM/YYYY or DD-MM-YYYY
+    m_dmy = re.match(r"^(\d{2})[./-](\d{2})[./-](\d{4})$", val_str)
+    if m_dmy:
+        d, m, y = int(m_dmy.group(1)), int(m_dmy.group(2)), int(m_dmy.group(3))
+        try:
+            parsed_d = date(y, m, d)
+            if 1900 <= parsed_d.year <= 2100:
+                return (parsed_d.isoformat(), True)
+        except ValueError:
+            return (None, False)
+
+    # 4. Slash / Dot: YYYY/MM/DD or YYYY.MM.DD
+    m_ymd = re.match(r"^(\d{4})[./](\d{2})[./](\d{2})$", val_str)
+    if m_ymd:
+        y, m, d = int(m_ymd.group(1)), int(m_ymd.group(2)), int(m_ymd.group(3))
+        try:
+            parsed_d = date(y, m, d)
+            if 1900 <= parsed_d.year <= 2100:
+                return (parsed_d.isoformat(), True)
+        except ValueError:
+            return (None, False)
+
+    return (None, False)
+
+
+def normalize_marker_slug(raw_key: Any) -> str:
+    """Normalizes marker key to lowercase snake_case alphanumeric string."""
+    cleaned = re.sub(r"[^a-z0-9_]+", "_", str(raw_key or "").strip().lower()).strip("_")
+    return cleaned or "marker"
+
+
 class LabObservationEntry(BaseModel):
     """
     Immutable single observation record in the server-side laboratory ledger.
@@ -745,7 +849,29 @@ class LabObservationEntry(BaseModel):
     correction_reason: Optional[str] = Field(default=None, max_length=256)
     is_active: bool = Field(default=True)
     is_critical_flag: bool = Field(default=False)
+    is_uncertain: bool = Field(default=False)
+    uncertainty_note: Optional[str] = Field(default=None, max_length=256)
+    is_recognition_ambiguous: bool = Field(default=False)
     recorded_at: str = Field(..., min_length=1, max_length=64)
+    study_id: Optional[str] = Field(default=None, max_length=128)
+
+    @field_validator("marker_key", mode="before")
+    @classmethod
+    def parse_marker_key(cls, v: Any) -> str:
+        return normalize_marker_slug(v)
+
+    @field_validator("sample_date", mode="before")
+    @classmethod
+    def parse_sample_date(cls, v: Any) -> Optional[str]:
+        if v is None:
+            return None
+        norm_date, is_valid = normalize_lab_date(v)
+        return norm_date if is_valid else None
+
+    @field_validator("is_uncertain", "is_recognition_ambiguous", "is_critical_flag", "is_active", mode="before")
+    @classmethod
+    def parse_bool_fields(cls, v: Any) -> bool:
+        return _parse_bool_strict(v)
 
 
 class LabMarkerMutationItem(BaseModel):
@@ -766,6 +892,28 @@ class LabMarkerMutationItem(BaseModel):
     supersedes_observation_id: Optional[str] = Field(default=None, max_length=64)
     correction_reason: Optional[str] = Field(default=None, max_length=256)
     is_critical_flag: bool = Field(default=False)
+    is_uncertain: bool = Field(default=False)
+    uncertainty_note: Optional[str] = Field(default=None, max_length=256)
+    is_recognition_ambiguous: bool = Field(default=False)
+    study_id: Optional[str] = Field(default=None, max_length=128)
+
+    @field_validator("marker_key", mode="before")
+    @classmethod
+    def parse_marker_key(cls, v: Any) -> str:
+        return normalize_marker_slug(v)
+
+    @field_validator("sample_date", mode="before")
+    @classmethod
+    def parse_sample_date(cls, v: Any) -> Optional[str]:
+        if v is None:
+            return None
+        norm_date, is_valid = normalize_lab_date(v)
+        return norm_date if is_valid else None
+
+    @field_validator("is_uncertain", "is_recognition_ambiguous", "is_critical_flag", mode="before")
+    @classmethod
+    def parse_bool_fields(cls, v: Any) -> bool:
+        return _parse_bool_strict(v)
 
     @model_validator(mode="after")
     def validate_mutation_fields(self) -> "LabMarkerMutationItem":
@@ -975,6 +1123,104 @@ class LabRevisionConsiliumClientResponse(BaseModel):
     cooldown: LabRevisionCooldownStatus
 
 
+KNOWN_DIMENSIONLESS_MARKERS = {
+    "inr",
+    "ph",
+    "urine_ph",
+    "blood_ph",
+    "specific_gravity",
+    "urine_specific_gravity",
+    "ast_alt_ratio",
+    "de_ritis_ratio",
+    "bun_creatinine_ratio",
+    "albumin_globulin_ratio",
+    "atherogenic_index",
+    "neutrophil_lymphocyte_ratio",
+    "thrombocyte_large_cell_ratio",
+    "pt_ratio",
+    "homa_ir",
+    "caro_index",
+}
+
+
+def is_dimensionless_marker(marker_key: str) -> bool:
+    """Checks whether a clinical laboratory marker is inherently dimensionless."""
+    k = marker_key.strip().lower()
+    if k in KNOWN_DIMENSIONLESS_MARKERS:
+        return True
+    if k.endswith("_ratio") or k.endswith("_index"):
+        return True
+    return False
+
+
+def to_decimal(val: Any) -> Optional[Decimal]:
+    """
+    Safely converts a numeric value (int, float, or numeric string) to Decimal for exact comparison.
+    Returns None if the value cannot be parsed as a decimal number.
+    Handles comma decimal separators common in European/Russian laboratory reports.
+    """
+    if val is None or isinstance(val, bool):
+        return None
+    if isinstance(val, (int, float)):
+        return Decimal(str(val))
+    if isinstance(val, str):
+        cleaned = val.strip().replace(",", ".")
+        try:
+            return Decimal(cleaned)
+        except InvalidOperation:
+            return None
+    return None
+
+
+def are_lab_values_equivalent(
+    val1: Any,
+    num_val1: Optional[float],
+    unit1: Optional[str],
+    val2: Any,
+    num_val2: Optional[float],
+    unit2: Optional[str],
+) -> bool:
+    """
+    Evaluates whether two laboratory values are clinically and technically equivalent.
+    - Units must match (whitespace-stripped case-insensitive match).
+    - If units differ (e.g. mmol/L vs mg/dL, or one has unit and the other does not), returns False.
+    - If numeric, exact Decimal comparison: 5.20 == 5.2, but 5.20001 != 5.2.
+    - If non-numeric (qualitative/textual), case-insensitive stripped string match.
+    """
+    norm_u1 = unit1.strip().lower() if (unit1 and unit1.strip()) else None
+    norm_u2 = unit2.strip().lower() if (unit2 and unit2.strip()) else None
+    if norm_u1 != norm_u2:
+        return False
+
+    d1 = to_decimal(num_val1) if num_val1 is not None else to_decimal(val1)
+    d2 = to_decimal(num_val2) if num_val2 is not None else to_decimal(val2)
+    if d1 is not None and d2 is not None:
+        return d1 == d2
+
+    if (d1 is not None) != (d2 is not None):
+        return False
+
+    s1 = str(val1).strip().lower() if val1 is not None else ""
+    s2 = str(val2).strip().lower() if val2 is not None else ""
+    return s1 == s2
+
+
+QUALITATIVE_PATTERNS = {
+    "отрицательно", "положительно", "не обнаружено", "обнаружено",
+    "norm", "normal", "negative", "positive", "норма", "не выявлено", "выявлено",
+    "trace", "traces", "следы", "незначительно", "умеренно", "значительно",
+    "reactive", "non-reactive", "nonreactive", "indeterminate", "equivocal", "borderline",
+    "сомнительно", "слабоположительно", "резкоположительно",
+    "слабо", "резко", "weakly", "detected", "not", "non", "светло", "соломенно",
+    "+", "++", "+++", "++++", "1+", "2+", "3+", "4+",
+    "clear", "straw", "yellow", "cloudy", "turbid",
+    "прозрачная", "соломенно-желтый", "желтый", "мутная",
+}
+
+_TITRATION_RE = re.compile(r"^\s*1\s*:\s*\d+\s*$")
+_PLUS_SIGNS_RE = re.compile(r"^\s*(\+{1,4}|[1-4]\+)\s*$")
+
+
 class VisionOcrMarkerItem(BaseModel):
     """
     Single recognized laboratory marker from Vision OCR.
@@ -994,6 +1240,126 @@ class VisionOcrMarkerItem(BaseModel):
     uncertainty_note: Optional[str] = Field(default=None, max_length=256)
     is_critical_flag: bool = Field(default=False)
     requires_user_verification: bool = Field(default=False)
+    is_recognition_ambiguous: bool = Field(default=False)
+
+    @field_validator(
+        "is_uncertain",
+        "is_recognition_ambiguous",
+        "is_critical_flag",
+        "requires_user_verification",
+        mode="before",
+    )
+    @classmethod
+    def parse_bool_fields(cls, v: Any) -> bool:
+        return _parse_bool_strict(v)
+
+    @field_validator("marker_key", mode="before")
+    @classmethod
+    def parse_marker_key(cls, v: Any) -> str:
+        return normalize_marker_slug(v)
+
+    @field_validator("sample_date", mode="before")
+    @classmethod
+    def parse_sample_date(cls, v: Any) -> Optional[str]:
+        if v is None:
+            return None
+        norm_date, is_valid = normalize_lab_date(v)
+        return norm_date if is_valid else None
+
+    @model_validator(mode="before")
+    @classmethod
+    def capture_initial_recognition_ambiguity(cls, data: Any) -> Any:
+        if isinstance(data, dict):
+            raw_val = str(data.get("raw_value") or "").strip()
+            num_val = data.get("numeric_value")
+
+            # Try parsing numeric_value from raw_value if not explicitly provided (e.g. '5.5*')
+            if num_val is None and raw_val:
+                cleaned_num = raw_val.strip().replace(",", ".").rstrip("* \t")
+                try:
+                    num_val = float(cleaned_num)
+                    data["numeric_value"] = num_val
+                except ValueError:
+                    num_val = None
+
+            # Check for explicit ambiguous characters in raw_value (? or ~ or ≈)
+            # Note: single footnote '*' does NOT denote OCR digit ambiguity
+            has_ambiguous_chars = bool(re.search(r"[?~≈]", raw_val))
+
+            explicit_flag = None
+            if "is_recognition_ambiguous" in data and data["is_recognition_ambiguous"] is not None:
+                explicit_flag = _parse_bool_strict(data["is_recognition_ambiguous"])
+
+            if explicit_flag is True:
+                # 1. Explicit True always preserves blocking / ambiguity
+                data["is_recognition_ambiguous"] = True
+            elif has_ambiguous_chars:
+                # 2. Objective unreadability ('~2.?', '5.?', '??') cannot be cancelled by explicit False or OCR guess
+                data["is_recognition_ambiguous"] = True
+            elif explicit_flag is False:
+                # 3. Explicit False is respected when no ambiguous characters exist
+                data["is_recognition_ambiguous"] = False
+            elif num_val is not None:
+                # 4. Legible number: regardless of unit presence or is_uncertain, the number itself
+                # is NOT an OCR error (uncertainty may be due to missing unit, footnote, reference range, etc.)
+                data["is_recognition_ambiguous"] = False
+            else:
+                # 5. Non-numeric string: check if recognized qualitative pattern
+                cleaned_raw = raw_val.lower().rstrip("* \t")
+                tokens = cleaned_raw.replace("-", " ").split()
+                is_qual = (
+                    cleaned_raw in QUALITATIVE_PATTERNS
+                    or (bool(tokens) and all(t in QUALITATIVE_PATTERNS for t in tokens))
+                    or bool(_TITRATION_RE.match(cleaned_raw))
+                    or bool(_PLUS_SIGNS_RE.match(cleaned_raw))
+                )
+                if is_qual:
+                    # Recognized qualitative finding (negative, trace, equivocal): clinical, NOT OCR error
+                    data["is_recognition_ambiguous"] = False
+                else:
+                    # Non-numeric, unparseable, non-qualitative: truly ambiguous OCR recognition
+                    is_unc = _parse_bool_strict(data.get("is_uncertain", False))
+                    data["is_recognition_ambiguous"] = True if is_unc else False
+        elif hasattr(data, "is_uncertain"):
+            raw_val = str(getattr(data, "raw_value", "") or "").strip()
+            num_val = getattr(data, "numeric_value", None)
+            if num_val is None and raw_val:
+                cleaned_num = raw_val.strip().replace(",", ".").rstrip("* \t")
+                try:
+                    num_val = float(cleaned_num)
+                    setattr(data, "numeric_value", num_val)
+                except Exception:
+                    num_val = None
+
+            has_ambiguous_chars = bool(re.search(r"[?~≈]", raw_val))
+
+            explicit_flag = None
+            if hasattr(data, "is_recognition_ambiguous") and getattr(data, "is_recognition_ambiguous") is not None:
+                explicit_flag = _parse_bool_strict(getattr(data, "is_recognition_ambiguous"))
+
+            if explicit_flag is True:
+                setattr(data, "is_recognition_ambiguous", True)
+            elif has_ambiguous_chars:
+                setattr(data, "is_recognition_ambiguous", True)
+            elif explicit_flag is False:
+                setattr(data, "is_recognition_ambiguous", False)
+            elif num_val is not None:
+                setattr(data, "is_recognition_ambiguous", False)
+            else:
+                cleaned_raw = raw_val.lower().rstrip("* \t")
+                tokens = cleaned_raw.replace("-", " ").split()
+                is_qual = (
+                    cleaned_raw in QUALITATIVE_PATTERNS
+                    or (bool(tokens) and all(t in QUALITATIVE_PATTERNS for t in tokens))
+                    or bool(_TITRATION_RE.match(cleaned_raw))
+                    or bool(_PLUS_SIGNS_RE.match(cleaned_raw))
+                )
+                if is_qual:
+                    setattr(data, "is_recognition_ambiguous", False)
+                else:
+                    is_unc = _parse_bool_strict(getattr(data, "is_uncertain", False))
+                    setattr(data, "is_recognition_ambiguous", True if is_unc else False)
+        return data
 
     @field_validator("reference_range", mode="before")
     @classmethod
@@ -1027,8 +1393,9 @@ class VisionOcrMarkerItem(BaseModel):
             return float(v)
         if isinstance(v, str):
             cleaned = v.strip().replace(",", ".")
+            cleaned_num = cleaned.rstrip("* \t")
             try:
-                return float(cleaned)
+                return float(cleaned_num)
             except ValueError:
                 return None
         return None
@@ -1040,40 +1407,91 @@ class VisionOcrMarkerItem(BaseModel):
 
     def evaluate_verification_requirement(self) -> bool:
         """
-        Determines whether this marker requires manual user review before entering
-        authoritative medical consilium ledgers:
-        - is_uncertain is True (smudged, blurry, doubtful)
-        - numeric_value is None and raw_value is not an established qualitative marker
-        - quantitative number without an explicit unit of measurement
-        - missing specimen collection date
+        Determines verification status and clinical uncertainty for this recognized marker.
+        Under C-8 rules:
+        - Dimensionless indicators (INR, pH, specific gravity, ratios, indices) are accepted without unit.
+        - Numeric results with missing unit are preserved: numeric_value, unit=None, is_uncertain=True,
+          with explicit uncertainty note distinguishing missing unit from recognition blur (Rule 5).
+        - Qualitative and semi-quantitative values (Positive, Negative, Trace, +, ++, +++, ++++,
+          reactive, non-reactive, titers, etc.) are preserved in original raw form (Rule 3).
+        - Physical OCR ambiguity (smudge, blur, doubtful print) sets is_recognition_ambiguous=True
+          and requires_user_verification=True, isolating it from active ledger numbers into unconfirmed_markers.
+        - Recognition ambiguity and missing unit do not cancel each other out.
+        - Repeated validation of the same object preserves ambiguity without degradation.
         """
-        if self.is_uncertain:
+        # Objective unreadability in raw_value ([?~≈]) cannot be bypassed by explicit False or OCR guess
+        # Note: single footnote '*' does NOT denote OCR digit ambiguity
+        if bool(re.search(r"[?~≈]", str(self.raw_value or ""))):
+            self.is_recognition_ambiguous = True
+
+        # 1. Physical recognition ambiguity on document (Rule 5 & C-8 Review Fix 1)
+        if self.is_recognition_ambiguous:
+            self.is_uncertain = True
+            self.requires_user_verification = True
+            if not self.uncertainty_note:
+                self.uncertainty_note = "Recognition ambiguity: unclear print or damaged document"
+
+        # 2. Specimen collection date check
+        if not self.sample_date or not self.sample_date.strip():
+            self.requires_user_verification = True
+            date_note = "Missing specimen collection date on laboratory report"
+            if not self.uncertainty_note:
+                self.uncertainty_note = date_note
+            elif date_note not in self.uncertainty_note and "Missing specimen collection date" not in self.uncertainty_note:
+                self.uncertainty_note = f"{self.uncertainty_note}; {date_note}"
+        else:
+            if self.uncertainty_note and "Missing specimen collection date" in self.uncertainty_note:
+                parts = [p.strip() for p in self.uncertainty_note.split(";") if "Missing specimen collection date" not in p]
+                self.uncertainty_note = "; ".join(parts) if parts else None
+
+        # 3. Qualitative / semi-quantitative vs Numeric evaluation
+        if self.numeric_value is None:
+            if not self.is_recognition_ambiguous:
+                cleaned_raw = self.raw_value.strip().lower()
+                tokens = cleaned_raw.replace("-", " ").split()
+                is_recognized_qualitative = (
+                    cleaned_raw in QUALITATIVE_PATTERNS
+                    or (bool(tokens) and all(t in QUALITATIVE_PATTERNS for t in tokens))
+                    or bool(_TITRATION_RE.match(cleaned_raw))
+                    or bool(_PLUS_SIGNS_RE.match(cleaned_raw))
+                )
+                if not is_recognized_qualitative:
+                    self.requires_user_verification = True
+                    custom_note = f"Non-standard text value requiring verification: '{self.raw_value}'"
+                    if not self.uncertainty_note:
+                        self.uncertainty_note = custom_note
+                    elif custom_note not in self.uncertainty_note and "Non-standard text value" not in self.uncertainty_note:
+                        self.uncertainty_note = f"{self.uncertainty_note}; {custom_note}"
+                else:
+                    if any(w in cleaned_raw for w in ("сомнительно", "indeterminate", "equivocal", "borderline", "слабоположительно")):
+                        self.is_uncertain = True
+                        borderline_note = f"Borderline qualitative finding: '{self.raw_value}'"
+                        if not self.uncertainty_note:
+                            self.uncertainty_note = borderline_note
+                        elif borderline_note not in self.uncertainty_note and "Borderline qualitative" not in self.uncertainty_note:
+                            self.uncertainty_note = f"{self.uncertainty_note}; {borderline_note}"
+        else:
+            has_unit = bool(self.unit and self.unit.strip())
+            if not has_unit:
+                if is_dimensionless_marker(self.marker_key):
+                    # Dimensionless marker (INR, pH, specific gravity, etc.) - accepted without unit (Rule 1)
+                    pass
+                else:
+                    # Regular numeric marker with missing unit of measurement on report (Rule 2)
+                    self.is_uncertain = True
+                    unit_note = "Missing unit of measurement for numeric value on laboratory report"
+                    if not self.uncertainty_note:
+                        self.uncertainty_note = unit_note
+                    elif unit_note not in self.uncertainty_note and "Missing unit of measurement" not in self.uncertainty_note:
+                        self.uncertainty_note = f"{self.uncertainty_note}; {unit_note}"
+
+        # 4. Final verification requirement resolution
+        if self.is_recognition_ambiguous or (not self.sample_date or not self.sample_date.strip()):
             self.requires_user_verification = True
             return True
 
         if self.numeric_value is None:
-            cleaned_raw = self.raw_value.strip().lower()
-            valid_qualitative = {
-                "отрицательно", "положительно", "не обнаружено", "обнаружено",
-                "norm", "normal", "negative", "positive", "норма", "не выявлено", "выявлено",
-            }
-            if cleaned_raw not in valid_qualitative:
-                self.requires_user_verification = True
-                if not self.uncertainty_note:
-                    self.uncertainty_note = "Non-standard text value requiring client verification"
-                return True
-        else:
-            if not self.unit or not self.unit.strip():
-                self.requires_user_verification = True
-                if not self.uncertainty_note:
-                    self.uncertainty_note = "Missing unit of measurement for numeric value"
-                return True
-
-        if not self.sample_date or not self.sample_date.strip():
-            self.requires_user_verification = True
-            if not self.uncertainty_note:
-                self.uncertainty_note = "Missing specimen collection date"
-            return True
+            return self.requires_user_verification
 
         self.requires_user_verification = False
         return False
@@ -1088,8 +1506,18 @@ class VisionOcrDocumentMetadata(BaseModel):
     sample_date: Optional[str] = Field(default=None, max_length=32)
     issue_date: Optional[str] = Field(default=None, max_length=32)
     laboratory_name: Optional[str] = Field(default=None, max_length=128)
+    order_id: Optional[str] = Field(default=None, max_length=128)
+    document_fingerprint: Optional[str] = Field(default=None, max_length=128)
     page_count: int = Field(default=1, ge=1)
     notes: Optional[str] = Field(default=None, max_length=512)
+
+    @field_validator("sample_date", "issue_date", mode="before")
+    @classmethod
+    def parse_meta_dates(cls, v: Any) -> Optional[str]:
+        if v is None:
+            return None
+        norm_date, is_valid = normalize_lab_date(v)
+        return norm_date if is_valid else None
 
 
 class VisionOcrModelOutput(BaseModel):

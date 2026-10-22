@@ -24,6 +24,7 @@ from sqlalchemy.orm import Session
 from app.repositories.report_repository import ModelReportRepository
 from app.schemas.consilium import AegisAgentRole
 from app.schemas.privacy import PrivacyLevel
+from app.services.ecg_context_service import sanitize_pii_text
 from app.services.primary_consilium_service import ConsiliumContextMissingError
 
 
@@ -47,6 +48,9 @@ SAFE_SHARED_MARKER_FIELDS = {
     "reference_range",
     "event_type",
     "observation_id",
+    "is_uncertain",
+    "uncertainty_note",
+    "is_recognition_ambiguous",
 }
 
 # Safe clinical observation keys for laboratory_history
@@ -64,8 +68,53 @@ SAFE_OBSERVATION_FIELDS = {
     "correction_reason",
     "is_active",
     "is_critical_flag",
+    "is_uncertain",
+    "uncertainty_note",
+    "is_recognition_ambiguous",
     "recorded_at",
 }
+
+
+def sanitize_uncertainty_note(note: Optional[str]) -> Optional[str]:
+    """
+    Sanitizes uncertainty_note before passing into consilium context models.
+    Strictly guarantees zero leakage of OCR free text, unlabelled PII, addresses, or IDs:
+    - Eliminates all arbitrary free text from being passed into consilium prompts.
+    - Strictly maps to deterministic, safe, fixed technical clinical formulations.
+    - Full raw OCR text remains intact only in server_only preparatory reports for audit.
+    """
+    if note is None:
+        return None
+    if not isinstance(note, str):
+        note = str(note)
+    cleaned = note.strip()
+    if not cleaned:
+        return None
+
+    lower = cleaned.lower()
+    standard_phrases: List[str] = []
+
+    if any(k in lower for k in ("recognition ambiguity", "unclear print", "damaged document", "размыт", "неразборчив", "пятно", "blur", "smudg", "дефект бланка", "поврежд")):
+        standard_phrases.append("Recognition ambiguity: unclear print or damaged document")
+
+    if any(k in lower for k in ("missing unit", "missing unit of measurement", "отсутствует единица", "без единицы", "нет единиц")):
+        standard_phrases.append("Missing unit of measurement for numeric value on laboratory report")
+
+    if any(k in lower for k in ("missing specimen collection date", "missing sample date", "дата забора не указана", "отсутствует дата", "нет даты")):
+        standard_phrases.append("Missing specimen collection date on laboratory report")
+
+    if any(k in lower for k in ("borderline qualitative", "indeterminate qualitative", "сомнительн", "borderline", "слабоположительн", "equivocal", "неопределен")):
+        standard_phrases.append("Borderline or indeterminate qualitative finding")
+
+    if any(k in lower for k in ("non-standard text", "нестандартн")):
+        standard_phrases.append("Non-standard text value requiring verification")
+
+    if standard_phrases:
+        return "; ".join(standard_phrases)
+
+    # When arbitrary/unrecognized free text is encountered (e.g. unlabelled names, addresses, IDs),
+    # never leak the string to consilium prompts. Map strictly to the safe fixed technical formulation.
+    return "Non-standard text value requiring verification"
 
 
 class LaboratoryConsiliumContext(BaseModel):
@@ -114,6 +163,9 @@ def _sanitize_shared_marker(marker_key: str, data: Any) -> Dict[str, Any]:
             "reference_range": None,
             "event_type": None,
             "observation_id": None,
+            "is_uncertain": False,
+            "uncertainty_note": None,
+            "is_recognition_ambiguous": False,
         }
 
     clean_marker: Dict[str, Any] = {}
@@ -122,6 +174,10 @@ def _sanitize_shared_marker(marker_key: str, data: Any) -> Dict[str, Any]:
             val = data[k]
             if k == "reference_range":
                 val = _sanitize_reference_range(val)
+            elif k == "uncertainty_note":
+                val = sanitize_uncertainty_note(val)
+            elif k == "display_name" and isinstance(val, str):
+                val = sanitize_pii_text(val)
             elif hasattr(val, "value"):
                 val = val.value
             elif hasattr(val, "model_dump"):
@@ -133,6 +189,12 @@ def _sanitize_shared_marker(marker_key: str, data: Any) -> Dict[str, Any]:
         clean_marker["marker_key"] = marker_key
     if "display_name" not in clean_marker:
         clean_marker["display_name"] = marker_key
+    if "is_uncertain" not in clean_marker:
+        clean_marker["is_uncertain"] = False
+    if "uncertainty_note" not in clean_marker:
+        clean_marker["uncertainty_note"] = None
+    if "is_recognition_ambiguous" not in clean_marker:
+        clean_marker["is_recognition_ambiguous"] = False
 
     return clean_marker
 
@@ -145,11 +207,21 @@ def _sanitize_observation(obs: Dict[str, Any]) -> Dict[str, Any]:
             val = obs[k]
             if k == "reference_range":
                 val = _sanitize_reference_range(val)
+            elif k == "uncertainty_note":
+                val = sanitize_uncertainty_note(val)
+            elif k in ("correction_reason", "display_name") and isinstance(val, str):
+                val = sanitize_pii_text(val)
             elif hasattr(val, "value"):
                 val = val.value
             elif hasattr(val, "model_dump"):
                 val = val.model_dump()
             clean_obs[k] = val
+    if "is_uncertain" not in clean_obs:
+        clean_obs["is_uncertain"] = False
+    if "uncertainty_note" not in clean_obs:
+        clean_obs["uncertainty_note"] = None
+    if "is_recognition_ambiguous" not in clean_obs:
+        clean_obs["is_recognition_ambiguous"] = False
     return clean_obs
 
 
@@ -286,6 +358,9 @@ def assemble_consilium_laboratory_context(
                     "correction_reason": marker.get("correction_reason"),
                     "is_active": True,
                     "is_critical_flag": bool(marker.get("is_critical_flag", False)),
+                    "is_uncertain": bool(marker.get("is_uncertain", False)),
+                    "uncertainty_note": marker.get("uncertainty_note"),
+                    "is_recognition_ambiguous": bool(marker.get("is_recognition_ambiguous", False)),
                     "recorded_at": rec_at,
                 }
                 sanitized_obs = _sanitize_observation(entry)
@@ -324,6 +399,9 @@ def assemble_consilium_laboratory_context(
                             "correction_reason": raw_val.get("correction_reason"),
                             "is_active": bool(raw_val.get("is_active", True)),
                             "is_critical_flag": bool(raw_val.get("is_critical_flag", False)),
+                            "is_uncertain": bool(raw_val.get("is_uncertain", False)),
+                            "uncertainty_note": raw_val.get("uncertainty_note"),
+                            "is_recognition_ambiguous": bool(raw_val.get("is_recognition_ambiguous", False)),
                             "recorded_at": rec_at,
                         }
                     else:
@@ -341,6 +419,9 @@ def assemble_consilium_laboratory_context(
                             "correction_reason": None,
                             "is_active": True,
                             "is_critical_flag": False,
+                            "is_uncertain": False,
+                            "uncertainty_note": None,
+                            "is_recognition_ambiguous": False,
                             "recorded_at": rec_at,
                         }
                     sanitized_obs = _sanitize_observation(entry)

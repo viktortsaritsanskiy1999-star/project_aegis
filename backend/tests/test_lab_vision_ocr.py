@@ -417,7 +417,7 @@ def test_multiple_dates_in_single_upload_creates_distinct_study_dates(client: Te
     resp2 = client.post(
         "/api/v1/cascade/intake/lab-images",
         data={"cycle_id": cycle.cycle_id},
-        files=[("files", ("oct.webp", io.BytesIO(_create_dummy_webp_bytes(512)), "image/webp"))],
+        files=[("files", ("oct.webp", io.BytesIO(_create_dummy_webp_bytes(600)), "image/webp"))],
         headers=auth_headers,
     )
     assert resp2.status_code == 200, resp2.text
@@ -986,12 +986,13 @@ def test_uncertain_recognition_isolation_from_consilium_ledger(client: TestClien
     res = resp.json()
 
     assert res["extracted_count"] == 6
-    assert res["requires_verification_count"] == 3  # ferritin, potassium (no unit on doc sample date), urine_protein
-    # Notice: magnesium inherited doc_metadata.sample_date 2026-10-15, so it is confirmed!
-    assert len(res["confirmed_markers"]) == 3  # hemoglobin, hbsag, magnesium
-    assert len(res["unconfirmed_markers"]) == 3  # ferritin (is_uncertain), potassium (missing unit), urine_protein (non-standard text)
+    assert res["requires_verification_count"] == 1  # only ferritin has OCR recognition ambiguity (smudge/blur)
+    # Notice: magnesium inherited doc_metadata.sample_date 2026-10-15.
+    # Under C-8, potassium (missing unit) and urine_protein (qualitative) are preserved in confirmed markers!
+    assert len(res["confirmed_markers"]) == 5  # hemoglobin, hbsag, magnesium, potassium, urine_protein
+    assert len(res["unconfirmed_markers"]) == 1  # ferritin (is_uncertain from OCR blur)
 
-    # Check that ONLY confirmed markers entered the authoritative laboratory ledger!
+    # Check that confirmed markers entered the authoritative laboratory ledger:
     ledger_service = LabRevisionConsiliumService(db=db_session, gateway=mock_gateway)
     ledger_state = ledger_service.get_lab_ledger_state(cycle.cycle_id)
 
@@ -999,10 +1000,21 @@ def test_uncertain_recognition_isolation_from_consilium_ledger(client: TestClien
     assert "hbsag" in ledger_state.active_markers
     assert "magnesium" in ledger_state.active_markers
 
-    # CRITICAL: unconfirmed markers are NOT in active_markers of the ledger!
+    # C-8 preservation: potassium (missing unit) and urine_protein (qualitative) are preserved in ledger!
+    assert "potassium" in ledger_state.active_markers
+    pot_obs = ledger_state.active_markers["potassium"]
+    assert pot_obs.numeric_value == 4.2
+    assert pot_obs.unit is None
+    assert pot_obs.is_uncertain is True
+    assert "Missing unit of measurement" in (pot_obs.uncertainty_note or "")
+
+    assert "urine_protein" in ledger_state.active_markers
+    prot_obs = ledger_state.active_markers["urine_protein"]
+    assert prot_obs.value == "следы сомнительно"
+    assert prot_obs.is_uncertain is True
+
+    # CRITICAL: only truly unconfirmed recognition-ambiguity markers (ferritin ~2?) are NOT in active_markers of the ledger!
     assert "ferritin" not in ledger_state.active_markers
-    assert "potassium" not in ledger_state.active_markers
-    assert "urine_protein" not in ledger_state.active_markers
 
     # But they ARE preserved in preparatory_vision_ocr on server for client review
     prep_reports = ModelReportRepository(db_session).list_versions(
@@ -1012,12 +1024,12 @@ def test_uncertain_recognition_isolation_from_consilium_ledger(client: TestClien
     )
     assert len(prep_reports) == 1
     content = prep_reports[0].content
-    assert content["confirmed_count"] == 3
-    assert content["unconfirmed_count"] == 3
+    assert content["confirmed_count"] == 5
+    assert content["unconfirmed_count"] == 1
     unconfirmed_keys = [u["marker_key"] for u in content["unconfirmed_markers"]]
     assert "ferritin" in unconfirmed_keys
-    assert "potassium" in unconfirmed_keys
-    assert "urine_protein" in unconfirmed_keys
+    assert "potassium" not in unconfirmed_keys
+    assert "urine_protein" not in unconfirmed_keys
 
 
 # --- 13. Multiple Studies and Dates Without Date Leakage ---
@@ -1369,7 +1381,7 @@ def test_atomicity_idempotent_duplicate_upload_and_primary_consilium_lock(client
     resp3 = client.post(
         "/api/v1/cascade/intake/lab-images",
         data={"cycle_id": cycle.cycle_id},
-        files=[("files", ("new_scan.jpg", io.BytesIO(_create_dummy_jpeg_bytes(512)), "image/jpeg"))],
+        files=[("files", ("new_scan.jpg", io.BytesIO(_create_dummy_jpeg_bytes(600)), "image/jpeg"))],
         headers=auth_headers,
     )
     assert resp3.status_code == 200

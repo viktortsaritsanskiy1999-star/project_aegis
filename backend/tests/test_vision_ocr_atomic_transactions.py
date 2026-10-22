@@ -458,7 +458,7 @@ def test_scenario_7_concurrent_ocr_uploads_zero_lost_markers_across_threads(tmp_
     results: List[LabVisionIntakeClientResponse] = []
     lock = threading.Lock()
 
-    def _ocr_worker(payload: Dict[str, Any]):
+    def _ocr_worker(payload: Dict[str, Any], length: int = 128):
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         session = SessionFactory()
@@ -470,7 +470,7 @@ def test_scenario_7_concurrent_ocr_uploads_zero_lost_markers_across_threads(tmp_
             res = loop.run_until_complete(
                 service.process_lab_images(
                     cycle_id=cycle_id,
-                    files=[_make_upload_file()],
+                    files=[_make_upload_file(length=length)],
                 )
             )
             with lock:
@@ -483,8 +483,8 @@ def test_scenario_7_concurrent_ocr_uploads_zero_lost_markers_across_threads(tmp_
             loop.close()
 
     threads = [
-        threading.Thread(target=_ocr_worker, args=(p,), daemon=True)
-        for p in worker_payloads
+        threading.Thread(target=_ocr_worker, args=(p, 128 + idx * 32), daemon=True)
+        for idx, p in enumerate(worker_payloads)
     ]
     for t in threads:
         t.start()
@@ -751,7 +751,7 @@ async def test_scenario_10_single_event_loop_coroutine_serialization(tmp_path: P
     shared_intake_locks: Dict[Any, Any] = {}
     shared_ledger_locks: Dict[str, Any] = {}
 
-    async def _run_intake(payload: Dict[str, Any]) -> LabVisionIntakeClientResponse:
+    async def _run_intake(payload: Dict[str, Any], length: int = 128) -> LabVisionIntakeClientResponse:
         with SessionFactory() as session:
             gateway = _build_mock_gateway(payload)
             service = LabVisionOcrService(
@@ -762,10 +762,10 @@ async def test_scenario_10_single_event_loop_coroutine_serialization(tmp_path: P
             )
             return await service.process_lab_images(
                 cycle_id=cycle_id,
-                files=[_make_upload_file()],
+                files=[_make_upload_file(length=length)],
             )
 
-    res_1, res_2 = await asyncio.gather(_run_intake(payload_1), _run_intake(payload_2))
+    res_1, res_2 = await asyncio.gather(_run_intake(payload_1, 128), _run_intake(payload_2, 256))
 
     assert {res_1.ledger_version, res_2.ledger_version} == {1, 2}
     assert res_1.status == "processed"
