@@ -1,4 +1,12 @@
-from app.schemas.health import HealthResponse
+from app.schemas.health import (
+    HealthResponse,
+    HealthDataSource,
+    HealthMeasurementCreate,
+    HealthMeasurementCreateBatch,
+    HealthMeasurementResponse,
+    HealthMeasurementBatchResponse,
+    VitalsStreamResponse,
+)
 from app.schemas.privacy import PrivacyLevel
 from app.schemas.reports import ClientModelReportResponse, ModelReportCreate, ClientReportContent
 from app.schemas.cycle import MedicalCycleCreate, MedicalCycleResponse, MedicalCycleStatusUpdate
@@ -114,4 +122,10 @@ __all__ = [
     "EcgRecordingQuality",
     "VisionEcgModelOutput",
     "EcgVisionIntakeClientResponse",
+    "HealthDataSource",
+    "HealthMeasurementCreate",
+    "HealthMeasurementCreateBatch",
+    "HealthMeasurementResponse",
+    "HealthMeasurementBatchResponse",
+    "VitalsStreamResponse",
 ]

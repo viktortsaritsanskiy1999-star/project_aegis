@@ -433,7 +433,7 @@ class PrimaryConsiliumService:
         ecg_summary: str,
         ecg_context: Optional[Any] = None,
     ) -> Dict[str, Any]:
-        measurements = self.measurement_repo.list_by_cycle(cycle_id=cycle_id)
+        measurements = self.measurement_repo.list_by_cycle(cycle_id=cycle_id, is_historical=False, is_simulated=False, limit=50)
         systolic: Optional[int] = None
         diastolic: Optional[int] = None
         pulse: Optional[int] = None

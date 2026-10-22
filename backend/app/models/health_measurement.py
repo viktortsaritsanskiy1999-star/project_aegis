@@ -51,3 +51,16 @@ class HealthMeasurement(Base):
     # Relationships
     session: Mapped["WorkoutSession | None"] = relationship("WorkoutSession", back_populates="measurements")
     cycle: Mapped["MedicalCycle | None"] = relationship("MedicalCycle", back_populates="measurements")
+
+    @property
+    def is_medically_admissible(self) -> bool:
+        """
+        True only if the measurement is genuine, live biometric data admissible for clinical evaluation.
+        Synthetic test data (test_chip, simulated, is_simulated=True) and historical retrospective imports
+        (is_historical=True) are strictly inadmissible for real-time consilium inference.
+        """
+        if self.is_simulated or self.source in ("test_chip", "simulated"):
+            return False
+        if self.is_historical:
+            return False
+        return True

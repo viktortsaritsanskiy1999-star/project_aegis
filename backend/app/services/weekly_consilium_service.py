@@ -537,8 +537,8 @@ class WeeklyConsiliumService:
                     f"Training log: {train_shelf}\n"
                 )
 
-        # Load latest vitals measurements
-        measurements = self.measurement_repo.list_by_cycle(cycle_id=cycle_id)
+        # Load latest vitals measurements (strictly excluding historical data from live stream)
+        measurements = self.measurement_repo.list_by_cycle(cycle_id=cycle_id, is_historical=False, is_simulated=False, limit=100)
         systolic = next((m.systolic for m in reversed(measurements) if m.systolic is not None), None)
         diastolic = next((m.diastolic for m in reversed(measurements) if m.diastolic is not None), None)
         pulse = next((m.pulse for m in reversed(measurements) if m.pulse is not None), None)

@@ -1598,7 +1598,7 @@ class LabRevisionConsiliumService:
         ecg_ctx = assemble_consilium_ecg_context(self.db, cycle_id)
         ecg_summary = ecg_ctx.ecg_summary
 
-        measurements = self.measurement_repo.list_by_cycle(cycle_id=cycle_id)
+        measurements = self.measurement_repo.list_by_cycle(cycle_id=cycle_id, is_historical=False, is_simulated=False, limit=50)
         systolic = next((m.systolic for m in reversed(measurements) if m.systolic is not None), None)
         diastolic = next((m.diastolic for m in reversed(measurements) if m.diastolic is not None), None)
         pulse = next((m.pulse for m in reversed(measurements) if m.pulse is not None), None)
