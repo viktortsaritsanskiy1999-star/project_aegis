@@ -2,6 +2,7 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 import '../services/vitals_monitor_service.dart';
+import '../services/health_data_provider.dart';
 import '../services/time_service.dart';
 import 'debug_time_panel.dart';
 
@@ -223,11 +224,11 @@ class _WorkoutSessionModalState extends State<WorkoutSessionModal> {
                                 spacing: 8,
                                 runSpacing: 6,
                                 children: [
-                                  _buildPulseChip(vitalsService, 135),
-                                  _buildPulseChip(vitalsService, 142),
-                                  _buildPulseChip(vitalsService, 150),
-                                  _buildPulseChip(vitalsService, 85),
-                                  _buildPulseChip(vitalsService, 0, isDanger: true),
+                                  _buildPulseChip(context, vitalsService, 135),
+                                  _buildPulseChip(context, vitalsService, 142),
+                                  _buildPulseChip(context, vitalsService, 150),
+                                  _buildPulseChip(context, vitalsService, 85),
+                                  _buildPulseChip(context, vitalsService, 0, isDanger: true),
                                 ],
                               ),
                               const SizedBox(height: 8),
@@ -267,7 +268,12 @@ class _WorkoutSessionModalState extends State<WorkoutSessionModal> {
                                       onPressed: () {
                                         final val = int.tryParse(_customPulseController.text.trim());
                                         if (val != null) {
-                                          vitalsService.onNewPulseRead(val, source: 'manual_input', isSimulated: true);
+                                          final healthProvider = Provider.of<HealthDataProvider?>(context, listen: false);
+                                          if (healthProvider != null) {
+                                            healthProvider.dispatchManualInput(pulse: val, isSimulated: true);
+                                          } else {
+                                            vitalsService.onNewPulseRead(val, source: 'manual_input', isSimulated: true);
+                                          }
                                           _customPulseController.clear();
                                         }
                                       },
@@ -435,9 +441,16 @@ class _WorkoutSessionModalState extends State<WorkoutSessionModal> {
     );
   }
 
-  Widget _buildPulseChip(VitalsMonitorService service, int bpm, {bool isDanger = false}) {
+  Widget _buildPulseChip(BuildContext context, VitalsMonitorService service, int bpm, {bool isDanger = false}) {
     return InkWell(
-      onTap: () => service.onNewPulseRead(bpm, source: 'test_chip', isSimulated: true),
+      onTap: () {
+        final healthProvider = Provider.of<HealthDataProvider?>(context, listen: false);
+        if (healthProvider != null) {
+          healthProvider.dispatchTestChip(pulse: bpm);
+        } else {
+          service.onNewPulseRead(bpm, source: 'test_chip', isSimulated: true);
+        }
+      },
       borderRadius: BorderRadius.circular(8),
       child: Container(
         padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),

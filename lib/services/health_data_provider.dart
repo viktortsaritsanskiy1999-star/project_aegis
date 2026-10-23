@@ -143,6 +143,29 @@ class HealthDataProvider extends ChangeNotifier {
 
   /// Whether the most recent outbound sync queue enqueue attempt failed
   bool get hasEnqueueError => _lastEnqueueError != null;
+  bool get enqueueError => _lastEnqueueError != null;
+
+  /// Diagnostic status forwarders for testing and monitoring
+  bool get isSyncQueueInitialized => syncQueue?.isInitialized ?? false;
+  int get syncPendingCount => syncQueue?.pendingCount ?? 0;
+  bool get isSyncing => syncQueue?.isSyncing ?? false;
+  bool get isSyncPaused => syncQueue?.isPaused ?? false;
+  String? get lastSyncError => syncQueue?.lastSyncError;
+
+  /// Active medical cycle ID currently bound to the sync queue
+  String? get activeCycleId => syncQueue?.activeCycleId;
+
+  /// Current cycle resolution status of the sync queue
+  CycleResolutionStatus get cycleStatus => syncQueue?.cycleStatus ?? CycleResolutionStatus.idle;
+
+  /// Whether the sync queue is currently waiting for user authorization to resolve medical cycle
+  bool get isAwaitingCycleAuthorization => syncQueue?.isAwaitingAuthorization ?? false;
+
+  /// Whether the currently active medical cycle has been confirmed by the server for this session
+  bool get isCycleConfirmedByServer => syncQueue?.isCycleConfirmedByServer ?? false;
+
+  /// Current session generation counter of the sync queue
+  int get sessionGeneration => syncQueue?.sessionGeneration ?? 0;
 
   /// The most recent error encountered when attempting to enqueue into syncQueue
   Object? get lastEnqueueError => _lastEnqueueError;
@@ -245,9 +268,20 @@ class HealthDataProvider extends ChangeNotifier {
     bool enqueueSuccess = true;
     if (syncQueue != null) {
       try {
-        await syncQueue!.enqueue(measurement);
+        final currentSessionId = _vitalsMonitorService.currentSessionId;
+        final phase = _vitalsMonitorService.currentState == AlertState.workoutActive
+            ? 'workout'
+            : (_vitalsMonitorService.currentState == AlertState.postWorkoutRecovery
+                ? 'recovery'
+                : 'standby');
+        await syncQueue!.enqueue(
+          measurement,
+          sessionId: currentSessionId,
+          phase: phase,
+        );
         _lastEnqueueError = null;
         _lastEnqueueErrorAt = null;
+        syncQueue!.scheduleFlush();
       } catch (e) {
         enqueueSuccess = false;
         _lastEnqueueError = e;
@@ -285,9 +319,13 @@ class HealthDataProvider extends ChangeNotifier {
     bool enqueueSuccess = true;
     if (syncQueue != null) {
       try {
-        await syncQueue!.enqueue(measurement);
+        await syncQueue!.enqueue(
+          measurement,
+          phase: 'historical',
+        );
         _lastEnqueueError = null;
         _lastEnqueueErrorAt = null;
+        syncQueue!.scheduleFlush();
       } catch (e) {
         enqueueSuccess = false;
         _lastEnqueueError = e;

@@ -15,6 +15,13 @@ import 'package:aegis_health/widgets/vitals_activity_check_modal.dart';
 import 'widgets/workout_session_modal.dart';
 import 'widgets/emergency_medical_modal.dart';
 import 'services/health_data_provider.dart';
+import 'services/api/aegis_api_client.dart';
+import 'services/sync/vitals_sync_queue.dart';
+
+/// Safe testable TokenProvider abstraction for standard Aegis mobile runtime.
+/// In standard mobile builds prior to Stage 5.3 user authentication, returns null.
+/// Compile-time embedding of global AEGIS_API_SECRET is strictly forbidden.
+Future<String?> standardRuntimeTokenProvider() async => null;
 
 void main() => runApp(
   MultiProvider(
@@ -47,27 +54,127 @@ void main() => runApp(
       ),
 
       // 🔗 HealthDataProvider: Universal health data ingestion
-      ChangeNotifierProxyProvider2<VaultService, VitalsMonitorService, HealthDataProvider>(
+      Provider<AegisApiClient>(
+        create: (_) => AegisApiClient(
+          tokenProvider: standardRuntimeTokenProvider,
+        ),
+        dispose: (_, client) => client.close(),
+      ),
+
+      // 🔗 Persistent outbound vitals telemetry queue
+      ChangeNotifierProxyProvider<AegisApiClient, VitalsSyncQueue>(
+        create: (context) {
+          final queue = VitalsSyncQueue(
+            apiClient: context.read<AegisApiClient>(),
+          );
+          // Asynchronously restore queue from persistent storage on startup
+          // Network errors or backend unavailability MUST NOT crash or block Flutter startup!
+          queue.init().then((_) {
+            if (!queue.isCycleConfirmedByServer) {
+              queue.resolveActiveCycle().catchError((error) {
+                debugPrint('[AegisApp] Warning: initial cycle resolution check: $error');
+                return false;
+              });
+            }
+          }).catchError((error) {
+            debugPrint('[AegisApp] Warning: VitalsSyncQueue startup restoration failed: $error');
+          });
+          queue.startPeriodicSync();
+          return queue;
+        },
+        update: (context, apiClient, previous) {
+          if (previous != null) {
+            previous.updateApiClient(apiClient);
+            return previous;
+          }
+          final queue = VitalsSyncQueue(apiClient: apiClient);
+          queue.init().then((_) {
+            if (!queue.isCycleConfirmedByServer) {
+              queue.resolveActiveCycle().catchError((error) {
+                debugPrint('[AegisApp] Warning: update cycle resolution check: $error');
+                return false;
+              });
+            }
+          }).catchError((error) {
+            debugPrint('[AegisApp] Warning: VitalsSyncQueue update init failed: $error');
+          });
+          queue.startPeriodicSync();
+          return queue;
+        },
+      ),
+
+      // 🔗 HealthDataProvider: Universal health data ingestion with persistent sync queue
+      ChangeNotifierProxyProvider3<VaultService, VitalsMonitorService, VitalsSyncQueue, HealthDataProvider>(
         create: (context) => HealthDataProvider(
           vaultService: context.read<VaultService>(),
           vitalsMonitorService: context.read<VitalsMonitorService>(),
+          syncQueue: context.read<VitalsSyncQueue>(),
         ),
-        update: (context, vaultService, vitalsService, previous) =>
-            (previous ?? HealthDataProvider(
-              vaultService: vaultService,
-              vitalsMonitorService: vitalsService,
-            ))..updateDependencies(
-              vaultService: vaultService,
-              vitalsMonitorService: vitalsService,
-            ),
+        update: (context, vaultService, vitalsService, syncQueue, previous) =>
+            (previous ??
+                HealthDataProvider(
+                  vaultService: vaultService,
+                  vitalsMonitorService: vitalsService,
+                  syncQueue: syncQueue,
+                ))
+              ..updateDependencies(
+                vaultService: vaultService,
+                vitalsMonitorService: vitalsService,
+                syncQueue: syncQueue,
+              ),
       ),
     ],
     child: const AegisApp(),
   ),
 );
 
-class AegisApp extends StatelessWidget {
+class AegisApp extends StatefulWidget {
   const AegisApp({super.key});
+
+  @override
+  State<AegisApp> createState() => _AegisAppState();
+}
+
+class _AegisAppState extends State<AegisApp> with WidgetsBindingObserver {
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addObserver(this);
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    super.didChangeAppLifecycleState(state);
+    try {
+      final queue = context.read<VitalsSyncQueue>();
+      switch (state) {
+        case AppLifecycleState.resumed:
+          queue.startPeriodicSync();
+          if (queue.isInitialized && !queue.isPaused && !queue.isSyncing && queue.pendingCount > 0) {
+            queue.flush().catchError((error) {
+              debugPrint('[AegisApp] Lifecycle resume flush error: $error');
+              return SyncResult(status: SyncStatus.retryableError, message: '$error');
+            });
+          }
+          break;
+        case AppLifecycleState.inactive:
+        case AppLifecycleState.paused:
+        case AppLifecycleState.detached:
+        case AppLifecycleState.hidden:
+          queue.stopPeriodicSync();
+          queue.cancelScheduledFlush();
+          break;
+      }
+    } catch (e) {
+      debugPrint('[AegisApp] Lifecycle state transition handling skipped: $e');
+    }
+  }
 
   @override
   Widget build(BuildContext context) {

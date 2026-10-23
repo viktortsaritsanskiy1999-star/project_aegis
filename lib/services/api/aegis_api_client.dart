@@ -43,6 +43,30 @@ class AegisApiClient {
     return headers;
   }
 
+  /// Returns whether a valid authorization token is currently provided.
+  /// If a tokenProvider is configured, verifies it resolves to a non-empty token string.
+  /// If tokenProvider is omitted (null), defaults to true for test mock compatibility.
+  Future<bool> hasAuthToken() async {
+    if (tokenProvider == null) return true;
+    try {
+      final token = await tokenProvider!();
+      return token != null && token.trim().isNotEmpty;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  /// Resolves the current authorization token string, or null if unauthenticated.
+  Future<String?> getAuthToken() async {
+    if (tokenProvider == null) return null;
+    try {
+      final token = await tokenProvider!();
+      return (token != null && token.trim().isNotEmpty) ? token.trim() : null;
+    } catch (_) {
+      return null;
+    }
+  }
+
   void _log(String message) {
     // Redact tokens or sensitive auth patterns from debug output
     final sanitized = message.replaceAll(RegExp(r'Bearer\s+[^\s]+'), 'Bearer [REDACTED]');
