@@ -1,10 +1,11 @@
 from datetime import datetime, timezone
-from typing import List, TYPE_CHECKING
-from sqlalchemy import String, DateTime
+from typing import List, Optional, TYPE_CHECKING
+from sqlalchemy import String, DateTime, ForeignKey
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from app.models.base import Base
 
 if TYPE_CHECKING:
+    from app.models.patient import Patient
     from app.models.weekly_sprint import WeeklySprint
     from app.models.workout_session import WorkoutSession
     from app.models.health_measurement import HealthMeasurement
@@ -21,6 +22,12 @@ class MedicalCycle(Base):
     __tablename__ = "medical_cycles"
 
     cycle_id: Mapped[str] = mapped_column(String(64), primary_key=True, index=True)
+    patient_id: Mapped[str | None] = mapped_column(
+        String(64),
+        ForeignKey("patients.patient_id", ondelete="RESTRICT"),
+        nullable=True,
+        index=True,
+    )
     status: Mapped[str] = mapped_column(String(32), default="active", index=True)  # active, completed, archived
     started_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
     closed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
@@ -32,6 +39,10 @@ class MedicalCycle(Base):
     )
 
     # Relationships
+    patient: Mapped[Optional["Patient"]] = relationship(
+        "Patient",
+        back_populates="cycles",
+    )
     sprints: Mapped[List["WeeklySprint"]] = relationship(
         "WeeklySprint",
         back_populates="cycle",

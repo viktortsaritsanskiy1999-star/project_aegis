@@ -34,6 +34,12 @@ class Settings(BaseSettings):
         default="",
         alias="AEGIS_API_SECRET",
     )
+    # Security: Dedicated server-side HMAC secret for 6-digit device pairing codes.
+    # Stored strictly outside the database. Must NOT fallback to AEGIS_API_SECRET.
+    pairing_secret: str = Field(
+        default="",
+        alias="AEGIS_PAIRING_SECRET",
+    )
     gemini_api_key: str = Field(
         default="",
         alias="GEMINI_API_KEY",
