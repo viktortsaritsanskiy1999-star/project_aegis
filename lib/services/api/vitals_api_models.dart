@@ -46,6 +46,21 @@ class AegisServerException extends AegisApiException {
   const AegisServerException(super.message, {super.statusCode, super.responseBody});
 }
 
+class AegisRateLimitException extends AegisApiException {
+  final Duration? retryAfter;
+
+  const AegisRateLimitException(
+    super.message, {
+    super.statusCode = 429,
+    super.responseBody,
+    this.retryAfter,
+  });
+
+  @override
+  String toString() =>
+      'AegisRateLimitException: $message (retryAfter: ${retryAfter != null ? "${retryAfter!.inSeconds}s" : "null"}, status: $statusCode)';
+}
+
 /// DTO corresponding to backend HealthMeasurementCreate schema
 class HealthMeasurementCreate {
   final String? cycleId;
