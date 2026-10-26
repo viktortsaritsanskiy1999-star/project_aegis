@@ -4,7 +4,14 @@ from sqlalchemy import create_engine
 from sqlalchemy.pool import StaticPool
 from app.config import settings
 from app.database import engine, init_db
-from app.routers import health_router, cycles_router, reports_router, cascade_router, vitals_router
+from app.routers import (
+    auth_router,
+    health_router,
+    cycles_router,
+    reports_router,
+    cascade_router,
+    vitals_router,
+)
 
 
 @asynccontextmanager
@@ -37,6 +44,7 @@ app = FastAPI(
 
 # Mount Routers
 app.include_router(health_router)
+app.include_router(auth_router)
 app.include_router(cycles_router)
 app.include_router(reports_router)
 app.include_router(cascade_router)

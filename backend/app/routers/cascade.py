@@ -20,7 +20,7 @@ from app.schemas.consilium import (
     LabVisionIntakeClientResponse,
     EcgVisionIntakeClientResponse,
 )
-from app.security.auth import verify_client_token
+from app.security.auth import ServiceAdminSession, require_service_admin_session
 from app.services.gemini_gateway import GeminiGateway, GeminiGatewayError
 from app.services.primary_consilium_service import (
     PrimaryConsiliumService,
@@ -74,7 +74,7 @@ async def submit_anamnesis_intake_endpoint(
     payload: AnamnesisIntakeRequest,
     db: Session = Depends(get_db),
     gateway: GeminiGateway = Depends(get_gemini_gateway),
-    _token: str = Depends(verify_client_token),
+    _token: ServiceAdminSession = Depends(require_service_admin_session),
 ) -> AnamnesisIntakeClientResponse:
     service = PrimaryConsiliumService(db=db, gateway=gateway)
     try:
@@ -122,7 +122,7 @@ async def run_primary_consilium_endpoint(
     payload: PrimaryConsiliumRunRequest,
     db: Session = Depends(get_db),
     gateway: GeminiGateway = Depends(get_gemini_gateway),
-    _token: str = Depends(verify_client_token),
+    _token: ServiceAdminSession = Depends(require_service_admin_session),
 ) -> PrimaryConsiliumClientResponse:
     service = PrimaryConsiliumService(db=db, gateway=gateway)
     try:
@@ -170,7 +170,7 @@ async def run_weekly_consilium_endpoint(
     payload: WeeklyConsiliumRunRequest,
     db: Session = Depends(get_db),
     gateway: GeminiGateway = Depends(get_gemini_gateway),
-    _token: str = Depends(verify_client_token),
+    _token: ServiceAdminSession = Depends(require_service_admin_session),
 ) -> WeeklyConsiliumClientResponse:
     service = WeeklyConsiliumService(db=db, gateway=gateway)
     try:
@@ -224,7 +224,7 @@ def upsert_laboratory_markers_endpoint(
     payload: LabLedgerUpsertRequest,
     db: Session = Depends(get_db),
     now_provider: Callable[[], datetime] = Depends(get_server_now_provider),
-    _token: str = Depends(verify_client_token),
+    _token: ServiceAdminSession = Depends(require_service_admin_session),
 ) -> LabLedgerStateResponse:
     service = LabRevisionConsiliumService(db=db, now_provider=now_provider)
     try:
@@ -258,7 +258,7 @@ def get_laboratory_ledger_state_endpoint(
     cycle_id: str = Query(..., min_length=3, max_length=64),
     db: Session = Depends(get_db),
     now_provider: Callable[[], datetime] = Depends(get_server_now_provider),
-    _token: str = Depends(verify_client_token),
+    _token: ServiceAdminSession = Depends(require_service_admin_session),
 ) -> LabLedgerStateResponse:
     service = LabRevisionConsiliumService(db=db, now_provider=now_provider)
     try:
@@ -279,7 +279,7 @@ def get_lab_revision_cooldown_endpoint(
     cycle_id: str = Query(..., min_length=3, max_length=64),
     db: Session = Depends(get_db),
     now_provider: Callable[[], datetime] = Depends(get_server_now_provider),
-    _token: str = Depends(verify_client_token),
+    _token: ServiceAdminSession = Depends(require_service_admin_session),
 ) -> LabRevisionCooldownStatus:
     service = LabRevisionConsiliumService(db=db, now_provider=now_provider)
     try:
@@ -307,7 +307,7 @@ async def run_lab_revision_consilium_endpoint(
     db: Session = Depends(get_db),
     gateway: GeminiGateway = Depends(get_gemini_gateway),
     now_provider: Callable[[], datetime] = Depends(get_server_now_provider),
-    _token: str = Depends(verify_client_token),
+    _token: ServiceAdminSession = Depends(require_service_admin_session),
 ) -> LabRevisionConsiliumClientResponse:
     service = LabRevisionConsiliumService(
         db=db,
@@ -374,7 +374,7 @@ async def submit_lab_images_intake_endpoint(
     db: Session = Depends(get_db),
     gateway: GeminiGateway = Depends(get_gemini_gateway),
     now_provider: Callable[[], datetime] = Depends(get_server_now_provider),
-    _token: str = Depends(verify_client_token),
+    _token: ServiceAdminSession = Depends(require_service_admin_session),
 ) -> LabVisionIntakeClientResponse:
     service = LabVisionOcrService(
         db=db,
@@ -433,7 +433,7 @@ async def submit_ecg_image_intake_endpoint(
     db: Session = Depends(get_db),
     gateway: GeminiGateway = Depends(get_gemini_gateway),
     now_provider: Callable[[], datetime] = Depends(get_server_now_provider),
-    _token: str = Depends(verify_client_token),
+    _token: ServiceAdminSession = Depends(require_service_admin_session),
 ) -> EcgVisionIntakeClientResponse:
     service = EcgVisionService(
         db=db,

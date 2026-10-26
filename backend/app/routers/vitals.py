@@ -1,19 +1,25 @@
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Optional
-from fastapi import APIRouter, Depends, HTTPException, Query, status, Response
+from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from sqlalchemy.orm import Session
 
 from app.database import get_db
-from app.repositories.cycle_repository import MedicalCycleRepository
-from app.repositories.measurement_repository import HealthMeasurementRepository, IdempotencyKeyConflictError
+from app.repositories.measurement_repository import (
+    HealthMeasurementRepository,
+    IdempotencyKeyConflictError,
+)
 from app.schemas.health import (
+    HealthMeasurementBatchResponse,
     HealthMeasurementCreate,
     HealthMeasurementCreateBatch,
     HealthMeasurementResponse,
-    HealthMeasurementBatchResponse,
     VitalsStreamResponse,
 )
-from app.security.auth import verify_client_token
+from app.security.auth import (
+    AuthSession,
+    require_scopes,
+    verify_cycle_access_for_session,
+)
 
 router = APIRouter(prefix="/api/v1/vitals", tags=["Vitals Telemetry"])
 
@@ -21,19 +27,19 @@ router = APIRouter(prefix="/api/v1/vitals", tags=["Vitals Telemetry"])
 @router.post(
     "/measurement",
     response_model=HealthMeasurementResponse,
-    summary="Ingest a single biometric health measurement (Protected)",
+    summary="Ingest a single biometric health measurement (Protected, Patient-Isolated)",
     description=(
         "Authorized endpoint receiving an individual biometric health measurement "
         "(pulse, blood pressure, SpO2) from smartwatch sensors, user manual entry, test chips, or simulation. "
-        "Strictly enforces technical admissibility ranges without inventing artificial medical alarm thresholds. "
-        "Guarantees duplicate delivery protection (idempotency) and binds to the active medical cycle."
+        "Strictly enforces patient cycle ownership BEFORE inspecting cycle status or deduplicating, "
+        "and enforces technical admissibility ranges without inventing artificial medical alarm thresholds."
     ),
 )
 def ingest_measurement_endpoint(
     payload: HealthMeasurementCreate,
     response: Response,
     db: Session = Depends(get_db),
-    _token: str = Depends(verify_client_token),
+    session: AuthSession = Depends(require_scopes("vitals:write")),
 ) -> HealthMeasurementResponse:
     if not payload.cycle_id:
         raise HTTPException(
@@ -41,13 +47,8 @@ def ingest_measurement_endpoint(
             detail="Field 'cycle_id' is required for single measurement ingestion.",
         )
 
-    cycle_repo = MedicalCycleRepository(db)
-    cycle = cycle_repo.get(payload.cycle_id)
-    if not cycle:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Medical cycle '{payload.cycle_id}' not found.",
-        )
+    # Verify cycle existence & patient ownership BEFORE inspecting cycle.status or deduplicating
+    cycle = verify_cycle_access_for_session(db, session, payload.cycle_id)
     if cycle.status != "active":
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -92,26 +93,21 @@ def ingest_measurement_endpoint(
 @router.post(
     "/batch",
     response_model=HealthMeasurementBatchResponse,
-    summary="Atomically ingest a batch of biometric measurements (Protected)",
+    summary="Atomically ingest a batch of biometric measurements (Protected, Patient-Isolated)",
     description=(
         "Authorized endpoint receiving a batch of biometric measurements (smartwatch batch sync or historical data). "
-        "Validates technical ranges, deduplicates identical records, and atomically persists all fresh measurements. "
-        "If any unexpected failure occurs during the batch, all insertions are rolled back."
+        "Verifies patient cycle ownership BEFORE inspecting cycle status or batch items, validates technical ranges, "
+        "deduplicates identical records, and atomically persists all fresh measurements."
     ),
 )
 def ingest_batch_endpoint(
     payload: HealthMeasurementCreateBatch,
     response: Response,
     db: Session = Depends(get_db),
-    _token: str = Depends(verify_client_token),
+    session: AuthSession = Depends(require_scopes("vitals:write")),
 ) -> HealthMeasurementBatchResponse:
-    cycle_repo = MedicalCycleRepository(db)
-    cycle = cycle_repo.get(payload.cycle_id)
-    if not cycle:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Medical cycle '{payload.cycle_id}' not found.",
-        )
+    # Verify cycle existence & patient ownership BEFORE inspecting cycle.status or batch items
+    cycle = verify_cycle_access_for_session(db, session, payload.cycle_id)
     if cycle.status != "active":
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -198,7 +194,7 @@ def ingest_batch_endpoint(
 @router.get(
     "/latest",
     response_model=VitalsStreamResponse,
-    summary="Get latest live vitals stream for a medical cycle (Protected)",
+    summary="Get latest live vitals stream for a medical cycle (Protected, Patient-Isolated)",
     description=(
         "Returns the authoritative latest live biometric vitals stream (pulse, blood pressure, SpO2) "
         "for the specified cycle. Historical measurements are strictly excluded from the live stream."
@@ -211,15 +207,9 @@ def get_latest_vitals_stream_endpoint(
         description="Whether to include simulated/test data in the stream (strictly false by default)",
     ),
     db: Session = Depends(get_db),
-    _token: str = Depends(verify_client_token),
+    session: AuthSession = Depends(require_scopes("vitals:read")),
 ) -> VitalsStreamResponse:
-    cycle_repo = MedicalCycleRepository(db)
-    cycle = cycle_repo.get(cycle_id)
-    if not cycle:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Medical cycle '{cycle_id}' not found.",
-        )
+    verify_cycle_access_for_session(db, session, cycle_id)
 
     meas_repo = HealthMeasurementRepository(db)
     is_sim_filter = None if include_simulated else False
@@ -265,10 +255,6 @@ def get_latest_vitals_stream_endpoint(
         if all(v is not None for v in (systolic, diastolic, pulse, spo2)):
             break
 
-    # We do NOT declare measurements live purely based on is_historical=False.
-    # Without an established live telemetry heartbeat / monitoring policy,
-    # is_live is None (safe unknown actuality) while latest_measured_at provides
-    # the exact physical measurement timestamp for backward compatibility.
     return VitalsStreamResponse(
         cycle_id=cycle_id,
         blood_pressure=f"{systolic if systolic is not None else '--'}/{diastolic if diastolic is not None else '--'} mmHg",
