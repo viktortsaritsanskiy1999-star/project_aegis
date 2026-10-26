@@ -350,15 +350,23 @@ class AuthSession {
       scopes.containsAll(requiredScopes);
 
   /// Checks if access token has expired or is about to expire within [skewBuffer] (default: 60s).
-  bool isAccessTokenExpired({Duration skewBuffer = const Duration(seconds: 60)}) {
+  bool isAccessTokenExpired({
+    Duration skewBuffer = const Duration(seconds: 60),
+    DateTime? now,
+  }) {
     final effectiveThreshold = expiresAt.subtract(skewBuffer);
-    return DateTime.now().toUtc().isAfter(effectiveThreshold);
+    final currentUtc = (now ?? DateTime.now()).toUtc();
+    return currentUtc.isAfter(effectiveThreshold);
   }
 
   /// Checks if the long-lived refresh token has expired.
-  bool isRefreshTokenExpired({Duration skewBuffer = Duration.zero}) {
+  bool isRefreshTokenExpired({
+    Duration skewBuffer = Duration.zero,
+    DateTime? now,
+  }) {
     final effectiveThreshold = refreshExpiresAt.subtract(skewBuffer);
-    return DateTime.now().toUtc().isAfter(effectiveThreshold);
+    final currentUtc = (now ?? DateTime.now()).toUtc();
+    return currentUtc.isAfter(effectiveThreshold);
   }
 
   Duration get accessTokenRemaining => expiresAt.difference(DateTime.now().toUtc());

@@ -26,6 +26,14 @@ class AegisAuthException extends AegisApiException {
   const AegisAuthException(super.message, {super.statusCode, super.responseBody});
 }
 
+class AegisForbiddenException extends AegisApiException {
+  const AegisForbiddenException(
+    super.message, {
+    super.statusCode = 403,
+    super.responseBody,
+  });
+}
+
 class AegisBadRequestException extends AegisApiException {
   const AegisBadRequestException(super.message, {super.statusCode, super.responseBody});
 }
