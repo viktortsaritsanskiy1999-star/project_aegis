@@ -1,6 +1,8 @@
 from datetime import datetime, timezone
+import time
 import uuid
 from typing import List, Optional
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 from sqlalchemy import select, update
 from app.models.device import Device
@@ -87,32 +89,68 @@ class DeviceRepository:
             .order_by(Device.paired_at.desc())
         ).scalars().all())
 
-    def revoke_device(self, device_id: str) -> Optional[Device]:
-        device = self.get(device_id)
-        if not device:
+    def revoke_device(self, device_id: str, *, commit: bool = True) -> Optional[Device]:
+        """
+        Atomically revokes a device and all of its active refresh tokens.
+        Uses a write-first SQL UPDATE to acquire an immediate write lock in SQLite,
+        eliminating SHARED->RESERVED lock upgrade deadlocks and race windows against
+        concurrent refresh token rotations.
+        """
+        if not isinstance(device_id, str) or not device_id.strip():
             return None
-        now = datetime.now(timezone.utc)
-        try:
-            device.is_active = False
-            device.revoked_at = now
-            device.updated_at = now
-            self.db.execute(
-                update(DeviceRefreshToken)
-                .where(
-                    DeviceRefreshToken.device_id == device_id,
-                    DeviceRefreshToken.revoked_at.is_(None),
-                )
-                .values(revoked_at=now)
-                .execution_options(synchronize_session=False)
-            )
-            self.db.commit()
-            self.db.refresh(device)
-            return device
-        except Exception:
-            self.db.rollback()
-            raise
+        clean_id = device_id.strip()
+        max_lock_retries = 5
 
-    def update_last_seen(self, device_id: str) -> Optional[Device]:
+        for attempt in range(max_lock_retries + 1):
+            now = datetime.now(timezone.utc)
+            try:
+                dev_res = self.db.execute(
+                    update(Device)
+                    .where(Device.device_id == clean_id)
+                    .values(
+                        is_active=False,
+                        revoked_at=now,
+                        updated_at=now,
+                    )
+                    .execution_options(synchronize_session=False)
+                )
+                if dev_res.rowcount == 0:
+                    if commit:
+                        self.db.rollback()
+                    return None
+
+                self.db.execute(
+                    update(DeviceRefreshToken)
+                    .where(
+                        DeviceRefreshToken.device_id == clean_id,
+                        DeviceRefreshToken.revoked_at.is_(None),
+                    )
+                    .values(revoked_at=now)
+                    .execution_options(synchronize_session=False)
+                )
+
+                if commit:
+                    self.db.commit()
+                    self.db.expire_all()
+                else:
+                    self.db.flush()
+                return self.get(clean_id)
+            except OperationalError as exc:
+                if commit:
+                    self.db.rollback()
+                err_msg = str(exc).lower()
+                if commit and attempt < max_lock_retries and ("locked" in err_msg or "busy" in err_msg):
+                    time.sleep(0.015 * (attempt + 1))
+                    continue
+                raise
+            except Exception:
+                if commit:
+                    self.db.rollback()
+                raise
+
+        return self.get(clean_id)
+
+    def update_last_seen(self, device_id: str, *, commit: bool = True) -> Optional[Device]:
         device = self.get(device_id)
         if not device:
             return None
@@ -120,9 +158,13 @@ class DeviceRepository:
         try:
             device.last_seen_at = now
             device.updated_at = now
-            self.db.commit()
-            self.db.refresh(device)
+            if commit:
+                self.db.commit()
+                self.db.refresh(device)
+            else:
+                self.db.flush()
             return device
         except Exception:
-            self.db.rollback()
+            if commit:
+                self.db.rollback()
             raise

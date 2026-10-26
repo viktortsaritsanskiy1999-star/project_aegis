@@ -40,6 +40,44 @@ class Settings(BaseSettings):
         default="",
         alias="AEGIS_PAIRING_SECRET",
     )
+    # Security: Dedicated server-side secret for signing short-lived HS256 JWT access tokens.
+    # Stored strictly outside the database. Must NOT fallback to or equal AEGIS_API_SECRET or AEGIS_PAIRING_SECRET.
+    jwt_secret: str = Field(
+        default="",
+        alias="AEGIS_JWT_SECRET",
+    )
+    jwt_issuer: str = Field(
+        default="aegis-backend",
+        alias="AEGIS_JWT_ISSUER",
+    )
+    jwt_audience: str = Field(
+        default="aegis-mobile-client",
+        alias="AEGIS_JWT_AUDIENCE",
+    )
+    access_token_ttl_minutes: int = Field(
+        default=30,
+        ge=1,
+        le=120,
+        alias="AEGIS_ACCESS_TOKEN_TTL_MINUTES",
+    )
+    refresh_token_ttl_days: int = Field(
+        default=30,
+        ge=1,
+        le=365,
+        alias="AEGIS_REFRESH_TOKEN_TTL_DAYS",
+    )
+    # Comma-separated list of trusted reverse-proxy IPs allowed to supply X-Forwarded-For.
+    # Empty by default (never trust proxy headers unless explicitly configured).
+    trusted_proxy_ips: str = Field(
+        default="",
+        alias="AEGIS_TRUSTED_PROXIES",
+    )
+    max_active_pairing_codes: int = Field(
+        default=10,
+        ge=1,
+        le=100,
+        alias="AEGIS_MAX_ACTIVE_PAIRING_CODES",
+    )
     gemini_api_key: str = Field(
         default="",
         alias="GEMINI_API_KEY",

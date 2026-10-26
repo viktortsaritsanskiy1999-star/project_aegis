@@ -315,7 +315,9 @@ class PairingRepository:
 
         try:
             patient = self.db.execute(
-                select(Patient).where(Patient.patient_id == consumed.patient_id)
+                select(Patient)
+                .where(Patient.patient_id == consumed.patient_id)
+                .execution_options(populate_existing=True)
             ).scalar_one_or_none()
             if patient is None or patient.status != "active":
                 raise ValueError("Cannot pair device: patient is not active.")
