@@ -18,6 +18,7 @@ import 'services/health_data_provider.dart';
 import 'services/api/aegis_api_client.dart';
 import 'services/auth/auth_session_manager.dart';
 import 'services/sync/vitals_sync_queue.dart';
+import 'widgets/aegis_device_pairing_modal.dart';
 
 /// Safe testable TokenProvider abstraction for standard Aegis mobile runtime.
 /// In standard mobile builds prior to Stage 5.3 user authentication, returns null.
@@ -568,24 +569,54 @@ class _AtlasScreenState extends State<AtlasScreen> {
                               ),
                             ],
                           ),
-                          child: const Row(
-                            mainAxisSize: MainAxisSize.min,
-                            children: [
-                              Icon(
-                                Icons.watch_rounded,
-                                color: Colors.cyanAccent,
-                                size: 14,
-                              ),
-                              SizedBox(width: 6),
-                              Text(
-                                "Smart Watch",
-                                style: TextStyle(
-                                  color: Colors.white,
-                                  fontSize: 11,
-                                  fontWeight: FontWeight.bold,
-                                ),
-                              ),
-                            ],
+                          child: Consumer<AuthSessionManager>(
+                            builder: (context, authManager, child) {
+                              Color dotColor;
+                              switch (authManager.status) {
+                                case AuthSessionStatus.authenticated:
+                                  dotColor = Colors.greenAccent;
+                                  break;
+                                case AuthSessionStatus.expired:
+                                  dotColor = Colors.amberAccent;
+                                  break;
+                                case AuthSessionStatus.rateLimited:
+                                  dotColor = Colors.orangeAccent;
+                                  break;
+                                case AuthSessionStatus.unauthenticated:
+                                  dotColor = Colors.white24;
+                                  break;
+                              }
+
+                              return Row(
+                                mainAxisSize: MainAxisSize.min,
+                                children: [
+                                  const Icon(
+                                    Icons.watch_rounded,
+                                    color: Colors.cyanAccent,
+                                    size: 14,
+                                  ),
+                                  const SizedBox(width: 6),
+                                  const Text(
+                                    "Smart Watch",
+                                    style: TextStyle(
+                                      color: Colors.white,
+                                      fontSize: 11,
+                                      fontWeight: FontWeight.bold,
+                                    ),
+                                  ),
+                                  const SizedBox(width: 6),
+                                  Container(
+                                    key: const Key('smart_watch_auth_dot'),
+                                    width: 6,
+                                    height: 6,
+                                    decoration: BoxDecoration(
+                                      color: dotColor,
+                                      shape: BoxShape.circle,
+                                    ),
+                                  ),
+                                ],
+                              );
+                            },
                           ),
                         ),
                       ),
@@ -1402,6 +1433,114 @@ class VitalsHeaderCard extends StatelessWidget {
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
+                      // 🛡️ Aegis Cloud Profile & Device Pairing Tile
+                      Consumer<AuthSessionManager>(
+                        builder: (context, authManager, child) {
+                          final isPaired = authManager.status == AuthSessionStatus.authenticated;
+                          final isExpired = authManager.status == AuthSessionStatus.expired;
+                          final Color badgeColor = isPaired
+                              ? Colors.greenAccent
+                              : (isExpired ? Colors.amberAccent : Colors.white38);
+                          final String statusLabel = isPaired
+                              ? "Connected"
+                              : (isExpired ? "Session Expired" : "Not Paired");
+
+                          return Container(
+                            width: double.infinity,
+                            margin: const EdgeInsets.only(bottom: 16),
+                            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+                            decoration: BoxDecoration(
+                              color: const Color(0xFF161B22),
+                              borderRadius: BorderRadius.circular(10),
+                              border: Border.all(
+                                color: badgeColor.withValues(alpha: 0.5),
+                                width: 1,
+                              ),
+                            ),
+                            child: Row(
+                              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                              children: [
+                                Row(
+                                  children: [
+                                    Icon(
+                                      isPaired ? Icons.cloud_done_rounded : Icons.cloud_outlined,
+                                      color: badgeColor,
+                                      size: 18,
+                                    ),
+                                    const SizedBox(width: 8),
+                                    Column(
+                                      crossAxisAlignment: CrossAxisAlignment.start,
+                                      children: [
+                                        const Text(
+                                          "Aegis Cloud Profile",
+                                          style: TextStyle(
+                                            color: Colors.white,
+                                            fontSize: 12,
+                                            fontWeight: FontWeight.bold,
+                                          ),
+                                        ),
+                                        const SizedBox(height: 2),
+                                        Row(
+                                          children: [
+                                            Container(
+                                              width: 6,
+                                              height: 6,
+                                              decoration: BoxDecoration(
+                                                color: badgeColor,
+                                                shape: BoxShape.circle,
+                                              ),
+                                            ),
+                                            const SizedBox(width: 4),
+                                            Text(
+                                              statusLabel,
+                                              style: TextStyle(
+                                                color: badgeColor,
+                                                fontSize: 10,
+                                                fontWeight: FontWeight.w500,
+                                              ),
+                                            ),
+                                            if (isPaired && authManager.confirmedAttributionPatientId != null) ...[
+                                              const SizedBox(width: 4),
+                                              Text(
+                                                "(${authManager.confirmedAttributionPatientId})",
+                                                style: const TextStyle(
+                                                  color: Colors.white54,
+                                                  fontSize: 10,
+                                                ),
+                                              ),
+                                            ],
+                                          ],
+                                        ),
+                                      ],
+                                    ),
+                                  ],
+                                ),
+                                OutlinedButton(
+                                  key: const Key('open_pairing_modal_button'),
+                                  style: OutlinedButton.styleFrom(
+                                    side: BorderSide(color: badgeColor, width: 1),
+                                    padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+                                    minimumSize: Size.zero,
+                                    tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                                  ),
+                                  onPressed: () {
+                                    AegisDevicePairingModal.show(context);
+                                  },
+                                  child: Text(
+                                    isPaired ? "Manage" : "Pair",
+                                    style: TextStyle(
+                                      color: badgeColor,
+                                      fontSize: 11,
+                                      fontWeight: FontWeight.bold,
+                                    ),
+                                  ),
+                                ),
+                              ],
+                            ),
+                          );
+                        },
+                      ),
+
                       // Vitals input fields
                       Row(
                         children: [
@@ -1548,9 +1687,24 @@ class VitalsHeaderCard extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return Consumer<VaultService>(
-      builder: (context, vault, child) {
+    return Consumer2<VaultService, AuthSessionManager>(
+      builder: (context, vault, authManager, child) {
         final hasEcg = vault.ecgSummary != null && vault.ecgSummary!.isNotEmpty;
+        Color authDotColor;
+        switch (authManager.status) {
+          case AuthSessionStatus.authenticated:
+            authDotColor = Colors.greenAccent;
+            break;
+          case AuthSessionStatus.expired:
+            authDotColor = Colors.amberAccent;
+            break;
+          case AuthSessionStatus.rateLimited:
+            authDotColor = Colors.orangeAccent;
+            break;
+          case AuthSessionStatus.unauthenticated:
+            authDotColor = Colors.white24;
+            break;
+        }
 
         return GestureDetector(
           onTap: () => showQuickEditModal(context),
@@ -1579,6 +1733,16 @@ class VitalsHeaderCard extends StatelessWidget {
                     color: Colors.white,
                     fontSize: 12,
                     fontWeight: FontWeight.w600,
+                  ),
+                ),
+                const SizedBox(width: 6),
+                Container(
+                  key: const Key('vitals_card_auth_dot'),
+                  width: 6,
+                  height: 6,
+                  decoration: BoxDecoration(
+                    color: authDotColor,
+                    shape: BoxShape.circle,
                   ),
                 ),
                 if (hasEcg) ...[
