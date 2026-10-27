@@ -202,6 +202,16 @@ class VitalsSyncQueue extends ChangeNotifier {
   bool get awaitingAuthorization => isAwaitingAuthorization;
   bool get isCycleActive => _cycleStatus == CycleResolutionStatus.active && _activeCycleId != null && _isCycleConfirmedByServer;
   bool get isCycleConfirmedByServer => _isCycleConfirmedByServer;
+  /// Returns true if the pause reason indicates a storage or persistence failure.
+  /// Persistence failures must never be cleared by subsequent auth events.
+  static bool _isPersistencePauseReason(String? reason) {
+    if (reason == null) return false;
+    final lower = reason.toLowerCase();
+    return lower.contains('persist') ||
+        lower.contains('storage') ||
+        lower.contains('snapshot');
+  }
+
   int get sessionGeneration => _sessionGeneration;
 
   // Runtime diagnostics
@@ -269,23 +279,29 @@ class VitalsSyncQueue extends ChangeNotifier {
     if (manager == null) return;
     _patientIsolationEnabled = true;
 
-    final currentSession = manager.currentSession;
-    final newPatientId = currentSession?.patientId ?? manager.lastKnownPatientId;
+    final attributedPatientId = manager.confirmedAttributionPatientId;
 
-    if (newPatientId != null && newPatientId.isNotEmpty) {
+    if (attributedPatientId != null && attributedPatientId.isNotEmpty) {
       if (_activePatientId == null) {
-        _activePatientId = newPatientId;
+        _activePatientId = attributedPatientId;
         if (_isInitialized) {
           _synchronized(() async {
             final changed = _quarantineLegacyUnassignedItemsLocked();
             await _persist();
             if (changed) notifyListeners();
           }).catchError((e) {
-            debugPrint('[VitalsSyncQueue] Persistence warning on initial patient binding: $e');
+            final errMsg = 'Persistence error during initial patient binding: $e';
+            debugPrint('[VitalsSyncQueue] $errMsg');
+            _isPaused = true;
+            _pauseReason = errMsg;
+            _lastSyncError = errMsg;
+            cancelScheduledFlush();
+            notifyListeners();
           });
         }
         if (manager.status == AuthSessionStatus.authenticated &&
             _isPaused &&
+            !_isPersistencePauseReason(_pauseReason) &&
             (_pauseReason == null ||
                 _pauseReason!.toLowerCase().contains('authoriz') ||
                 _pauseReason!.toLowerCase().contains('401') ||
@@ -306,18 +322,20 @@ class VitalsSyncQueue extends ChangeNotifier {
           }
         }
         notifyListeners();
-      } else if (_activePatientId != newPatientId) {
+      } else if (_activePatientId != attributedPatientId) {
         // Patient switch detected (Patient A -> Patient B):
         // Increment sessionGeneration, invalidate cycle confirmation, preserve Patient A items untouched.
         _sessionGeneration++;
         final capturedEpoch = _sessionGeneration;
-        _activePatientId = newPatientId;
+        _activePatientId = attributedPatientId;
         _activeCycleId = null;
         _isCycleConfirmedByServer = false;
         _cycleStatus = CycleResolutionStatus.idle;
-        _isPaused = false;
-        _pauseReason = null;
-        _lastSyncError = null;
+        if (!_isPersistencePauseReason(_pauseReason)) {
+          _isPaused = false;
+          _pauseReason = null;
+          _lastSyncError = null;
+        }
         _consecutiveFailures = 0;
         _nextRetryAllowedAfter = null;
         cancelScheduledFlush();
@@ -328,7 +346,13 @@ class VitalsSyncQueue extends ChangeNotifier {
             _quarantineLegacyUnassignedItemsLocked();
             await _persist(sessionEpoch: capturedEpoch);
           }).catchError((e) {
-            debugPrint('[VitalsSyncQueue] Persistence warning on patient switch: $e');
+            final errMsg = 'Persistence error on patient switch: $e';
+            debugPrint('[VitalsSyncQueue] $errMsg');
+            _isPaused = true;
+            _pauseReason = errMsg;
+            _lastSyncError = errMsg;
+            cancelScheduledFlush();
+            notifyListeners();
           });
         }
       } else {
@@ -336,6 +360,7 @@ class VitalsSyncQueue extends ChangeNotifier {
         // Do NOT increment _sessionGeneration and do NOT reset active cycle or queue!
         if (manager.status == AuthSessionStatus.authenticated &&
             _isPaused &&
+            !_isPersistencePauseReason(_pauseReason) &&
             (_pauseReason == null ||
                 _pauseReason!.toLowerCase().contains('authoriz') ||
                 _pauseReason!.toLowerCase().contains('401') ||
@@ -358,6 +383,43 @@ class VitalsSyncQueue extends ChangeNotifier {
           notifyListeners();
         }
       }
+    } else {
+      // attributedPatientId is null:
+      // Status is unauthenticated, revoked, or expired/indeterminate without confirmed device binding.
+      if (_activePatientId != null) {
+        _sessionGeneration++;
+        final capturedEpoch = _sessionGeneration;
+        _activePatientId = null;
+        _activeCycleId = null;
+        _isCycleConfirmedByServer = false;
+        _cycleStatus = CycleResolutionStatus.awaitingAuthorization;
+        _isPaused = true;
+        _pauseReason = 'Awaiting authorization: active medical cycle requires user session';
+        _lastSyncError = _pauseReason;
+        cancelScheduledFlush();
+        notifyListeners();
+
+        if (_isInitialized) {
+          _synchronized(() async {
+            await _persist(sessionEpoch: capturedEpoch);
+          }).catchError((e) {
+            final errMsg = 'Persistence error on session disassociation: $e';
+            debugPrint('[VitalsSyncQueue] $errMsg');
+            _isPaused = true;
+            _pauseReason = errMsg;
+            _lastSyncError = errMsg;
+            cancelScheduledFlush();
+            notifyListeners();
+          });
+        }
+      } else {
+        _isCycleConfirmedByServer = false;
+        _cycleStatus = CycleResolutionStatus.awaitingAuthorization;
+        _isPaused = true;
+        _pauseReason = 'Awaiting authorization: active medical cycle requires user session';
+        cancelScheduledFlush();
+        notifyListeners();
+      }
     }
 
     // Handle non-authenticated states (expired, indeterminate refresh, unauthenticated)
@@ -377,7 +439,7 @@ class VitalsSyncQueue extends ChangeNotifier {
       _lastSyncError = _pauseReason;
       cancelScheduledFlush();
       notifyListeners();
-    } else if (manager.status == AuthSessionStatus.unauthenticated && currentSession == null) {
+    } else if (manager.status == AuthSessionStatus.unauthenticated && manager.currentSession == null) {
       _isCycleConfirmedByServer = false;
       _cycleStatus = CycleResolutionStatus.awaitingAuthorization;
       _isPaused = true;
@@ -428,8 +490,19 @@ class VitalsSyncQueue extends ChangeNotifier {
       }
 
       if (modified && _isInitialized) {
-        await _persist();
-        notifyListeners();
+        try {
+          await _persist();
+          notifyListeners();
+        } catch (e) {
+          final errMsg = 'Failed to persist queue snapshot on patient switch: $e';
+          debugPrint('[VitalsSyncQueue] $errMsg');
+          _isPaused = true;
+          _pauseReason = errMsg;
+          _lastSyncError = errMsg;
+          cancelScheduledFlush();
+          notifyListeners();
+          throw VitalsQueuePersistenceException(errMsg, e);
+        }
       }
     });
   }
@@ -644,13 +717,27 @@ class VitalsSyncQueue extends ChangeNotifier {
         return false;
       }
 
-      if (cycle.patientId != null &&
+      if (_patientIsolationEnabled &&
+          (cycle.patientId == null ||
+              expectedPatientId == null ||
+              cycle.patientId != expectedPatientId)) {
+        _isCycleConfirmedByServer = false;
+        _cycleStatus = CycleResolutionStatus.authError;
+        _isPaused = true;
+        _pauseReason = cycle.patientId == null
+            ? 'Cycle resolution rejected: medical cycle lacks patient_id ownership binding'
+            : 'Cycle patient_id mismatch with active session patient (${cycle.patientId} != $expectedPatientId)';
+        _lastSyncError = _pauseReason;
+        notifyListeners();
+        return false;
+      } else if (!_patientIsolationEnabled &&
+          cycle.patientId != null &&
           expectedPatientId != null &&
           cycle.patientId != expectedPatientId) {
         _isCycleConfirmedByServer = false;
         _cycleStatus = CycleResolutionStatus.authError;
         _isPaused = true;
-        _pauseReason = 'Cycle patient_id mismatch with active session patient';
+        _pauseReason = 'Cycle patient_id mismatch with active session patient (${cycle.patientId} != $expectedPatientId)';
         _lastSyncError = _pauseReason;
         notifyListeners();
         return false;
@@ -1131,8 +1218,7 @@ class VitalsSyncQueue extends ChangeNotifier {
         }
 
         // Reconcile disk patient identity with AuthSessionManager / activePatientId
-        final authPatientId = _authSessionManager?.currentSession?.patientId ??
-            _authSessionManager?.lastKnownPatientId;
+        final authPatientId = _authSessionManager?.confirmedAttributionPatientId;
 
         if (authPatientId != null && authPatientId.isNotEmpty) {
           _patientIsolationEnabled = true;
@@ -1160,8 +1246,15 @@ class VitalsSyncQueue extends ChangeNotifier {
             needsSnapshotPersist = true;
           }
         } else if (diskPatientId != null && diskPatientId.isNotEmpty) {
-          _activePatientId = diskPatientId;
-          _patientIsolationEnabled = true;
+          if (_authSessionManager == null) {
+            _activePatientId = diskPatientId;
+            _patientIsolationEnabled = true;
+          } else {
+            // Session manager is unauthenticated or revoked: do NOT restore diskPatientId as active!
+            _activePatientId = null;
+            _patientIsolationEnabled = true;
+            needsSnapshotPersist = true;
+          }
         }
 
         // Quarantine any legacy unassigned pending items when patient isolation is active
@@ -1272,11 +1365,7 @@ class VitalsSyncQueue extends ChangeNotifier {
 
       if (_authSessionManager != null) {
         _patientIsolationEnabled = true;
-        final sessionPatient = _authSessionManager!.currentSession?.patientId ??
-            _authSessionManager!.lastKnownPatientId;
-        if (_activePatientId == null && sessionPatient != null && sessionPatient.isNotEmpty) {
-          _activePatientId = sessionPatient;
-        }
+        _activePatientId = _authSessionManager!.confirmedAttributionPatientId;
       }
 
       final itemPatientId = _activePatientId;
@@ -1327,6 +1416,23 @@ class VitalsSyncQueue extends ChangeNotifier {
         rawMetadata: metadata.isNotEmpty ? metadata : null,
       );
 
+      String? quarantineReason;
+      if (shouldQuarantineUnbound) {
+        if (_authSessionManager != null) {
+          if (_authSessionManager!.status == AuthSessionStatus.unauthenticated) {
+            quarantineReason = 'Quarantined: device unauthenticated or session revoked (R1)';
+          } else if (_authSessionManager!.status == AuthSessionStatus.expired) {
+            quarantineReason = 'Quarantined: session expired without confirmed device binding (R1)';
+          } else if (_authSessionManager!.isRefreshIndeterminate) {
+            quarantineReason = 'Quarantined: indeterminate session refresh without confirmed device binding (R1)';
+          } else {
+            quarantineReason = 'Quarantined: no confirmed patient attribution (R1)';
+          }
+        } else {
+          quarantineReason = 'Quarantined: recorded without active or prior patient_id binding';
+        }
+      }
+
       final queueItem = VitalsQueueItem(
         eventId: eventId,
         idempotencyKey: idempotencyKey,
@@ -1335,9 +1441,7 @@ class VitalsSyncQueue extends ChangeNotifier {
         dto: dto,
         enqueuedAt: DateTime.now(),
         isQuarantined: shouldQuarantineUnbound,
-        lastError: shouldQuarantineUnbound
-            ? 'Quarantined: recorded without active or prior patient_id binding'
-            : null,
+        lastError: quarantineReason,
       );
 
       final prevPending = List<VitalsQueueItem>.from(_pendingItems);

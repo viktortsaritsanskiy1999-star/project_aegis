@@ -44,6 +44,26 @@ class AuthSessionManager extends ChangeNotifier {
     _hasActiveSecureStorageManager = false;
   }
 
+  /// Sets or modifies session state for deterministic test scenarios.
+  @visibleForTesting
+  void setSessionForTesting(
+    AuthSession? session, {
+    AuthSessionStatus? status,
+    bool? isRefreshIndeterminate,
+  }) {
+    _session = session;
+    if (session != null) {
+      _lastKnownPatientId = session.patientId;
+    }
+    if (status != null) {
+      _status = status;
+    }
+    if (isRefreshIndeterminate != null) {
+      _isRefreshIndeterminate = isRefreshIndeterminate;
+    }
+    notifyListeners();
+  }
+
   final IAuthTokenStorage _storage;
   final AegisApiClient _apiClient;
   final Duration refreshSkewBuffer;
@@ -113,6 +133,24 @@ class AuthSessionManager extends ChangeNotifier {
 
   /// Patient ID of the active session, or the last known bound patient ID prior to expiry/revocation.
   String? get lastKnownPatientId => _session?.patientId ?? _lastKnownPatientId;
+
+  /// Returns the confirmed patient ID for local measurement attribution according to Project Aegis R1 policy:
+  /// - [AuthSessionStatus.authenticated]: current session patient ID;
+  /// - [AuthSessionStatus.expired]: prior patient ID if and only if confirmed device binding remains loaded ([currentSession] != null);
+  /// - indeterminate refresh: prior patient ID if and only if confirmed device binding remains loaded ([currentSession] != null);
+  /// - [AuthSessionStatus.unauthenticated] (or revoked): null (enforcing fail-closed quarantine);
+  /// - Unpaired / unconfirmed: null (enforcing fail-closed quarantine).
+  String? get confirmedAttributionPatientId {
+    if (_status == AuthSessionStatus.unauthenticated) {
+      return null;
+    }
+    if (_session != null &&
+        _session!.patientId.trim().isNotEmpty &&
+        _session!.deviceId.trim().isNotEmpty) {
+      return _session!.patientId.trim();
+    }
+    return null;
+  }
 
   /// Whether the manager currently holds an usable authenticated session.
   bool get isAuthenticated =>
@@ -1072,6 +1110,7 @@ class AuthSessionManager extends ChangeNotifier {
       _rateLimitedUntil = null;
       _lastRetryAfter = null;
       _lastError = null;
+      _lastKnownPatientId = null;
 
       try {
         await _storage.clearSession();

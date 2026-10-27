@@ -3269,5 +3269,780 @@ void main() {
 
       apiClient.close();
     });
+
+    // ---------------------------------------------------------
+    // Stage 5.3C-3B-1: Patient Attribution Policy (R1) & D6 + D8 Invariants
+    // ---------------------------------------------------------
+    group('Stage 5.3C-3B-1: Patient Attribution Policy (R1) & D6 + D8 Invariants', () {
+      test('R1-A: Authenticated session attributes measurement to current patient and permits flush', () async {
+        final jwtA = _buildTestJwt(patientId: 'patient_A', deviceId: 'device_A');
+        int postBatchCalls = 0;
+        final mockClient = MockClient((request) async {
+          if (request.url.path == '/api/v1/cycle/current') {
+            return http.Response(json.encode({
+              'cycle_id': 'cycle_A',
+              'patient_id': 'patient_A',
+              'status': 'active',
+              'started_at': DateTime.now().toUtc().toIso8601String(),
+            }), 200);
+          }
+          if (request.url.path == '/api/v1/vitals/batch') {
+            postBatchCalls++;
+            final body = json.decode(request.body) as Map<String, dynamic>;
+            expect(body['cycle_id'], equals('cycle_A'));
+            final items = body['measurements'] as List;
+            expect(items.length, equals(1));
+            return http.Response(json.encode({
+              'accepted': 1,
+              'failed': 0,
+              'quarantined': 0,
+              'recorded': 1,
+              'deduplicated': 0,
+            }), 200);
+          }
+          return http.Response('Not Found', 404);
+        });
+
+        final apiClient = AegisApiClient(
+          baseUrl: 'http://127.0.0.1:8000',
+          client: mockClient,
+        );
+        final storage = InMemoryAuthTokenStorage();
+        final sessionA = AuthSession(
+          accessToken: jwtA,
+          refreshToken: 'rt_patient_A',
+          tokenType: 'Bearer',
+          expiresIn: 3600,
+          expiresAt: DateTime.now().add(const Duration(hours: 1)),
+          refreshExpiresAt: DateTime.now().add(const Duration(days: 30)),
+          deviceId: 'device_A',
+          patientId: 'patient_A',
+          scope: 'vitals:write vitals:read',
+        );
+        await storage.saveSession(sessionA);
+        final manager = AuthSessionManager(
+          apiClient: apiClient,
+          storage: storage,
+        );
+        await manager.initialize();
+
+        final queue = VitalsSyncQueue(
+          apiClient: apiClient,
+          authSessionManager: manager,
+        );
+        await queue.init();
+        await queue.resolveActiveCycle();
+
+        expect(queue.activePatientId, equals('patient_A'));
+        expect(queue.isPaused, isFalse);
+
+        final measurement = HealthMeasurement(
+          timestamp: DateTime.now(),
+          pulse: 75,
+          source: HealthDataSource.watchSensor,
+        );
+        await queue.enqueue(measurement);
+
+        expect(queue.pendingCount, equals(1));
+        expect(queue.quarantinedCount, equals(0));
+        expect(queue.pendingItems.first.patientId, equals('patient_A'));
+        expect(queue.pendingItems.first.isQuarantined, isFalse);
+
+        final result = await queue.flush();
+        expect(result.status, equals(SyncStatus.success));
+        expect(postBatchCalls, equals(1));
+        expect(queue.pendingCount, equals(0));
+
+        queue.dispose();
+        manager.dispose();
+        apiClient.close();
+      });
+
+      test('R1-B1: Expired session with confirmed binding records locally for patient and pauses flush (0 HTTP)', () async {
+        final jwtA = _buildTestJwt(patientId: 'patient_A', deviceId: 'device_A');
+        int postBatchCalls = 0;
+        final mockClient = MockClient((request) async {
+          if (request.url.path == '/api/v1/vitals/batch') {
+            postBatchCalls++;
+            return http.Response('{"detail": "Should not be called"}', 500);
+          }
+          return http.Response('Not Found', 404);
+        });
+
+        final apiClient = AegisApiClient(
+          baseUrl: 'http://127.0.0.1:8000',
+          client: mockClient,
+        );
+        final storage = InMemoryAuthTokenStorage();
+        final sessionA = AuthSession(
+          accessToken: jwtA,
+          refreshToken: 'rt_patient_A',
+          tokenType: 'Bearer',
+          expiresIn: 3600,
+          expiresAt: DateTime.now().add(const Duration(hours: 1)),
+          refreshExpiresAt: DateTime.now().add(const Duration(days: 30)),
+          deviceId: 'device_A',
+          patientId: 'patient_A',
+          scope: 'vitals:write vitals:read',
+        );
+        await storage.saveSession(sessionA);
+        final manager = AuthSessionManager(
+          apiClient: apiClient,
+          storage: storage,
+        );
+        await manager.initialize();
+
+        final queue = VitalsSyncQueue(
+          apiClient: apiClient,
+          authSessionManager: manager,
+        );
+        await queue.init();
+
+        // Transition session to expired
+        manager.setSessionForTesting(sessionA, status: AuthSessionStatus.expired);
+
+        expect(queue.isPaused, isTrue);
+        expect(queue.pauseReason, contains('expired'));
+        expect(queue.activePatientId, equals('patient_A'));
+
+        final measurement = HealthMeasurement(
+          timestamp: DateTime.now(),
+          pulse: 75,
+          source: HealthDataSource.watchSensor,
+        );
+        await queue.enqueue(measurement);
+
+        expect(queue.pendingCount, equals(1));
+        expect(queue.quarantinedCount, equals(0));
+        expect(queue.pendingItems.first.patientId, equals('patient_A'));
+        expect(queue.pendingItems.first.isQuarantined, isFalse);
+
+        final result = await queue.flush();
+        expect(result.status, equals(SyncStatus.paused));
+        expect(postBatchCalls, equals(0));
+        expect(queue.pendingCount, equals(1));
+
+        queue.dispose();
+        manager.dispose();
+        apiClient.close();
+      });
+
+      test('R1-B2: Expired session without confirmed binding quarantines measurement fail-closed', () async {
+        final mockClient = MockClient((request) async => http.Response('Not Found', 404));
+        final apiClient = AegisApiClient(
+          baseUrl: 'http://127.0.0.1:8000',
+          client: mockClient,
+        );
+        final storage = InMemoryAuthTokenStorage();
+        final manager = AuthSessionManager(
+          apiClient: apiClient,
+          storage: storage,
+        );
+        await manager.initialize();
+
+        // Expired without session / device binding
+        manager.setSessionForTesting(null, status: AuthSessionStatus.expired);
+
+        final queue = VitalsSyncQueue(
+          apiClient: apiClient,
+          authSessionManager: manager,
+        );
+        await queue.init();
+
+        expect(queue.activePatientId, isNull);
+        expect(queue.isPaused, isTrue);
+
+        final measurement = HealthMeasurement(
+          timestamp: DateTime.now(),
+          pulse: 72,
+          source: HealthDataSource.watchSensor,
+        );
+        await queue.enqueue(measurement);
+
+        expect(queue.pendingCount, equals(0));
+        expect(queue.quarantinedCount, equals(1));
+        final qItem = queue.quarantinedItems.first;
+        expect(qItem.patientId, isNull);
+        expect(qItem.isQuarantined, isTrue);
+        expect(qItem.lastError, contains('expired without confirmed device binding'));
+
+        queue.dispose();
+        manager.dispose();
+        apiClient.close();
+      });
+
+      test('R1-C: Refresh Indeterminate with confirmed binding records locally and pauses flush (0 HTTP)', () async {
+        final jwtA = _buildTestJwt(patientId: 'patient_A', deviceId: 'device_A');
+        int postBatchCalls = 0;
+        final mockClient = MockClient((request) async {
+          if (request.url.path == '/api/v1/vitals/batch') {
+            postBatchCalls++;
+            return http.Response('{"detail": "Should not be called"}', 500);
+          }
+          return http.Response('Not Found', 404);
+        });
+
+        final apiClient = AegisApiClient(
+          baseUrl: 'http://127.0.0.1:8000',
+          client: mockClient,
+        );
+        final storage = InMemoryAuthTokenStorage();
+        final sessionA = AuthSession(
+          accessToken: jwtA,
+          refreshToken: 'rt_patient_A',
+          tokenType: 'Bearer',
+          expiresIn: 3600,
+          expiresAt: DateTime.now().add(const Duration(hours: 1)),
+          refreshExpiresAt: DateTime.now().add(const Duration(days: 30)),
+          deviceId: 'device_A',
+          patientId: 'patient_A',
+          scope: 'vitals:write vitals:read',
+        );
+        await storage.saveSession(sessionA);
+        final manager = AuthSessionManager(
+          apiClient: apiClient,
+          storage: storage,
+        );
+        await manager.initialize();
+
+        final queue = VitalsSyncQueue(
+          apiClient: apiClient,
+          authSessionManager: manager,
+        );
+        await queue.init();
+
+        manager.setSessionForTesting(sessionA, status: AuthSessionStatus.authenticated, isRefreshIndeterminate: true);
+
+        expect(queue.isPaused, isTrue);
+        expect(queue.pauseReason, contains('indeterminate'));
+        expect(queue.activePatientId, equals('patient_A'));
+
+        final measurement = HealthMeasurement(
+          timestamp: DateTime.now(),
+          pulse: 78,
+          source: HealthDataSource.watchSensor,
+        );
+        await queue.enqueue(measurement);
+
+        expect(queue.pendingCount, equals(1));
+        expect(queue.quarantinedCount, equals(0));
+        expect(queue.pendingItems.first.patientId, equals('patient_A'));
+
+        final result = await queue.flush();
+        expect(result.status, equals(SyncStatus.paused));
+        expect(postBatchCalls, equals(0));
+        expect(queue.pendingCount, equals(1));
+
+        queue.dispose();
+        manager.dispose();
+        apiClient.close();
+      });
+
+      test('R1-D: Revoked session quarantines new measurement and wipes active attribution', () async {
+        final jwtA = _buildTestJwt(patientId: 'patient_A', deviceId: 'device_A');
+        final mockClient = MockClient((request) async {
+          if (request.url.path == '/api/v1/auth/revoke') {
+            return http.Response(json.encode({'status': 'revoked', 'device_id': 'device_A'}), 200);
+          }
+          return http.Response('Not Found', 404);
+        });
+
+        final apiClient = AegisApiClient(
+          baseUrl: 'http://127.0.0.1:8000',
+          client: mockClient,
+        );
+        final storage = InMemoryAuthTokenStorage();
+        final sessionA = AuthSession(
+          accessToken: jwtA,
+          refreshToken: 'rt_patient_A',
+          tokenType: 'Bearer',
+          expiresIn: 3600,
+          expiresAt: DateTime.now().add(const Duration(hours: 1)),
+          refreshExpiresAt: DateTime.now().add(const Duration(days: 30)),
+          deviceId: 'device_A',
+          patientId: 'patient_A',
+          scope: 'vitals:write vitals:read',
+        );
+        await storage.saveSession(sessionA);
+        final manager = AuthSessionManager(
+          apiClient: apiClient,
+          storage: storage,
+        );
+        await manager.initialize();
+
+        final queue = VitalsSyncQueue(
+          apiClient: apiClient,
+          authSessionManager: manager,
+        );
+        await queue.init();
+        expect(queue.activePatientId, equals('patient_A'));
+
+        await manager.revokeSession();
+        expect(manager.status, equals(AuthSessionStatus.unauthenticated));
+        expect(manager.confirmedAttributionPatientId, isNull);
+        expect(queue.activePatientId, isNull);
+        expect(queue.isPaused, isTrue);
+
+        final measurement = HealthMeasurement(
+          timestamp: DateTime.now(),
+          pulse: 80,
+          source: HealthDataSource.watchSensor,
+        );
+        await queue.enqueue(measurement);
+
+        expect(queue.pendingCount, equals(0));
+        expect(queue.quarantinedCount, equals(1));
+        final qItem = queue.quarantinedItems.first;
+        expect(qItem.patientId, isNull);
+        expect(qItem.isQuarantined, isTrue);
+        expect(qItem.lastError, contains('unauthenticated or session revoked'));
+
+        queue.dispose();
+        manager.dispose();
+        apiClient.close();
+      });
+
+      test('R1-E: Unauthenticated prior to pairing quarantines new measurement and never auto-assigns on subsequent pair', () async {
+        final mockClient = MockClient((request) async => http.Response('Not Found', 404));
+        final apiClient = AegisApiClient(
+          baseUrl: 'http://127.0.0.1:8000',
+          client: mockClient,
+        );
+        final storage = InMemoryAuthTokenStorage();
+        final manager = AuthSessionManager(
+          apiClient: apiClient,
+          storage: storage,
+        );
+        await manager.initialize();
+
+        final queue = VitalsSyncQueue(
+          apiClient: apiClient,
+          authSessionManager: manager,
+        );
+        await queue.init();
+
+        expect(queue.activePatientId, isNull);
+
+        final m1 = HealthMeasurement(
+          timestamp: DateTime.now(),
+          pulse: 70,
+          source: HealthDataSource.watchSensor,
+        );
+        await queue.enqueue(m1);
+
+        expect(queue.pendingCount, equals(0));
+        expect(queue.quarantinedCount, equals(1));
+        expect(queue.quarantinedItems.first.patientId, isNull);
+
+        // Now pair device with Patient New
+        final sessionNew = AuthSession(
+          accessToken: _buildTestJwt(patientId: 'patient_New', deviceId: 'device_New'),
+          refreshToken: 'rt_patient_New',
+          tokenType: 'Bearer',
+          expiresIn: 3600,
+          expiresAt: DateTime.now().add(const Duration(hours: 1)),
+          refreshExpiresAt: DateTime.now().add(const Duration(days: 30)),
+          deviceId: 'device_New',
+          patientId: 'patient_New',
+          scope: 'vitals:write vitals:read',
+        );
+        manager.setSessionForTesting(sessionNew, status: AuthSessionStatus.authenticated);
+
+        expect(queue.activePatientId, equals('patient_New'));
+        // Pre-pairing quarantined measurement MUST NOT be assigned to patient_New
+        expect(queue.quarantinedCount, equals(1));
+        expect(queue.quarantinedItems.first.patientId, isNull);
+
+        final m2 = HealthMeasurement(
+          timestamp: DateTime.now(),
+          pulse: 74,
+          source: HealthDataSource.watchSensor,
+        );
+        await queue.enqueue(m2);
+
+        expect(queue.pendingCount, equals(1));
+        expect(queue.pendingItems.first.patientId, equals('patient_New'));
+        expect(queue.quarantinedCount, equals(1));
+
+        queue.dispose();
+        manager.dispose();
+        apiClient.close();
+      });
+
+      test('R1-F: A -> revoke -> B preserves old A pending items, quarantines post-revoke items, and sends only B items on B flush', () async {
+        final jwtA = _buildTestJwt(patientId: 'patient_A', deviceId: 'device_shared');
+        final jwtB = _buildTestJwt(patientId: 'patient_B', deviceId: 'device_shared');
+        final dispatchedItems = <Map<String, dynamic>>[];
+
+        final mockClient = MockClient((request) async {
+          if (request.url.path == '/api/v1/auth/revoke') {
+            return http.Response(json.encode({'status': 'revoked', 'device_id': 'device_shared'}), 200);
+          }
+          if (request.url.path == '/api/v1/cycle/current') {
+            final authHeader = request.headers['authorization'] ?? '';
+            final pid = authHeader.contains(jwtA) ? 'patient_A' : 'patient_B';
+            return http.Response(json.encode({
+              'cycle_id': pid == 'patient_A' ? 'cycle_A' : 'cycle_B',
+              'patient_id': pid,
+              'status': 'active',
+              'started_at': DateTime.now().toUtc().toIso8601String(),
+            }), 200);
+          }
+          if (request.url.path == '/api/v1/vitals/batch') {
+            final body = json.decode(request.body) as Map<String, dynamic>;
+            dispatchedItems.addAll((body['measurements'] as List).cast<Map<String, dynamic>>());
+            return http.Response(json.encode({
+              'accepted': (body['measurements'] as List).length,
+              'failed': 0,
+              'quarantined': 0,
+              'recorded': (body['measurements'] as List).length,
+              'deduplicated': 0,
+            }), 200);
+          }
+          return http.Response('Not Found', 404);
+        });
+
+        final apiClient = AegisApiClient(
+          baseUrl: 'http://127.0.0.1:8000',
+          client: mockClient,
+        );
+        final storage = InMemoryAuthTokenStorage();
+        final sessionA = AuthSession(
+          accessToken: jwtA,
+          refreshToken: 'rt_patient_A',
+          tokenType: 'Bearer',
+          expiresIn: 3600,
+          expiresAt: DateTime.now().add(const Duration(hours: 1)),
+          refreshExpiresAt: DateTime.now().add(const Duration(days: 30)),
+          deviceId: 'device_shared',
+          patientId: 'patient_A',
+          scope: 'vitals:write vitals:read',
+        );
+        await storage.saveSession(sessionA);
+        final manager = AuthSessionManager(
+          apiClient: apiClient,
+          storage: storage,
+        );
+        await manager.initialize();
+
+        final queue = VitalsSyncQueue(
+          apiClient: apiClient,
+          authSessionManager: manager,
+        );
+        await queue.init();
+        await queue.resolveActiveCycle();
+
+        // 1. Enqueue item for Patient A
+        await queue.enqueue(HealthMeasurement(
+          timestamp: DateTime.now(),
+          pulse: 71,
+          source: HealthDataSource.watchSensor,
+        ));
+        expect(queue.pendingCount, equals(1));
+        expect(queue.pendingItems.first.patientId, equals('patient_A'));
+
+        // 2. Revoke session
+        await manager.revokeSession();
+        expect(queue.activePatientId, isNull);
+
+        // 3. Enqueue intermediate item during unauthenticated state
+        await queue.enqueue(HealthMeasurement(
+          timestamp: DateTime.now(),
+          pulse: 72,
+          source: HealthDataSource.watchSensor,
+        ));
+        expect(queue.quarantinedCount, equals(1));
+
+        // 4. Login Patient B
+        final sessionB = AuthSession(
+          accessToken: jwtB,
+          refreshToken: 'rt_patient_B',
+          tokenType: 'Bearer',
+          expiresIn: 3600,
+          expiresAt: DateTime.now().add(const Duration(hours: 1)),
+          refreshExpiresAt: DateTime.now().add(const Duration(days: 30)),
+          deviceId: 'device_shared',
+          patientId: 'patient_B',
+          scope: 'vitals:write vitals:read',
+        );
+        await storage.saveSession(sessionB);
+        manager.setSessionForTesting(sessionB, status: AuthSessionStatus.authenticated);
+
+        expect(queue.activePatientId, equals('patient_B'));
+        await queue.resolveActiveCycle();
+
+        // 5. Enqueue item for Patient B
+        await queue.enqueue(HealthMeasurement(
+          timestamp: DateTime.now(),
+          pulse: 88,
+          source: HealthDataSource.watchSensor,
+        ));
+        expect(queue.pendingCount, equals(2)); // A's item + B's item
+
+        // 6. Flush queue under Patient B session
+        final flushResult = await queue.flush();
+        expect(flushResult.status, equals(SyncStatus.success));
+
+        // Verify ONLY Patient B's item was dispatched!
+        expect(dispatchedItems.length, equals(1));
+        expect(dispatchedItems.first['raw_metadata']['patient_id'], equals('patient_B'));
+
+        // Patient A's pending item remains safely in queue and quarantined item remains quarantined
+        expect(queue.pendingCount, equals(1));
+        expect(queue.pendingItems.first.patientId, equals('patient_A'));
+        expect(queue.quarantinedCount, equals(1));
+
+        queue.dispose();
+        manager.dispose();
+        apiClient.close();
+      });
+
+      test('D6: Persistence error during patient switch transitions queue to fail-closed pause with diagnostic', () async {
+        final customStore = TestSharedPreferencesStore();
+        SharedPreferences.resetStatic();
+        SharedPreferencesStorePlatform.instance = customStore;
+
+        final mockClient = MockClient((request) async => http.Response('ok', 200));
+        final apiClient = AegisApiClient(
+          baseUrl: 'http://127.0.0.1:8000',
+          client: mockClient,
+        );
+
+        final queue = VitalsSyncQueue(
+          apiClient: apiClient,
+          activeCycleId: 'cycle_A',
+          activePatientId: 'patient_A',
+        );
+        await queue.init();
+
+        await queue.enqueue(HealthMeasurement(
+          timestamp: DateTime.now(),
+          pulse: 72,
+          source: HealthDataSource.watchSensor,
+        ));
+        expect(queue.pendingCount, equals(1));
+        expect(queue.isPaused, isFalse);
+
+        // Now inject simulated disk failure
+        customStore.shouldFail = true;
+
+        // Patient switch via setActivePatientId must throw VitalsQueuePersistenceException and fail-closed pause
+        bool threwException = false;
+        try {
+          await queue.setActivePatientId('patient_B');
+        } on VitalsQueuePersistenceException catch (_) {
+          threwException = true;
+        }
+        expect(threwException, isTrue);
+
+        expect(queue.isPaused, isTrue);
+        expect(queue.pauseReason, contains('Failed to persist queue snapshot on patient switch'));
+        expect(queue.lastSyncError, equals(queue.pauseReason));
+
+        // Flush is blocked when paused
+        final flushResult = await queue.flush();
+        expect(flushResult.status, equals(SyncStatus.paused));
+        // Measurement is NOT lost
+        expect(queue.pendingCount, equals(1));
+
+        queue.dispose();
+        apiClient.close();
+      });
+
+      test('D8: Cycle resolution with missing or mismatched patientId transitions queue to authError pause (0 binding)', () async {
+        final jwtA = _buildTestJwt(patientId: 'patient_A', deviceId: 'device_A');
+        String currentCycleResponse = '';
+
+        final mockClient = MockClient((request) async {
+          if (request.url.path == '/api/v1/cycle/current') {
+            return http.Response(currentCycleResponse, 200);
+          }
+          return http.Response('Not Found', 404);
+        });
+
+        final apiClient = AegisApiClient(
+          baseUrl: 'http://127.0.0.1:8000',
+          client: mockClient,
+        );
+        final storage = InMemoryAuthTokenStorage();
+        final sessionA = AuthSession(
+          accessToken: jwtA,
+          refreshToken: 'rt_patient_A',
+          tokenType: 'Bearer',
+          expiresIn: 3600,
+          expiresAt: DateTime.now().add(const Duration(hours: 1)),
+          refreshExpiresAt: DateTime.now().add(const Duration(days: 30)),
+          deviceId: 'device_A',
+          patientId: 'patient_A',
+          scope: 'vitals:write vitals:read',
+        );
+        await storage.saveSession(sessionA);
+        final manager = AuthSessionManager(
+          apiClient: apiClient,
+          storage: storage,
+        );
+        await manager.initialize();
+
+        final queue = VitalsSyncQueue(
+          apiClient: apiClient,
+          authSessionManager: manager,
+        );
+        await queue.init();
+
+        // Case 1: Server returns active cycle WITHOUT patient_id
+        currentCycleResponse = json.encode({
+          'cycle_id': 'cycle_orphan',
+          'status': 'active',
+          'started_at': DateTime.now().toUtc().toIso8601String(),
+        });
+
+        final resolvedMissing = await queue.resolveActiveCycle();
+        expect(resolvedMissing, isFalse);
+        expect(queue.cycleStatus, equals(CycleResolutionStatus.authError));
+        expect(queue.isPaused, isTrue);
+        expect(queue.pauseReason, contains('lacks patient_id ownership binding'));
+        expect(queue.isCycleConfirmedByServer, isFalse);
+        expect(queue.activeCycleId, isNull);
+
+        // Enqueueing during unconfirmed/rejected cycle does not bind cycle_orphan
+        await queue.enqueue(HealthMeasurement(
+          timestamp: DateTime.now(),
+          pulse: 75,
+          source: HealthDataSource.watchSensor,
+        ));
+        expect(queue.pendingItems.first.cycleId, isNull);
+
+        // Case 2: Server returns active cycle with MISMATCHED patient_id (Patient Intruder)
+        currentCycleResponse = json.encode({
+          'cycle_id': 'cycle_intruder',
+          'patient_id': 'patient_intruder',
+          'status': 'active',
+          'started_at': DateTime.now().toUtc().toIso8601String(),
+        });
+
+        final resolvedMismatch = await queue.resolveActiveCycle();
+        expect(resolvedMismatch, isFalse);
+        expect(queue.cycleStatus, equals(CycleResolutionStatus.authError));
+        expect(queue.isPaused, isTrue);
+        expect(queue.pauseReason, contains('mismatch'));
+        expect(queue.isCycleConfirmedByServer, isFalse);
+        expect(queue.activeCycleId, isNull);
+
+        queue.dispose();
+        manager.dispose();
+        apiClient.close();
+      });
+
+      test('D6-Hardening: Session disassociation persistence error pause is NOT cleared by subsequent Patient B auth notification', () async {
+        final customStore = TestSharedPreferencesStore();
+        SharedPreferences.resetStatic();
+        SharedPreferencesStorePlatform.instance = customStore;
+
+        int batchHttpCalls = 0;
+        final jwtA = _buildTestJwt(patientId: 'patient_A', deviceId: 'device_shared');
+        final jwtB = _buildTestJwt(patientId: 'patient_B', deviceId: 'device_shared');
+
+        final mockClient = MockClient((request) async {
+          if (request.url.path == '/api/v1/auth/revoke') {
+            return http.Response(json.encode({'status': 'revoked', 'device_id': 'device_shared'}), 200);
+          }
+          if (request.url.path == '/api/v1/vitals/batch') {
+            batchHttpCalls++;
+            return http.Response('{"detail": "Should never be called"}', 500);
+          }
+          if (request.url.path == '/api/v1/cycle/current') {
+            return http.Response(json.encode({
+              'cycle_id': 'cycle_B',
+              'patient_id': 'patient_B',
+              'status': 'active',
+              'started_at': DateTime.now().toUtc().toIso8601String(),
+            }), 200);
+          }
+          return http.Response('Not Found', 404);
+        });
+
+        final apiClient = AegisApiClient(
+          baseUrl: 'http://127.0.0.1:8000',
+          client: mockClient,
+        );
+        final storage = InMemoryAuthTokenStorage();
+        final sessionA = AuthSession(
+          accessToken: jwtA,
+          refreshToken: 'rt_patient_A',
+          tokenType: 'Bearer',
+          expiresIn: 3600,
+          expiresAt: DateTime.now().add(const Duration(hours: 1)),
+          refreshExpiresAt: DateTime.now().add(const Duration(days: 30)),
+          deviceId: 'device_shared',
+          patientId: 'patient_A',
+          scope: 'vitals:write vitals:read',
+        );
+        await storage.saveSession(sessionA);
+        final manager = AuthSessionManager(
+          apiClient: apiClient,
+          storage: storage,
+        );
+        await manager.initialize();
+
+        final queue = VitalsSyncQueue(
+          apiClient: apiClient,
+          authSessionManager: manager,
+        );
+        await queue.init();
+
+        // Enqueue an item for Patient A
+        await queue.enqueue(HealthMeasurement(
+          timestamp: DateTime.now(),
+          pulse: 71,
+          source: HealthDataSource.watchSensor,
+        ));
+        expect(queue.pendingCount, equals(1));
+        expect(queue.pendingItems.first.patientId, equals('patient_A'));
+
+        // Inject persistence failure
+        customStore.shouldFail = true;
+
+        // Revoke Patient A session - snapshot persistence on session disassociation will fail
+        await manager.revokeSession();
+        await Future<void>.delayed(const Duration(milliseconds: 50));
+
+        // Queue must have transitioned into fail-closed persistence pause
+        expect(queue.isPaused, isTrue);
+        expect(queue.pauseReason, contains('Persistence error on session disassociation'));
+
+        // Now Patient B authenticates
+        final sessionB = AuthSession(
+          accessToken: jwtB,
+          refreshToken: 'rt_patient_B',
+          tokenType: 'Bearer',
+          expiresIn: 3600,
+          expiresAt: DateTime.now().add(const Duration(hours: 1)),
+          refreshExpiresAt: DateTime.now().add(const Duration(days: 30)),
+          deviceId: 'device_shared',
+          patientId: 'patient_B',
+          scope: 'vitals:write vitals:read',
+        );
+        // Even if disk recovers, an auth notification must NEVER silently clear persistence pause
+        customStore.shouldFail = false;
+        manager.setSessionForTesting(sessionB, status: AuthSessionStatus.authenticated);
+
+        // Verification: Auth notification must NOT clear persistence pause
+        expect(queue.isPaused, isTrue);
+        expect(queue.pauseReason, contains('Persistence error on session disassociation'));
+
+        // Attempting to flush while in persistence pause MUST return paused and make 0 HTTP calls
+        final flushResult = await queue.flush();
+        expect(flushResult.status, equals(SyncStatus.paused));
+        expect(batchHttpCalls, equals(0));
+
+        // Pending and quarantined items remain intact
+        expect(queue.pendingCount, equals(1));
+        expect(queue.pendingItems.first.patientId, equals('patient_A'));
+
+        queue.dispose();
+        manager.dispose();
+        apiClient.close();
+      });
+    });
   });
 }
