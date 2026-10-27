@@ -128,8 +128,38 @@ class HealthMeasurement {
 class HealthDataProvider extends ChangeNotifier {
   VaultService _vaultService;
   VitalsMonitorService _vitalsMonitorService;
+
+  VitalsSyncQueue? _syncQueue;
+  VitalsSyncQueue? _observedQueue;
+  bool _isDisposed = false;
+
   /// Optional outbound persistent synchronization queue
-  VitalsSyncQueue? syncQueue;
+  VitalsSyncQueue? get syncQueue => _syncQueue;
+  set syncQueue(VitalsSyncQueue? newQueue) {
+    if (identical(_syncQueue, newQueue)) return;
+    _detachQueueListener();
+    _syncQueue = newQueue;
+    _attachQueueListener(_syncQueue);
+    if (!_isDisposed) {
+      notifyListeners();
+    }
+  }
+
+  void _onQueueChanged() {
+    if (_isDisposed) return;
+    notifyListeners();
+  }
+
+  void _attachQueueListener(VitalsSyncQueue? queue) {
+    if (queue == null) return;
+    _observedQueue = queue;
+    queue.addListener(_onQueueChanged);
+  }
+
+  void _detachQueueListener() {
+    _observedQueue?.removeListener(_onQueueChanged);
+    _observedQueue = null;
+  }
 
   final StreamController<HealthMeasurement> _vitalsStreamController =
       StreamController<HealthMeasurement>.broadcast();
@@ -146,26 +176,41 @@ class HealthDataProvider extends ChangeNotifier {
   bool get enqueueError => _lastEnqueueError != null;
 
   /// Diagnostic status forwarders for testing and monitoring
-  bool get isSyncQueueInitialized => syncQueue?.isInitialized ?? false;
-  int get syncPendingCount => syncQueue?.pendingCount ?? 0;
-  bool get isSyncing => syncQueue?.isSyncing ?? false;
-  bool get isSyncPaused => syncQueue?.isPaused ?? false;
-  String? get lastSyncError => syncQueue?.lastSyncError;
+  bool get isSyncQueueInitialized => _syncQueue?.isInitialized ?? false;
+
+  /// Patient-oriented count of pending items for the currently active patient (R3)
+  int get syncPendingCount => _syncQueue?.activePatientPendingItems.length ?? 0;
+
+  /// Total count of all pending items in the queue across all sessions/patients (diagnostic)
+  int get syncTotalPendingCount => _syncQueue?.pendingCount ?? 0;
+
+  /// Total count of quarantined items in the queue (diagnostic)
+  int get syncQuarantinedCount => _syncQueue?.quarantinedCount ?? 0;
+
+  /// Active patient identity currently bound to the sync queue
+  String? get activePatientId => _syncQueue?.activePatientId;
+
+  /// Current pause reason of the sync queue
+  String? get syncPauseReason => _syncQueue?.pauseReason;
+
+  bool get isSyncing => _syncQueue?.isSyncing ?? false;
+  bool get isSyncPaused => _syncQueue?.isPaused ?? false;
+  String? get lastSyncError => _syncQueue?.lastSyncError;
 
   /// Active medical cycle ID currently bound to the sync queue
-  String? get activeCycleId => syncQueue?.activeCycleId;
+  String? get activeCycleId => _syncQueue?.activeCycleId;
 
   /// Current cycle resolution status of the sync queue
-  CycleResolutionStatus get cycleStatus => syncQueue?.cycleStatus ?? CycleResolutionStatus.idle;
+  CycleResolutionStatus get cycleStatus => _syncQueue?.cycleStatus ?? CycleResolutionStatus.idle;
 
   /// Whether the sync queue is currently waiting for user authorization to resolve medical cycle
-  bool get isAwaitingCycleAuthorization => syncQueue?.isAwaitingAuthorization ?? false;
+  bool get isAwaitingCycleAuthorization => _syncQueue?.isAwaitingAuthorization ?? false;
 
   /// Whether the currently active medical cycle has been confirmed by the server for this session
-  bool get isCycleConfirmedByServer => syncQueue?.isCycleConfirmedByServer ?? false;
+  bool get isCycleConfirmedByServer => _syncQueue?.isCycleConfirmedByServer ?? false;
 
   /// Current session generation counter of the sync queue
-  int get sessionGeneration => syncQueue?.sessionGeneration ?? 0;
+  int get sessionGeneration => _syncQueue?.sessionGeneration ?? 0;
 
   /// The most recent error encountered when attempting to enqueue into syncQueue
   Object? get lastEnqueueError => _lastEnqueueError;
@@ -178,6 +223,7 @@ class HealthDataProvider extends ChangeNotifier {
 
   /// Clears any recorded enqueue error state
   void clearEnqueueError() {
+    if (_isDisposed) return;
     if (_lastEnqueueError != null || _lastEnqueueErrorAt != null) {
       _lastEnqueueError = null;
       _lastEnqueueErrorAt = null;
@@ -194,9 +240,12 @@ class HealthDataProvider extends ChangeNotifier {
   HealthDataProvider({
     required VaultService vaultService,
     required VitalsMonitorService vitalsMonitorService,
-    this.syncQueue,
+    VitalsSyncQueue? syncQueue,
   })  : _vaultService = vaultService,
-        _vitalsMonitorService = vitalsMonitorService;
+        _vitalsMonitorService = vitalsMonitorService,
+        _syncQueue = syncQueue {
+    _attachQueueListener(_syncQueue);
+  }
 
   /// Updates service references on Provider rebuild
   void updateDependencies({
@@ -290,7 +339,9 @@ class HealthDataProvider extends ChangeNotifier {
       }
     }
 
-    notifyListeners();
+    if (!_isDisposed) {
+      notifyListeners();
+    }
     return enqueueSuccess;
   }
 
@@ -334,7 +385,9 @@ class HealthDataProvider extends ChangeNotifier {
       }
     }
 
-    notifyListeners();
+    if (!_isDisposed) {
+      notifyListeners();
+    }
     return enqueueSuccess;
   }
 
@@ -460,6 +513,8 @@ class HealthDataProvider extends ChangeNotifier {
 
   @override
   void dispose() {
+    _isDisposed = true;
+    _detachQueueListener();
     _activeSensorSubscription?.cancel();
     _vitalsStreamController.close();
     super.dispose();

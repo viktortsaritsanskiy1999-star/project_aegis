@@ -701,7 +701,15 @@ class VitalsSyncQueue extends ChangeNotifier {
               identical(_apiClient, client) &&
               (expectedPatientId == null || updatedPatient == expectedPatientId)) {
             token = updatedToken;
-            cycle = await client.getCurrentCycle(accessToken: token);
+            try {
+              cycle = await client.getCurrentCycle(accessToken: token);
+            } on AegisAuthException catch (retryError) {
+              await _authSessionManager!.handleProtectedEndpointError(
+                retryError,
+                alreadyRetried: true,
+              );
+              rethrow;
+            }
           } else {
             rethrow;
           }
@@ -1967,7 +1975,15 @@ class VitalsSyncQueue extends ChangeNotifier {
                   (updatedPatient == expectedPatientId &&
                       (!_patientIsolationEnabled || updatedSub == expectedPatientId)))) {
             currentToken = updatedToken;
-            response = await client.postVitalsBatch(batchDto, accessToken: currentToken);
+            try {
+              response = await client.postVitalsBatch(batchDto, accessToken: currentToken);
+            } on AegisAuthException catch (retryError) {
+              await _authSessionManager!.handleProtectedEndpointError(
+                retryError,
+                alreadyRetried: true,
+              );
+              rethrow;
+            }
           } else {
             rethrow;
           }

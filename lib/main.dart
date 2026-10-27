@@ -16,6 +16,7 @@ import 'widgets/workout_session_modal.dart';
 import 'widgets/emergency_medical_modal.dart';
 import 'services/health_data_provider.dart';
 import 'services/api/aegis_api_client.dart';
+import 'services/auth/auth_session_manager.dart';
 import 'services/sync/vitals_sync_queue.dart';
 
 /// Safe testable TokenProvider abstraction for standard Aegis mobile runtime.
@@ -53,19 +54,26 @@ void main() => runApp(
         previous!..updateTimeService(timeService),
       ),
 
-      // 🔗 HealthDataProvider: Universal health data ingestion
+      // 🔗 AegisApiClient: Production API client
       Provider<AegisApiClient>(
-        create: (_) => AegisApiClient(
-          tokenProvider: standardRuntimeTokenProvider,
-        ),
+        create: (_) => AegisApiClient(),
         dispose: (_, client) => client.close(),
       ),
 
+      // 🔐 AuthSessionManager: Single process-wide session and token manager
+      ChangeNotifierProvider<AuthSessionManager>(
+        create: (context) => AuthSessionManager(
+          apiClient: context.read<AegisApiClient>(),
+        ),
+      ),
+
       // 🔗 Persistent outbound vitals telemetry queue
-      ChangeNotifierProxyProvider<AegisApiClient, VitalsSyncQueue>(
+      ChangeNotifierProvider<VitalsSyncQueue>(
         create: (context) {
           final queue = VitalsSyncQueue(
             apiClient: context.read<AegisApiClient>(),
+            authSessionManager: context.read<AuthSessionManager>(),
+            enforcePatientIsolation: true,
           );
           // Asynchronously restore queue from persistent storage on startup
           // Network errors or backend unavailability MUST NOT crash or block Flutter startup!
@@ -78,25 +86,6 @@ void main() => runApp(
             }
           }).catchError((error) {
             debugPrint('[AegisApp] Warning: VitalsSyncQueue startup restoration failed: $error');
-          });
-          queue.startPeriodicSync();
-          return queue;
-        },
-        update: (context, apiClient, previous) {
-          if (previous != null) {
-            previous.updateApiClient(apiClient);
-            return previous;
-          }
-          final queue = VitalsSyncQueue(apiClient: apiClient);
-          queue.init().then((_) {
-            if (!queue.isCycleConfirmedByServer) {
-              queue.resolveActiveCycle().catchError((error) {
-                debugPrint('[AegisApp] Warning: update cycle resolution check: $error');
-                return false;
-              });
-            }
-          }).catchError((error) {
-            debugPrint('[AegisApp] Warning: VitalsSyncQueue update init failed: $error');
           });
           queue.startPeriodicSync();
           return queue;

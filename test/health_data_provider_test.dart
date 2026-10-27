@@ -7,7 +7,31 @@ import 'package:aegis_health/services/vitals_monitor_service.dart';
 import 'package:aegis_health/services/time_service.dart';
 import 'package:aegis_health/services/athena_trigger_service.dart';
 import 'package:aegis_health/services/aegis_cascade_controller.dart';
+import 'dart:convert';
+import 'package:http/http.dart' as http;
+import 'package:http/testing.dart';
+import 'package:aegis_health/services/api/aegis_api_client.dart';
+import 'package:aegis_health/services/sync/vitals_sync_queue.dart';
+import 'package:aegis_health/services/auth/auth_session_manager.dart';
+import 'package:aegis_health/services/auth/auth_token_storage.dart';
+import 'package:aegis_health/services/auth/auth_models.dart';
 
+
+String _buildTestJwt({
+  String patientId = 'test_patient_52',
+  String deviceId = 'test_device_52',
+}) {
+  final headerJson = json.encode({'alg': 'HS256', 'typ': 'JWT'});
+  final payloadJson = json.encode({
+    'sub': patientId,
+    'did': deviceId,
+    'type': 'access',
+  });
+  final h = base64Url.encode(utf8.encode(headerJson)).replaceAll('=', '');
+  final p = base64Url.encode(utf8.encode(payloadJson)).replaceAll('=', '');
+  const s = 'c2lnbmF0dXJlX2Zha2Vfc2VjcmV0X2FkZHM';
+  return '$h.$p.$s';
+}
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
 
@@ -17,6 +41,7 @@ void main() {
   late HealthDataProvider healthDataProvider;
 
   setUp(() async {
+    AuthSessionManager.resetActiveInstancesForTesting();
     SharedPreferences.setMockInitialValues({});
     timeService = TimeService();
     timeService.resetToRealTime();
@@ -40,6 +65,7 @@ void main() {
   tearDown(() {
     healthDataProvider.dispose();
     vitalsService.dispose();
+    AuthSessionManager.resetActiveInstancesForTesting();
   });
 
   test('1. Explicit source tagging: manual_input is never tagged as watch_sensor', () async {
@@ -272,5 +298,462 @@ void main() {
     await sub.cancel();
     await streamController1.close();
     await streamController2.close();
+  });
+
+  // =========================================================================
+  // Stage 5.3C-3B-2B: HealthDataProvider & VitalsSyncQueue Integration (A-G)
+  // =========================================================================
+  group('Stage 5.3C-3B-2B: HealthDataProvider & VitalsSyncQueue Integration', () {
+    setUp(() {
+      AuthSessionManager.resetActiveInstancesForTesting();
+    });
+
+    tearDown(() {
+      AuthSessionManager.resetActiveInstancesForTesting();
+    });
+
+    test('A. PendingCount: In dual-patient queue, syncPendingCount reflects only active patient items', () async {
+      final jwtA = _buildTestJwt(patientId: 'patient_A', deviceId: 'device_A');
+      final jwtB = _buildTestJwt(patientId: 'patient_B', deviceId: 'device_A');
+
+      final mockClient = MockClient((request) async {
+        if (request.url.path == '/api/v1/cycle/current') {
+          return http.Response(json.encode({
+            'cycle_id': 'cycle_shared',
+            'status': 'active',
+            'started_at': DateTime.now().toUtc().toIso8601String(),
+          }), 200);
+        }
+        return http.Response('Not Found', 404);
+      });
+
+      final apiClient = AegisApiClient(baseUrl: 'http://127.0.0.1:8000', client: mockClient);
+      final storage = InMemoryAuthTokenStorage();
+      final sessionA = AuthSession(
+        accessToken: jwtA,
+        refreshToken: 'rt_A',
+        tokenType: 'Bearer',
+        expiresIn: 3600,
+        expiresAt: DateTime.now().add(const Duration(hours: 1)),
+        refreshExpiresAt: DateTime.now().add(const Duration(days: 30)),
+        deviceId: 'device_A',
+        patientId: 'patient_A',
+        scope: 'vitals:write vitals:read',
+      );
+      await storage.saveSession(sessionA);
+      final manager = AuthSessionManager(apiClient: apiClient, storage: storage);
+      await manager.initialize();
+
+      final queue = VitalsSyncQueue(
+        apiClient: apiClient,
+        authSessionManager: manager,
+        enforcePatientIsolation: true,
+      );
+      await queue.init();
+
+      final provider = HealthDataProvider(
+        vaultService: vaultService,
+        vitalsMonitorService: vitalsService,
+        syncQueue: queue,
+      );
+
+      // Ingest measurement for Patient A
+      await provider.ingestMeasurement(HealthMeasurement(
+        timestamp: DateTime.now(),
+        pulse: 72,
+        source: HealthDataSource.watchSensor,
+      ));
+
+      expect(provider.syncPendingCount, equals(1));
+      expect(provider.syncTotalPendingCount, equals(1));
+      expect(provider.activePatientId, equals('patient_A'));
+
+      // Switch session to Patient B
+      final sessionB = AuthSession(
+        accessToken: jwtB,
+        refreshToken: 'rt_B',
+        tokenType: 'Bearer',
+        expiresIn: 3600,
+        expiresAt: DateTime.now().add(const Duration(hours: 1)),
+        refreshExpiresAt: DateTime.now().add(const Duration(days: 30)),
+        deviceId: 'device_A',
+        patientId: 'patient_B',
+        scope: 'vitals:write vitals:read',
+      );
+      await storage.saveSession(sessionB);
+      manager.setSessionForTesting(sessionB, status: AuthSessionStatus.authenticated);
+
+      // Ingest measurement for Patient B
+      await provider.ingestMeasurement(HealthMeasurement(
+        timestamp: DateTime.now(),
+        pulse: 85,
+        source: HealthDataSource.watchSensor,
+      ));
+
+      // Verification: syncPendingCount strictly counts Patient B only
+      expect(provider.syncPendingCount, equals(1));
+      // Diagnostic total includes both A and B
+      expect(provider.syncTotalPendingCount, equals(2));
+      expect(provider.activePatientId, equals('patient_B'));
+
+      provider.dispose();
+      queue.dispose();
+      manager.dispose();
+      apiClient.close();
+    });
+
+    test('B. QuarantineCount: Revocation sends subsequent measurements to quarantine and updates syncQuarantinedCount', () async {
+      final jwtB = _buildTestJwt(patientId: 'patient_B_user', deviceId: 'device_B');
+      final mockClient = MockClient((request) async => http.Response('Not Found', 404));
+      final apiClient = AegisApiClient(baseUrl: 'http://127.0.0.1:8000', client: mockClient);
+      final storage = InMemoryAuthTokenStorage();
+      final sessionB = AuthSession(
+        accessToken: jwtB,
+        refreshToken: 'rt_B',
+        tokenType: 'Bearer',
+        expiresIn: 3600,
+        expiresAt: DateTime.now().add(const Duration(hours: 1)),
+        refreshExpiresAt: DateTime.now().add(const Duration(days: 30)),
+        deviceId: 'device_B',
+        patientId: 'patient_B_user',
+        scope: 'vitals:write vitals:read',
+      );
+      await storage.saveSession(sessionB);
+      final manager = AuthSessionManager(apiClient: apiClient, storage: storage);
+      await manager.initialize();
+
+      final queue = VitalsSyncQueue(
+        apiClient: apiClient,
+        authSessionManager: manager,
+        enforcePatientIsolation: true,
+      );
+      await queue.init();
+
+      final provider = HealthDataProvider(
+        vaultService: vaultService,
+        vitalsMonitorService: vitalsService,
+        syncQueue: queue,
+      );
+      expect(provider.syncQuarantinedCount, equals(0));
+
+      // Revoke session -> unauthenticated
+      manager.setSessionForTesting(null, status: AuthSessionStatus.unauthenticated);
+      expect(provider.activePatientId, isNull);
+
+      // Ingest measurement while unauthenticated
+      final success = await provider.ingestMeasurement(HealthMeasurement(
+        timestamp: DateTime.now(),
+        pulse: 78,
+        source: HealthDataSource.watchSensor,
+      ));
+
+      expect(success, isTrue); // offline-first succeeds
+      expect(provider.syncQuarantinedCount, equals(1));
+      expect(provider.syncPendingCount, equals(0));
+      expect(provider.syncPauseReason, contains('Awaiting authorization'));
+
+      provider.dispose();
+      queue.dispose();
+      manager.dispose();
+      apiClient.close();
+    });
+
+    test('C. Queue Notification: Successful flush updates counters on HealthDataProvider without new ingest', () async {
+      final jwtC = _buildTestJwt(patientId: 'patient_C', deviceId: 'device_C');
+      final mockClient = MockClient((request) async {
+        if (request.url.path == '/api/v1/cycle/current') {
+          return http.Response(json.encode({
+            'cycle_id': 'cycle_C',
+            'patient_id': 'patient_C',
+            'status': 'active',
+            'started_at': DateTime.now().toUtc().toIso8601String(),
+          }), 200);
+        }
+        if (request.url.path == '/api/v1/vitals/batch') {
+          return http.Response(json.encode({
+            'accepted': 1,
+            'failed': 0,
+            'quarantined': 0,
+            'recorded': 1,
+            'deduplicated': 0,
+          }), 200);
+        }
+        return http.Response('Not Found', 404);
+      });
+
+      final apiClient = AegisApiClient(baseUrl: 'http://127.0.0.1:8000', client: mockClient);
+      final storage = InMemoryAuthTokenStorage();
+      final sessionC = AuthSession(
+        accessToken: jwtC,
+        refreshToken: 'rt_C',
+        tokenType: 'Bearer',
+        expiresIn: 3600,
+        expiresAt: DateTime.now().add(const Duration(hours: 1)),
+        refreshExpiresAt: DateTime.now().add(const Duration(days: 30)),
+        deviceId: 'device_C',
+        patientId: 'patient_C',
+        scope: 'vitals:write vitals:read',
+      );
+      await storage.saveSession(sessionC);
+      final manager = AuthSessionManager(apiClient: apiClient, storage: storage);
+      await manager.initialize();
+
+      final queue = VitalsSyncQueue(
+        apiClient: apiClient,
+        authSessionManager: manager,
+        enforcePatientIsolation: true,
+      );
+      await queue.init();
+      await queue.resolveActiveCycle();
+
+      final provider = HealthDataProvider(
+        vaultService: vaultService,
+        vitalsMonitorService: vitalsService,
+        syncQueue: queue,
+      );
+
+      await provider.ingestMeasurement(HealthMeasurement(
+        timestamp: DateTime.now(),
+        pulse: 74,
+        source: HealthDataSource.watchSensor,
+      ));
+      expect(provider.syncPendingCount, equals(1));
+
+      int providerNotificationCount = 0;
+      provider.addListener(() => providerNotificationCount++);
+
+      // Flush directly on queue
+      final flushResult = await queue.flush();
+      expect(flushResult.status, equals(SyncStatus.success));
+
+      // Verification: provider pendingCount is now 0 and provider received notification
+      expect(provider.syncPendingCount, equals(0));
+      expect(providerNotificationCount, greaterThan(0));
+
+      provider.dispose();
+      queue.dispose();
+      manager.dispose();
+      apiClient.close();
+    });
+
+    test('D. Patient Switch: A -> B updates activePatientId and visible indicators', () async {
+      final jwtD1 = _buildTestJwt(patientId: 'patient_D1', deviceId: 'device_D');
+      final jwtD2 = _buildTestJwt(patientId: 'patient_D2', deviceId: 'device_D');
+
+      final mockClient = MockClient((request) async => http.Response('Not Found', 404));
+      final apiClient = AegisApiClient(baseUrl: 'http://127.0.0.1:8000', client: mockClient);
+      final storage = InMemoryAuthTokenStorage();
+      final sessionD1 = AuthSession(
+        accessToken: jwtD1,
+        refreshToken: 'rt_D1',
+        tokenType: 'Bearer',
+        expiresIn: 3600,
+        expiresAt: DateTime.now().add(const Duration(hours: 1)),
+        refreshExpiresAt: DateTime.now().add(const Duration(days: 30)),
+        deviceId: 'device_D',
+        patientId: 'patient_D1',
+        scope: 'vitals:write vitals:read',
+      );
+      await storage.saveSession(sessionD1);
+      final manager = AuthSessionManager(apiClient: apiClient, storage: storage);
+      await manager.initialize();
+
+      final queue = VitalsSyncQueue(
+        apiClient: apiClient,
+        authSessionManager: manager,
+        enforcePatientIsolation: true,
+      );
+      await queue.init();
+
+      final provider = HealthDataProvider(
+        vaultService: vaultService,
+        vitalsMonitorService: vitalsService,
+        syncQueue: queue,
+      );
+
+      await provider.ingestMeasurement(HealthMeasurement(
+        timestamp: DateTime.now(),
+        pulse: 70,
+        source: HealthDataSource.watchSensor,
+      ));
+      await provider.ingestMeasurement(HealthMeasurement(
+        timestamp: DateTime.now(),
+        pulse: 71,
+        source: HealthDataSource.watchSensor,
+      ));
+
+      expect(provider.activePatientId, equals('patient_D1'));
+      expect(provider.syncPendingCount, equals(2));
+
+      int notifyCount = 0;
+      provider.addListener(() => notifyCount++);
+
+      // Switch patient
+      final sessionD2 = AuthSession(
+        accessToken: jwtD2,
+        refreshToken: 'rt_D2',
+        tokenType: 'Bearer',
+        expiresIn: 3600,
+        expiresAt: DateTime.now().add(const Duration(hours: 1)),
+        refreshExpiresAt: DateTime.now().add(const Duration(days: 30)),
+        deviceId: 'device_D',
+        patientId: 'patient_D2',
+        scope: 'vitals:write vitals:read',
+      );
+      await storage.saveSession(sessionD2);
+      manager.setSessionForTesting(sessionD2, status: AuthSessionStatus.authenticated);
+
+      // Verification: provider notified, patient updated, pending count reflects new patient
+      expect(notifyCount, greaterThan(0));
+      expect(provider.activePatientId, equals('patient_D2'));
+      expect(provider.syncPendingCount, equals(0));
+      expect(provider.syncTotalPendingCount, equals(2));
+
+      provider.dispose();
+      queue.dispose();
+      manager.dispose();
+      apiClient.close();
+    });
+
+    test('E. Dispose: Disposed HealthDataProvider removes queue listener and receives no notifications', () async {
+      final mockClient = MockClient((request) async => http.Response('Not Found', 404));
+      final apiClient = AegisApiClient(baseUrl: 'http://127.0.0.1:8000', client: mockClient);
+      final queue = VitalsSyncQueue(apiClient: apiClient);
+      await queue.init();
+
+      final provider = HealthDataProvider(
+        vaultService: vaultService,
+        vitalsMonitorService: vitalsService,
+        syncQueue: queue,
+      );
+
+      int notificationCount = 0;
+      provider.addListener(() => notificationCount++);
+
+      provider.dispose();
+
+      // Queue notifies listeners
+      await queue.enqueue(HealthMeasurement(
+        timestamp: DateTime.now(),
+        pulse: 75,
+        source: HealthDataSource.watchSensor,
+      ));
+
+      // Disposed provider must not trigger listener or throw
+      expect(notificationCount, equals(0));
+
+      queue.dispose();
+      apiClient.close();
+    });
+
+    test('F. Queue Rebinding: Replacing queue detaches old listener and attaches new listener', () async {
+      final mockClient = MockClient((request) async => http.Response('Not Found', 404));
+      final client1 = AegisApiClient(baseUrl: 'http://127.0.0.1:8000', client: mockClient);
+      final client2 = AegisApiClient(baseUrl: 'http://127.0.0.1:8000', client: mockClient);
+
+      final queue1 = VitalsSyncQueue(apiClient: client1);
+      await queue1.init();
+      final queue2 = VitalsSyncQueue(apiClient: client2);
+      await queue2.init();
+
+      final provider = HealthDataProvider(
+        vaultService: vaultService,
+        vitalsMonitorService: vitalsService,
+        syncQueue: queue1,
+      );
+
+      int notificationCount = 0;
+      provider.addListener(() => notificationCount++);
+
+      // Re-bind to queue2 via updateDependencies
+      provider.updateDependencies(
+        vaultService: vaultService,
+        vitalsMonitorService: vitalsService,
+        syncQueue: queue2,
+      );
+
+      // Re-binding notifies provider listeners
+      final countAfterRebind = notificationCount;
+      expect(countAfterRebind, greaterThan(0));
+
+      // queue1 notification must NOT affect provider
+      await queue1.enqueue(HealthMeasurement(
+        timestamp: DateTime.now(),
+        pulse: 65,
+        source: HealthDataSource.watchSensor,
+      ));
+      expect(notificationCount, equals(countAfterRebind));
+
+      // queue2 notification MUST affect provider
+      await queue2.enqueue(HealthMeasurement(
+        timestamp: DateTime.now(),
+        pulse: 75,
+        source: HealthDataSource.watchSensor,
+      ));
+      expect(notificationCount, greaterThan(countAfterRebind));
+
+      provider.dispose();
+      queue1.dispose();
+      queue2.dispose();
+      client1.close();
+      client2.close();
+    });
+
+    test('G. Offline: Without auth, measurements persist to VaultService and VitalsMonitorService with 0 network calls', () async {
+      int httpCalls = 0;
+      final mockClient = MockClient((request) async {
+        httpCalls++;
+        return http.Response('Unexpected request', 500);
+      });
+      final apiClient = AegisApiClient(baseUrl: 'http://127.0.0.1:8000', client: mockClient);
+      final storage = InMemoryAuthTokenStorage();
+      final manager = AuthSessionManager(apiClient: apiClient, storage: storage);
+
+      final queue = VitalsSyncQueue(
+        apiClient: apiClient,
+        authSessionManager: manager,
+        enforcePatientIsolation: true,
+      );
+      await queue.init();
+
+      final provider = HealthDataProvider(
+        vaultService: vaultService,
+        vitalsMonitorService: vitalsService,
+        syncQueue: queue,
+      );
+
+      expect(provider.activePatientId, isNull);
+      expect(provider.isSyncPaused, isTrue);
+
+      final initialVaultCount = vaultService.getHeartRateSamples().length;
+
+      // Ingest measurement without session
+      final measurement = HealthMeasurement(
+        timestamp: DateTime.now(),
+        pulse: 88,
+        systolic: 125,
+        diastolic: 82,
+        source: HealthDataSource.manualInput,
+      );
+      final success = await provider.ingestMeasurement(measurement);
+
+      // Verification:
+      // 1. Ingestion succeeds
+      expect(success, isTrue);
+      // 2. Persisted to Vault
+      expect(vaultService.getHeartRateSamples().length, equals(initialVaultCount + 1));
+      expect(vaultService.systolic, equals(125));
+      expect(vaultService.diastolic, equals(82));
+      // 3. Quarantined in queue (R1)
+      expect(provider.syncQuarantinedCount, equals(1));
+      expect(provider.syncPendingCount, equals(0));
+      // 4. Zero HTTP calls executed
+      expect(httpCalls, equals(0));
+
+      provider.dispose();
+      queue.dispose();
+      manager.dispose();
+      apiClient.close();
+    });
   });
 }
