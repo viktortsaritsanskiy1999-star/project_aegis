@@ -51,6 +51,7 @@ class AuthSessionManager extends ChangeNotifier {
   final Future<bool> Function()? _connectivityCheck;
 
   AuthSession? _session;
+  String? _lastKnownPatientId;
   AuthSessionStatus _status = AuthSessionStatus.unauthenticated;
   bool _isRefreshIndeterminate = false;
   DateTime? _rateLimitedUntil;
@@ -58,6 +59,10 @@ class AuthSessionManager extends ChangeNotifier {
   AegisApiException? _lastError;
   SecureStorageUnavailableException? _lastStorageError;
   bool _isDisposed = false;
+  bool _isInitialized = false;
+  Future<AuthSession?>? _initFuture;
+  bool _boundTokenProviderToClient = false;
+  Future<String?> Function()? _boundTokenProvider;
 
   /// Single-flight lock ensuring concurrent callers share a single `POST /api/v1/auth/refresh` call.
   Completer<String>? _inFlightRefreshCompleter;
@@ -86,13 +91,28 @@ class AuthSessionManager extends ChangeNotifier {
     if (_storage is SecureAuthTokenStorage) {
       _hasActiveSecureStorageManager = true;
     }
+    if (_apiClient.tokenProvider == null) {
+      _boundTokenProvider = getValidAccessToken;
+      _apiClient.bindTokenProvider(_boundTokenProvider);
+      _boundTokenProviderToClient = true;
+    }
+    _apiClient.attachSessionManager(this);
   }
+
+  /// Underlying HTTP client bound to this session manager.
+  AegisApiClient get apiClient => _apiClient;
+
+  /// Whether [initialize] or [loadSession] or [pairDevice] has completed at least once.
+  bool get isInitialized => _isInitialized;
 
   /// Current session state.
   AuthSessionStatus get status => _status;
 
   /// Current loaded or paired session metadata, if available.
   AuthSession? get currentSession => _session;
+
+  /// Patient ID of the active session, or the last known bound patient ID prior to expiry/revocation.
+  String? get lastKnownPatientId => _session?.patientId ?? _lastKnownPatientId;
 
   /// Whether the manager currently holds an usable authenticated session.
   bool get isAuthenticated =>
@@ -165,6 +185,33 @@ class AuthSessionManager extends ChangeNotifier {
     }
 
     return true;
+  }
+
+  /// Extracts the `sub` claim from a valid mobile access token JWT,
+  /// or returns `null` if [token] is not a valid mobile JWT or lacks a non-empty `sub` claim.
+  /// If both `sub` and `patient_id` claims are present, they must be consistent.
+  static String? extractPatientIdFromJwt(String? token) {
+    if (token == null || !isValidMobileAccessTokenJwt(token)) return null;
+    try {
+      final parts = token.trim().split('.');
+      final payloadBytes = base64Url.decode(base64Url.normalize(parts[1]));
+      final payloadMap = json.decode(utf8.decode(payloadBytes));
+      if (payloadMap is Map<String, dynamic>) {
+        final sub = payloadMap['sub'];
+        if (sub is! String || sub.trim().isEmpty) {
+          return null;
+        }
+        final cleanSub = sub.trim();
+        final patientId = payloadMap['patient_id'];
+        if (patientId is String && patientId.trim().isNotEmpty) {
+          if (patientId.trim() != cleanSub) {
+            return null; // Inconsistent claims
+          }
+        }
+        return cleanSub;
+      }
+    } catch (_) {}
+    return null;
   }
 
   void _registerActiveDevice(String deviceId) {
@@ -244,13 +291,31 @@ class AuthSessionManager extends ChangeNotifier {
   }
 
   /// Loads any persisted [AuthSession] from [IAuthTokenStorage] on startup.
-  Future<AuthSession?> initialize() => loadSession();
+  /// Concurrent calls while initialization is in flight share the same [Future].
+  Future<AuthSession?> initialize() {
+    if (_initFuture != null) return _initFuture!;
+    final future = loadSession();
+    _initFuture = future;
+    future.whenComplete(() {
+      if (identical(_initFuture, future)) {
+        _initFuture = null;
+      }
+    }).ignore();
+    return future;
+  }
 
   /// Loads and validates the stored [AuthSession] from [IAuthTokenStorage].
   /// Detects and blocks any refresh token that was left in-flight from a prior process run.
   Future<AuthSession?> loadSession() async {
     _ensureNotDisposed();
+    try {
+      return await _loadSessionInternal();
+    } finally {
+      _isInitialized = true;
+    }
+  }
 
+  Future<AuthSession?> _loadSessionInternal() async {
     // 1. Check for persistent in-flight refresh record from prior run
     RefreshInFlightRecord? inFlightRecord;
     try {
@@ -336,6 +401,7 @@ class AuthSessionManager extends ChangeNotifier {
 
     _registerActiveDevice(stored.deviceId);
     _session = stored;
+    _lastKnownPatientId = stored.patientId;
 
     final now = _nowProvider().toUtc();
 
@@ -461,6 +527,8 @@ class AuthSessionManager extends ChangeNotifier {
       }
 
       _session = newSession;
+      _lastKnownPatientId = newSession.patientId;
+      _isInitialized = true;
       _status = AuthSessionStatus.authenticated;
       _isRefreshIndeterminate = false;
       _rateLimitedUntil = null;
@@ -1072,6 +1140,14 @@ class AuthSessionManager extends ChangeNotifier {
   void dispose() {
     if (!_isDisposed) {
       _isDisposed = true;
+      if (_boundTokenProviderToClient &&
+          _boundTokenProvider != null &&
+          identical(_apiClient.tokenProvider, _boundTokenProvider)) {
+        _apiClient.bindTokenProvider(null);
+      }
+      if (identical(_apiClient.attachedSessionManager, this)) {
+        _apiClient.attachSessionManager(null);
+      }
       _activeStorages.remove(_storage);
       if (_storage is SecureAuthTokenStorage) {
         _hasActiveSecureStorageManager = false;

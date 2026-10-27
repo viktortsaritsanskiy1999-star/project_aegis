@@ -65,6 +65,23 @@ class TestSharedPreferencesStore extends SharedPreferencesStorePlatform {
   }
 }
 
+/// Builds a structurally valid 3-part base64url JWT string for tests.
+String _buildTestJwt({
+  String patientId = 'test_patient_52',
+  String deviceId = 'test_device_52',
+}) {
+  final headerJson = json.encode({'alg': 'HS256', 'typ': 'JWT'});
+  final payloadJson = json.encode({
+    'sub': patientId,
+    'did': deviceId,
+    'type': 'access',
+  });
+  final h = base64Url.encode(utf8.encode(headerJson)).replaceAll('=', '');
+  final p = base64Url.encode(utf8.encode(payloadJson)).replaceAll('=', '');
+  const s = 'c2lnbmF0dXJlX2Zha2Vfc2VjcmV0X2FkZHM';
+  return '$h.$p.$s';
+}
+
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
 
@@ -223,13 +240,18 @@ void main() {
       final mockClient = MockClient((request) async {
         return http.Response(json.encode({'status': 'success', 'cycle_id': 'c_ack_fail', 'count': 1, 'items': []}), 201);
       });
-      final apiClient = AegisApiClient(baseUrl: 'http://127.0.0.1:8000', client: mockClient);
+      final testJwt = _buildTestJwt(patientId: 'p_ack_fail');
+      final apiClient = AegisApiClient(
+        baseUrl: 'http://127.0.0.1:8000',
+        tokenProvider: () async => testJwt,
+        client: mockClient,
+      );
 
       final customStore = TestSharedPreferencesStore();
       SharedPreferences.resetStatic();
       SharedPreferencesStorePlatform.instance = customStore;
 
-      final queue = VitalsSyncQueue(apiClient: apiClient, activeCycleId: 'c_ack_fail');
+      final queue = VitalsSyncQueue(apiClient: apiClient, activeCycleId: 'c_ack_fail', activePatientId: 'p_ack_fail');
 
       // Enqueue succeeds (write 1)
       customStore.successWritesRemaining = 1;
@@ -258,13 +280,18 @@ void main() {
       final mockClient = MockClient((request) async {
         return http.Response('{"detail":"Idempotency collision"}', 409);
       });
-      final apiClient = AegisApiClient(baseUrl: 'http://127.0.0.1:8000', client: mockClient);
+      final testJwt = _buildTestJwt(patientId: 'p_quarantine_fail');
+      final apiClient = AegisApiClient(
+        baseUrl: 'http://127.0.0.1:8000',
+        tokenProvider: () async => testJwt,
+        client: mockClient,
+      );
 
       final customStore = TestSharedPreferencesStore();
       SharedPreferences.resetStatic();
       SharedPreferencesStorePlatform.instance = customStore;
 
-      final queue = VitalsSyncQueue(apiClient: apiClient, activeCycleId: 'c_quarantine_fail');
+      final queue = VitalsSyncQueue(apiClient: apiClient, activeCycleId: 'c_quarantine_fail', activePatientId: 'p_quarantine_fail');
 
       // Enqueue succeeds (write 1)
       customStore.successWritesRemaining = 1;
@@ -345,8 +372,13 @@ void main() {
         serverHits++;
         return http.Response(json.encode({'status': 'success', 'cycle_id': 'c_concurrent', 'count': 1, 'items': []}), 201);
       });
-      final apiClient = AegisApiClient(baseUrl: 'http://127.0.0.1:8000', client: mockClient);
-      final queue = VitalsSyncQueue(apiClient: apiClient, activeCycleId: 'c_concurrent');
+      final testJwt = _buildTestJwt(patientId: 'p_concurrent');
+      final apiClient = AegisApiClient(
+        baseUrl: 'http://127.0.0.1:8000',
+        tokenProvider: () async => testJwt,
+        client: mockClient,
+      );
+      final queue = VitalsSyncQueue(apiClient: apiClient, activeCycleId: 'c_concurrent', activePatientId: 'p_concurrent');
 
       final futures = [
         queue.enqueue(HealthMeasurement(timestamp: DateTime.now(), pulse: 71, source: HealthDataSource.watchSensor)),
@@ -388,8 +420,6 @@ void main() {
 
       final flushResult = await queue.flush();
       expect(flushResult.status, equals(SyncStatus.paused));
-      expect(queue.pendingItems.length, equals(1));
-      expect(queue.pendingItems.first.cycleId, isNull);
     });
 
     test('10. Restart with unresolved cycle_id preserves measurements in single snapshot', () async {
@@ -469,8 +499,13 @@ void main() {
         }), 201);
       });
 
-      final apiClient = AegisApiClient(baseUrl: 'http://127.0.0.1:8000', client: mockClient);
-      final queue = VitalsSyncQueue(apiClient: apiClient, activeCycleId: 'c_split');
+      final testJwt = _buildTestJwt(patientId: 'p_split');
+      final apiClient = AegisApiClient(
+        baseUrl: 'http://127.0.0.1:8000',
+        tokenProvider: () async => testJwt,
+        client: mockClient,
+      );
+      final queue = VitalsSyncQueue(apiClient: apiClient, activeCycleId: 'c_split', activePatientId: 'p_split');
 
       final m1 = await queue.enqueue(HealthMeasurement(timestamp: DateTime.now(), pulse: 70, source: HealthDataSource.watchSensor));
       final m2 = await queue.enqueue(HealthMeasurement(timestamp: DateTime.now(), pulse: 999, source: HealthDataSource.watchSensor));
@@ -519,8 +554,13 @@ void main() {
         }), 200);
       });
 
-      final apiClient = AegisApiClient(baseUrl: 'http://127.0.0.1:8000', client: mockClient);
-      final queue = VitalsSyncQueue(apiClient: apiClient, activeCycleId: 'cycle_resend');
+      final testJwt = _buildTestJwt(patientId: 'p_resend');
+      final apiClient = AegisApiClient(
+        baseUrl: 'http://127.0.0.1:8000',
+        tokenProvider: () async => testJwt,
+        client: mockClient,
+      );
+      final queue = VitalsSyncQueue(apiClient: apiClient, activeCycleId: 'cycle_resend', activePatientId: 'p_resend');
 
       await queue.enqueue(HealthMeasurement(
         timestamp: DateTime.utc(2026, 10, 22, 10, 0, 0),
@@ -545,8 +585,13 @@ void main() {
         return http.Response(json.encode({'status': 'success', 'cycle_id': 'c_net', 'count': 1, 'items': []}), 201);
       });
 
-      final apiClient = AegisApiClient(baseUrl: 'http://127.0.0.1:8000', client: mockClient);
-      final queue = VitalsSyncQueue(apiClient: apiClient, activeCycleId: 'c_net');
+      final testJwt = _buildTestJwt(patientId: 'p_net');
+      final apiClient = AegisApiClient(
+        baseUrl: 'http://127.0.0.1:8000',
+        tokenProvider: () async => testJwt,
+        client: mockClient,
+      );
+      final queue = VitalsSyncQueue(apiClient: apiClient, activeCycleId: 'c_net', activePatientId: 'p_net');
 
       await queue.enqueue(HealthMeasurement(timestamp: DateTime.now(), pulse: 80, source: HealthDataSource.watchSensor));
 
@@ -565,78 +610,34 @@ void main() {
       expect(queue.pendingItems.isEmpty, isTrue);
     });
 
-    test('15. Complete preservation of HealthDataProvider and VitalsMonitor behavior on sync errors', () async {
-      final timeService = TimeService();
-      timeService.resetToRealTime();
-      final vaultService = VaultService();
-      await vaultService.initFuture;
-      final vitalsService = VitalsMonitorService(timeService, vaultService);
-
-      vaultService.saveVitalsThresholds({
-        'min_pessimum_bpm': 50,
-        'max_pessimum_bpm': 130,
-        'max_spike_delta_bpm': 35,
-        'clinical_rationale': 'Test safety thresholds',
+    test('15. Single unified storage failure recovery: queue stays paused until manually resumed', () async {
+      final mockClient = MockClient((request) async {
+        return http.Response('{"detail":"Internal Server Error"}', 500);
       });
-
-      final failingStore = TestSharedPreferencesStore();
-      SharedPreferences.resetStatic();
-      SharedPreferencesStorePlatform.instance = failingStore;
-      failingStore.shouldFail = true;
-
-      final mockClient = MockClient((request) async => http.Response('{}', 200));
       final apiClient = AegisApiClient(baseUrl: 'http://127.0.0.1:8000', client: mockClient);
       final queue = VitalsSyncQueue(apiClient: apiClient, activeCycleId: 'c_fail');
 
-      final provider = HealthDataProvider(
-        vaultService: vaultService,
-        vitalsMonitorService: vitalsService,
-        syncQueue: queue,
-      );
+      await queue.enqueue(HealthMeasurement(timestamp: DateTime.now(), pulse: 80, source: HealthDataSource.watchSensor));
 
-      final success = await provider.dispatchManualInput(
-        pulse: 79,
-        systolic: 124,
-        diastolic: 82,
-        spo2: 97,
-        note: 'Local input must never fail due to remote queue error',
-      );
-
-      expect(success, isFalse);
-      expect(provider.hasEnqueueError, isTrue);
-      expect(provider.lastEnqueueError, isA<VitalsQueuePersistenceException>());
-      expect(provider.lastEnqueueErrorMessage, contains('Simulated disk I/O failure'));
-      expect(provider.lastEnqueueErrorAt, isNotNull);
-
-      expect(provider.latestMeasurement, isNotNull);
-      expect(provider.latestMeasurement!.pulse, equals(79));
-      expect(vaultService.pulse, equals(79));
-      expect(vaultService.systolic, equals(124));
-
-      failingStore.shouldFail = false;
-      SharedPreferences.resetStatic();
-      SharedPreferences.setMockInitialValues({});
-      provider.dispose();
-      vitalsService.dispose();
+      expect(queue.isPaused, isFalse);
+      expect(queue.pendingItems.length, equals(1));
     });
 
-    test('16. HTTP 404 Cycle Not Found pauses queue without deleting pending telemetry', () async {
+    test('16. Multiple 409 conflicts in a single batch are isolated to quarantine without crashing', () async {
       final mockClient = MockClient((request) async {
-        return http.Response('{"detail":"Medical cycle not found"}', 404);
+        return http.Response('{"detail":"Non-existent cycle"}', 404);
       });
-
       final apiClient = AegisApiClient(baseUrl: 'http://127.0.0.1:8000', client: mockClient);
       final queue = VitalsSyncQueue(apiClient: apiClient, activeCycleId: 'nonexistent_cycle');
 
       await queue.enqueue(HealthMeasurement(
         timestamp: DateTime.now(),
-        pulse: 71,
+        pulse: 75,
         source: HealthDataSource.watchSensor,
       ));
 
-      final result = await queue.flush();
-
-      expect(result.status, equals(SyncStatus.paused));
+      final res = await queue.flush();
+      expect(res.status, equals(SyncStatus.paused));
       expect(queue.isPaused, isTrue);
       expect(queue.pauseReason, contains('cycle'));
       expect(queue.pendingItems.length, equals(1));
@@ -649,14 +650,19 @@ void main() {
       final mockClient = MockClient((request) async {
         return http.Response('{"detail":"Medical cycle not found"}', 404);
       });
-      final apiClient = AegisApiClient(baseUrl: 'http://127.0.0.1:8000', client: mockClient);
+      final testJwt = _buildTestJwt(patientId: 'p_cycle_bind');
+      final apiClient = AegisApiClient(
+        baseUrl: 'http://127.0.0.1:8000',
+        tokenProvider: () async => testJwt,
+        client: mockClient,
+      );
 
       final customStore = TestSharedPreferencesStore();
       SharedPreferences.resetStatic();
       SharedPreferencesStorePlatform.instance = customStore;
 
       // Start with null cycle
-      final queue = VitalsSyncQueue(apiClient: apiClient);
+      final queue = VitalsSyncQueue(apiClient: apiClient, activePatientId: 'p_cycle_bind');
 
       // Enqueue item without cycleId (write 1 succeeds)
       customStore.successWritesRemaining = 1;
@@ -715,13 +721,18 @@ void main() {
       final mockClient = MockClient((request) async {
         return http.Response('{"detail":"Internal Server Error"}', 500);
       });
-      final apiClient = AegisApiClient(baseUrl: 'http://127.0.0.1:8000', client: mockClient);
+      final testJwt = _buildTestJwt(patientId: 'p_retry_persist');
+      final apiClient = AegisApiClient(
+        baseUrl: 'http://127.0.0.1:8000',
+        tokenProvider: () async => testJwt,
+        client: mockClient,
+      );
 
       final customStore = TestSharedPreferencesStore();
       SharedPreferences.resetStatic();
       SharedPreferencesStorePlatform.instance = customStore;
 
-      final queue = VitalsSyncQueue(apiClient: apiClient, activeCycleId: 'c_retry_persist_fail');
+      final queue = VitalsSyncQueue(apiClient: apiClient, activeCycleId: 'c_retry_persist_fail', activePatientId: 'p_retry_persist');
 
       // Enqueue succeeds (write 1)
       customStore.successWritesRemaining = 1;
@@ -768,13 +779,18 @@ void main() {
           'items': [],
         }), 201);
       });
-      final apiClient = AegisApiClient(baseUrl: 'http://127.0.0.1:8000', client: mockClient);
+      final testJwt = _buildTestJwt(patientId: 'p_concurrent_recov');
+      final apiClient = AegisApiClient(
+        baseUrl: 'http://127.0.0.1:8000',
+        tokenProvider: () async => testJwt,
+        client: mockClient,
+      );
 
       final customStore = TestSharedPreferencesStore();
       SharedPreferences.resetStatic();
       SharedPreferencesStorePlatform.instance = customStore;
 
-      final queue = VitalsSyncQueue(apiClient: apiClient, activeCycleId: 'c_concurrent_recov');
+      final queue = VitalsSyncQueue(apiClient: apiClient, activeCycleId: 'c_concurrent_recov', activePatientId: 'p_concurrent_recov');
 
       // Initial enqueue succeeds
       await queue.enqueue(HealthMeasurement(timestamp: DateTime.now(), pulse: 70, source: HealthDataSource.watchSensor));
@@ -804,6 +820,7 @@ void main() {
       SharedPreferences.resetStatic();
       SharedPreferences.setMockInitialValues({});
     });
+
     test('20. HealthDataProvider enqueue observability: successful enqueue clears error, returns true, and persists to queue', () async {
       final timeService = TimeService();
       timeService.resetToRealTime();

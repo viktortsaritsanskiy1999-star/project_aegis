@@ -357,20 +357,26 @@ class VitalsStreamResponse {
 /// DTO corresponding to backend MedicalCycleResponse schema
 class MedicalCycleResponse {
   final String cycleId;
+  final String? patientId;
   final String status;
   final DateTime? startedAt;
   final DateTime? closedAt;
 
   const MedicalCycleResponse({
     required this.cycleId,
+    this.patientId,
     required this.status,
     this.startedAt,
     this.closedAt,
   });
 
   factory MedicalCycleResponse.fromJson(Map<String, dynamic> json) {
+    final rawPatientId = json['patient_id'] as String?;
     return MedicalCycleResponse(
       cycleId: json['cycle_id'] as String? ?? '',
+      patientId: (rawPatientId != null && rawPatientId.trim().isNotEmpty)
+          ? rawPatientId.trim()
+          : null,
       status: json['status'] as String? ?? '',
       startedAt: json['started_at'] != null
           ? DateTime.tryParse(json['started_at'] as String)

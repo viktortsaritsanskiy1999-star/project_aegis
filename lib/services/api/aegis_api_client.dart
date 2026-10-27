@@ -10,17 +10,41 @@ typedef TokenProvider = Future<String?> Function();
 
 class AegisApiClient {
   final String baseUrl;
-  final TokenProvider? tokenProvider;
+  TokenProvider? _tokenProvider;
+  Object? _attachedSessionManager;
+  void Function(Object? manager)? _onSessionManagerChanged;
   final Duration timeout;
   final http.Client _client;
 
   AegisApiClient({
     String? baseUrl,
-    this.tokenProvider,
+    TokenProvider? tokenProvider,
     this.timeout = const Duration(seconds: 10),
     http.Client? client,
   })  : baseUrl = (baseUrl ?? _defaultBaseUrl()).replaceAll(RegExp(r'/+$'), ''),
+        _tokenProvider = tokenProvider,
         _client = client ?? http.Client();
+
+  TokenProvider? get tokenProvider => _tokenProvider;
+
+  /// Returns the currently attached [AuthSessionManager] instance, if any.
+  Object? get attachedSessionManager => _attachedSessionManager;
+
+  /// Binds or updates the [TokenProvider] delegate (e.g., `authSessionManager.getValidAccessToken`).
+  void bindTokenProvider(TokenProvider? provider) {
+    _tokenProvider = provider;
+  }
+
+  /// Attaches an [AuthSessionManager] to this client for automatic discovery by dependent queues.
+  void attachSessionManager(Object? manager) {
+    _attachedSessionManager = manager;
+    _onSessionManagerChanged?.call(manager);
+  }
+
+  /// Registers a listener notified when an [AuthSessionManager] is attached or detached.
+  void setSessionManagerListener(void Function(Object? manager)? listener) {
+    _onSessionManagerChanged = listener;
+  }
 
   static String _defaultBaseUrl() {
     // Android emulator loopback alias is 10.0.2.2; desktop / iOS / tests use 127.0.0.1
@@ -37,10 +61,12 @@ class AegisApiClient {
     };
   }
 
-  Future<Map<String, String>> _buildHeaders() async {
+  Future<Map<String, String>> _buildHeaders({String? accessToken}) async {
     final headers = _buildJsonHeaders();
-    if (tokenProvider != null) {
-      final token = await tokenProvider!();
+    if (accessToken != null && accessToken.trim().isNotEmpty) {
+      headers['Authorization'] = 'Bearer ${accessToken.trim()}';
+    } else if (_tokenProvider != null) {
+      final token = await _tokenProvider!();
       if (token != null && token.trim().isNotEmpty) {
         headers['Authorization'] = 'Bearer ${token.trim()}';
       }
@@ -52,9 +78,9 @@ class AegisApiClient {
   /// If a tokenProvider is configured, verifies it resolves to a non-empty token string.
   /// If tokenProvider is omitted (null), defaults to true for test mock compatibility.
   Future<bool> hasAuthToken() async {
-    if (tokenProvider == null) return true;
+    if (_tokenProvider == null) return true;
     try {
-      final token = await tokenProvider!();
+      final token = await _tokenProvider!();
       return token != null && token.trim().isNotEmpty;
     } catch (_) {
       return false;
@@ -63,9 +89,9 @@ class AegisApiClient {
 
   /// Resolves the current authorization token string, or null if unauthenticated.
   Future<String?> getAuthToken() async {
-    if (tokenProvider == null) return null;
+    if (_tokenProvider == null) return null;
     try {
-      final token = await tokenProvider!();
+      final token = await _tokenProvider!();
       return (token != null && token.trim().isNotEmpty) ? token.trim() : null;
     } catch (_) {
       return null;
@@ -268,10 +294,10 @@ class AegisApiClient {
   }
 
   /// Query current active medical cycle
-  Future<MedicalCycleResponse> getCurrentCycle() async {
+  Future<MedicalCycleResponse> getCurrentCycle({String? accessToken}) async {
     final uri = Uri.parse('$baseUrl/api/v1/cycle/current');
     try {
-      final headers = await _buildHeaders();
+      final headers = await _buildHeaders(accessToken: accessToken);
       _log('GET $uri');
       final response = await _client.get(uri, headers: headers).timeout(timeout);
 
@@ -293,11 +319,14 @@ class AegisApiClient {
   }
 
   /// Atomically ingest a batch of measurements
-  Future<HealthMeasurementBatchResponse> postVitalsBatch(HealthMeasurementCreateBatch batch) async {
+  Future<HealthMeasurementBatchResponse> postVitalsBatch(
+    HealthMeasurementCreateBatch batch, {
+    String? accessToken,
+  }) async {
     final uri = Uri.parse('$baseUrl/api/v1/vitals/batch');
     final payloadJson = json.encode(batch.toJson());
     try {
-      final headers = await _buildHeaders();
+      final headers = await _buildHeaders(accessToken: accessToken);
       _log('POST $uri (${batch.measurements.length} items for cycle ${batch.cycleId})');
       final response = await _client.post(uri, headers: headers, body: payloadJson).timeout(timeout);
 
@@ -319,11 +348,14 @@ class AegisApiClient {
   }
 
   /// Ingest single measurement
-  Future<HealthMeasurementResponse> postSingleMeasurement(HealthMeasurementCreate measurement) async {
+  Future<HealthMeasurementResponse> postSingleMeasurement(
+    HealthMeasurementCreate measurement, {
+    String? accessToken,
+  }) async {
     final uri = Uri.parse('$baseUrl/api/v1/vitals/measurement');
     final payloadJson = json.encode(measurement.toJson());
     try {
-      final headers = await _buildHeaders();
+      final headers = await _buildHeaders(accessToken: accessToken);
       _log('POST $uri (pulse: ${measurement.pulse}, source: ${measurement.source})');
       final response = await _client.post(uri, headers: headers, body: payloadJson).timeout(timeout);
 
@@ -345,13 +377,17 @@ class AegisApiClient {
   }
 
   /// Get authoritative latest vitals stream
-  Future<VitalsStreamResponse> getLatestVitals(String cycleId, {bool includeSimulated = false}) async {
+  Future<VitalsStreamResponse> getLatestVitals(
+    String cycleId, {
+    bool includeSimulated = false,
+    String? accessToken,
+  }) async {
     final uri = Uri.parse('$baseUrl/api/v1/vitals/latest').replace(queryParameters: {
       'cycle_id': cycleId,
       if (includeSimulated) 'include_simulated': 'true',
     });
     try {
-      final headers = await _buildHeaders();
+      final headers = await _buildHeaders(accessToken: accessToken);
       _log('GET $uri');
       final response = await _client.get(uri, headers: headers).timeout(timeout);
 
