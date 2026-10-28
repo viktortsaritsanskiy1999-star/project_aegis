@@ -21,7 +21,11 @@ from app.repositories.pairing_repository import PairingRepository
 from app.repositories.patient_repository import PatientRepository
 from app.repositories.report_repository import ModelReportRepository
 from app.routers.client_cascade import get_gemini_gateway
-from app.security.tokens import create_access_token, verify_access_token
+from app.security.tokens import (
+    LEGACY_DEVICE_SCOPE,
+    create_access_token,
+    verify_access_token,
+)
 from app.services.gemini_gateway import GeminiGateway
 from app.services.lab_revision_consilium_service import LabRevisionConsiliumService
 from app.services.primary_consilium_service import (
@@ -266,24 +270,41 @@ def test_device_jwt_rejected_on_admin_cascade_circuit(isolated_client_env):
 
 def test_missing_cascade_intake_scope_returns_403(isolated_client_env):
     """
-    Verifies that a mobile device holding only default scopes
-    ("vitals:read vitals:write cycle:read") receives 403 Forbidden
-    when attempting to call `/api/v1/client/cascade/intake/anamnesis`.
+    Verifies that a mobile device token lacking `cascade:intake`
+    (e.g., legacy Stage 5.3 scope "vitals:read vitals:write cycle:read")
+    receives 403 Forbidden when attempting to call `/api/v1/client/cascade/intake/anamnesis`,
+    while a standard paired device token succeeds.
     """
     client, session, _ = isolated_client_env
-    # Default token issued upon pair has only DEFAULT_DEVICE_SCOPE ("vitals:read vitals:write cycle:read")
     pair_res = _pair_patient_device(
         client, session, patient_id="pat-scope-01", device_id="dev-scope-01", raw_code="740002"
     )
-    default_headers = {"Authorization": f"Bearer {pair_res['access_token']}"}
+    # 1. Legacy token without cascade:intake -> 403
+    real_claims = verify_access_token(pair_res["access_token"])
+    legacy_jwt = create_access_token(
+        patient_id="pat-scope-01",
+        device_id="dev-scope-01",
+        family_id=real_claims.family_id,
+        scope=LEGACY_DEVICE_SCOPE,
+    ).access_token
+    legacy_headers = {"Authorization": f"Bearer {legacy_jwt}"}
 
     resp = client.post(
         "/api/v1/client/cascade/intake/anamnesis",
         json={"answers": _sample_intake_answers()},
-        headers=default_headers,
+        headers=legacy_headers,
     )
     assert resp.status_code == 403
     assert resp.json()["detail"] == "Insufficient token scope for this operation."
+
+    # 2. Standard pairing token (possesses all standard scopes including cascade:intake) -> 200 OK
+    default_headers = {"Authorization": f"Bearer {pair_res['access_token']}"}
+    resp_std = client.post(
+        "/api/v1/client/cascade/intake/anamnesis",
+        json={"answers": _sample_intake_answers()},
+        headers=default_headers,
+    )
+    assert resp_std.status_code == 200
 
 
 # ==============================================================================

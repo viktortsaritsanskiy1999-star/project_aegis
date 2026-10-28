@@ -34,7 +34,12 @@ from app.security.auth import (
     require_any_scope,
     require_scopes,
 )
-from app.security.tokens import create_access_token, verify_access_token
+from app.security.tokens import (
+    DEFAULT_DEVICE_SCOPE,
+    LEGACY_DEVICE_SCOPE,
+    create_access_token,
+    verify_access_token,
+)
 
 TEST_API_SECRET = "test-stage-5-3b2-admin-api-secret-11223344"
 TEST_PAIRING_SECRET = "test-stage-5-3b2-pairing-hmac-secret-55667788"
@@ -167,7 +172,12 @@ def test_01_successful_device_pairing_and_no_store_headers(isolated_api_env):
     assert data["token_type"] == "Bearer"
     assert data["patient_id"] == "patient-pair-01"
     assert data["device_id"] == "dev-pair-01"
-    assert data["scope"] == "vitals:read vitals:write cycle:read"
+    assert data["scope"] == DEFAULT_DEVICE_SCOPE
+    assert set(data["scope"].split()) >= {
+        "vitals:read", "vitals:write", "cycle:read",
+        "cascade:intake", "cascade:run", "reports:read",
+        "chat:read", "chat:write",
+    }
     assert data["expires_in"] == 1800
     assert isinstance(data["access_token"], str) and data["access_token"].count(".") == 2
     assert isinstance(data["refresh_token"], str) and len(data["refresh_token"]) >= 32
@@ -1381,15 +1391,29 @@ def test_19_scope_all_required_and_reports_read_enforcement(isolated_api_env):
         content={"title": "Patient B Client Report", "summary": "Belongs to B"},
     )
 
-    # 1. Default pairing token ("vitals:read vitals:write cycle:read") has cycle:read but NOT reports:read -> 403
+    # 1. Standard pairing token (with DEFAULT_DEVICE_SCOPE containing reports:read) -> 200 OK
     default_headers = {"Authorization": f"Bearer {pair_a['access_token']}"}
     r_def_list = client.get("/api/v1/reports/client?cycle_id=cycle-v2-scope-a", headers=default_headers)
-    assert r_def_list.status_code == 403
-    assert r_def_list.json()["detail"] == "Insufficient token scope for this operation."
+    assert r_def_list.status_code == 200
 
     r_def_single = client.get("/api/v1/reports/client/rep_v2_a_client", headers=default_headers)
-    assert r_def_single.status_code == 403
-    assert r_def_single.json()["detail"] == "Insufficient token scope for this operation."
+    assert r_def_single.status_code == 200
+
+    # 1b. Legacy Stage 5.3 token ("vitals:read vitals:write cycle:read") lacks reports:read -> 403
+    legacy_jwt = create_access_token(
+        patient_id="pat-v2-scope-a",
+        device_id="dev-v2-scope-a",
+        family_id=fam_a,
+        scope=LEGACY_DEVICE_SCOPE,
+    ).access_token
+    legacy_headers = {"Authorization": f"Bearer {legacy_jwt}"}
+    r_leg_list = client.get("/api/v1/reports/client?cycle_id=cycle-v2-scope-a", headers=legacy_headers)
+    assert r_leg_list.status_code == 403
+    assert r_leg_list.json()["detail"] == "Insufficient token scope for this operation."
+
+    r_leg_single = client.get("/api/v1/reports/client/rep_v2_a_client", headers=legacy_headers)
+    assert r_leg_single.status_code == 403
+    assert r_leg_single.json()["detail"] == "Insufficient token scope for this operation."
 
     # 2. Token with ONLY cycle:read -> 403
     only_cycle_jwt = create_access_token(

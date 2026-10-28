@@ -316,6 +316,37 @@ class DeviceRevokeResponse {
       'DeviceRevokeResponse(status: $status, deviceId: $deviceId, revoked: $revoked)';
 }
 
+/// Standard permissions scopes in Project Aegis.
+abstract final class AegisScopes {
+  static const String vitalsRead = 'vitals:read';
+  static const String vitalsWrite = 'vitals:write';
+  static const String cycleRead = 'cycle:read';
+  static const String cascadeIntake = 'cascade:intake';
+  static const String cascadeRun = 'cascade:run';
+  static const String reportsRead = 'reports:read';
+  static const String chatRead = 'chat:read';
+  static const String chatWrite = 'chat:write';
+
+  /// Standard permissions issued to paired mobile devices in Stage 5.4.
+  static const Set<String> standardDeviceScopes = {
+    vitalsRead,
+    vitalsWrite,
+    cycleRead,
+    cascadeIntake,
+    cascadeRun,
+    reportsRead,
+    chatRead,
+    chatWrite,
+  };
+
+  /// Legacy Stage 5.3 baseline scopes.
+  static const Set<String> legacyStage53Scopes = {
+    vitalsRead,
+    vitalsWrite,
+    cycleRead,
+  };
+}
+
 /// Immutable client-side active session model.
 @immutable
 class AuthSession {
@@ -348,6 +379,17 @@ class AuthSession {
 
   bool hasAllScopes(Iterable<String> requiredScopes) =>
       scopes.containsAll(requiredScopes);
+
+  /// Whether this session holds all [AegisScopes.standardDeviceScopes].
+  bool get hasStandardDeviceScopes =>
+      hasAllScopes(AegisScopes.standardDeviceScopes);
+
+  /// Scopes that are missing from this session relative to [requiredScopes]
+  /// (or [AegisScopes.standardDeviceScopes] if not specified).
+  Set<String> missingScopes([Iterable<String>? requiredScopes]) {
+    final target = requiredScopes ?? AegisScopes.standardDeviceScopes;
+    return target.where((s) => !scopes.contains(s)).toSet();
+  }
 
   /// Checks if access token has expired or is about to expire within [skewBuffer] (default: 60s).
   bool isAccessTokenExpired({

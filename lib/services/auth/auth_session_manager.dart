@@ -50,6 +50,7 @@ class AuthSessionManager extends ChangeNotifier {
     AuthSession? session, {
     AuthSessionStatus? status,
     bool? isRefreshIndeterminate,
+    bool? hasAttemptedScopeUpgrade,
   }) {
     _session = session;
     if (session != null) {
@@ -60,6 +61,9 @@ class AuthSessionManager extends ChangeNotifier {
     }
     if (isRefreshIndeterminate != null) {
       _isRefreshIndeterminate = isRefreshIndeterminate;
+    }
+    if (hasAttemptedScopeUpgrade != null) {
+      _hasAttemptedScopeUpgrade = hasAttemptedScopeUpgrade;
     }
     notifyListeners();
   }
@@ -74,6 +78,7 @@ class AuthSessionManager extends ChangeNotifier {
   String? _lastKnownPatientId;
   AuthSessionStatus _status = AuthSessionStatus.unauthenticated;
   bool _isRefreshIndeterminate = false;
+  bool _hasAttemptedScopeUpgrade = false;
   DateTime? _rateLimitedUntil;
   Duration? _lastRetryAfter;
   AegisApiException? _lastError;
@@ -182,6 +187,17 @@ class AuthSessionManager extends ChangeNotifier {
     if (!now.isBefore(_rateLimitedUntil!)) return null;
     return _rateLimitedUntil!.difference(now);
   }
+
+  /// Whether the currently loaded session is missing standard device scopes,
+  /// indicating it was paired under an older client/server version and requires
+  /// a planned one-off token rotation.
+  bool get needsScopeUpgrade =>
+      _session != null &&
+      _status == AuthSessionStatus.authenticated &&
+      !_session!.hasStandardDeviceScopes;
+
+  /// Whether a planned scope upgrade rotation was already attempted during this manager lifecycle.
+  bool get hasAttemptedScopeUpgrade => _hasAttemptedScopeUpgrade;
 
   /// Validates that [token] is a structurally well-formed mobile JWT (`header.payload.signature`)
   /// and strictly rejects static secrets (such as `AEGIS_API_SECRET`) or refresh tokens.
@@ -319,6 +335,7 @@ class AuthSessionManager extends ChangeNotifier {
       );
       _isRefreshIndeterminate = true;
     }
+    _hasAttemptedScopeUpgrade = false;
   }
 
   void _applyRateLimit(Duration? retryAfter) {
@@ -473,6 +490,7 @@ class AuthSessionManager extends ChangeNotifier {
     } else {
       _status = AuthSessionStatus.authenticated;
       _isRefreshIndeterminate = false;
+      _hasAttemptedScopeUpgrade = false;
     }
 
     notifyListeners();
@@ -569,6 +587,7 @@ class AuthSessionManager extends ChangeNotifier {
       _isInitialized = true;
       _status = AuthSessionStatus.authenticated;
       _isRefreshIndeterminate = false;
+      _hasAttemptedScopeUpgrade = false;
       _rateLimitedUntil = null;
       _lastRetryAfter = null;
       _lastError = null;
@@ -588,11 +607,88 @@ class AuthSessionManager extends ChangeNotifier {
     }
   }
 
+  /// Checks whether the active session possesses all required permissions
+  /// (defaulting to [AegisScopes.standardDeviceScopes]).
+  ///
+  /// If the current session lacks any required scope (e.g., following an application upgrade
+  /// from Stage 5.3 to Stage 5.4), this method initiates a single-flight token rotation
+  /// via `POST /api/v1/auth/refresh` to obtain the server's updated scope grants.
+  ///
+  /// Invariants:
+  /// - Safe for existing devices: Upgrades permissions without requiring re-pairing.
+  /// - Loop prevention: Attempts scope upgrade at most once per manager lifecycle.
+  /// - 403 != 401: Never invoked blindly in response to HTTP 403 Forbidden.
+  /// - Single-flight: Concurrent calls join the same in-flight refresh operation.
+  /// - Returns `true` if the session possesses all [requiredScopes] after check/rotation.
+  Future<bool> ensureRequiredScopes({
+    Iterable<String>? requiredScopes,
+  }) async {
+    _ensureNotDisposed();
+
+    if (_session == null || _status != AuthSessionStatus.authenticated) {
+      return false;
+    }
+
+    final targetScopes = (requiredScopes ?? AegisScopes.standardDeviceScopes).toSet();
+    if (_session!.hasAllScopes(targetScopes)) {
+      return true;
+    }
+
+    // Single-flight: If a refresh is already in flight, await it and check result
+    if (_inFlightRefreshCompleter != null) {
+      try {
+        await _inFlightRefreshCompleter!.future;
+      } on AegisApiException {
+        return false;
+      } on SecureStorageUnavailableException {
+        return false;
+      }
+      return _session != null && _session!.hasAllScopes(targetScopes);
+    }
+
+    if (_hasAttemptedScopeUpgrade) {
+      return false;
+    }
+
+    if (_isRefreshIndeterminate || _status == AuthSessionStatus.expired) {
+      return false;
+    }
+
+    final now = _nowProvider().toUtc();
+    if (_session!.isRefreshTokenExpired(now: now)) {
+      _status = AuthSessionStatus.expired;
+      notifyListeners();
+      return false;
+    }
+
+    _hasAttemptedScopeUpgrade = true;
+    _log(
+      'Session lacks required scopes (${_session!.missingScopes(targetScopes).join(', ')}). '
+      'Initiating planned single-flight token rotation to upgrade device permissions...',
+    );
+
+    try {
+      await refreshSession();
+    } on AegisApiException catch (e) {
+      _log('Planned scope upgrade refresh failed: $e');
+      return false;
+    } on SecureStorageUnavailableException catch (e) {
+      _log('Planned scope upgrade storage error: ${e.message}');
+      return false;
+    }
+
+    return _session != null && _session!.hasAllScopes(targetScopes);
+  }
+
   /// Resolves a valid JWT access token for [AegisApiClient] requests.
   /// Automatically performs a pre-emptive Single-Flight refresh when the current access token
   /// is expired or within [refreshSkewBuffer] of expiration.
+  /// If [requiredScopes] is provided and missing from the current session, initiates a one-off
+  /// planned scope upgrade refresh.
   /// Returns `null` if unauthenticated, expired, rate-limited, or if refresh fails.
-  Future<String?> getValidAccessToken() async {
+  Future<String?> getValidAccessToken({
+    Iterable<String>? requiredScopes,
+  }) async {
     _ensureNotDisposed();
 
     if (_session == null || _status == AuthSessionStatus.unauthenticated) {
@@ -630,6 +726,16 @@ class AuthSessionManager extends ChangeNotifier {
       } on AegisApiException {
         return null;
       } on SecureStorageUnavailableException {
+        return null;
+      }
+    }
+
+    // If specific requiredScopes are requested and missing, attempt a one-off scope upgrade
+    if (requiredScopes != null &&
+        !_session!.hasAllScopes(requiredScopes) &&
+        !_hasAttemptedScopeUpgrade) {
+      final upgraded = await ensureRequiredScopes(requiredScopes: requiredScopes);
+      if (!upgraded) {
         return null;
       }
     }
@@ -999,6 +1105,9 @@ class AuthSessionManager extends ChangeNotifier {
     _session = rotatedSession;
     _status = AuthSessionStatus.authenticated;
     _isRefreshIndeterminate = false;
+    if (rotatedSession.hasStandardDeviceScopes) {
+      _hasAttemptedScopeUpgrade = false;
+    }
     _rateLimitedUntil = null;
     _lastRetryAfter = null;
     _lastError = null;

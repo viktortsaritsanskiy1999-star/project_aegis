@@ -23,7 +23,11 @@ from app.schemas.chat import (
     AthenaVitalsAlertContext,
 )
 from app.schemas.privacy import PrivacyLevel
-from app.security.tokens import create_access_token, verify_access_token
+from app.security.tokens import (
+    LEGACY_DEVICE_SCOPE,
+    create_access_token,
+    verify_access_token,
+)
 from app.services.gemini_gateway import GeminiGateway, GeminiModelRole
 from app.services.weekly_consilium_service import (
     WeeklyConsiliumService,
@@ -241,25 +245,46 @@ def test_insufficient_scope_chat_write_returns_403(isolated_chat_env):
     pair_res = _pair_patient_device(
         client, session, patient_id="pat-scope-chat-01", device_id="dev-scope-chat-01", raw_code="810001"
     )
-    # Default pairing token has only vitals:read vitals:write cycle:read
-    headers = {"Authorization": f"Bearer {pair_res['access_token']}"}
+    # Legacy token without chat:write receives 403
+    real_claims = verify_access_token(pair_res["access_token"])
+    legacy_jwt = create_access_token(
+        patient_id="pat-scope-chat-01",
+        device_id="dev-scope-chat-01",
+        family_id=real_claims.family_id,
+        scope=LEGACY_DEVICE_SCOPE,
+    ).access_token
+    legacy_headers = {"Authorization": f"Bearer {legacy_jwt}"}
 
-    resp = client.post("/api/v1/client/chat/athena", json={"message": "Привет"}, headers=headers)
+    resp = client.post("/api/v1/client/chat/athena", json={"message": "Привет"}, headers=legacy_headers)
     assert resp.status_code == 403
     assert resp.json()["detail"] == "Insufficient token scope for this operation."
 
 
 def test_insufficient_scope_chat_read_returns_403(isolated_chat_env):
-    """Verifies that token lacking chat:read scope receives 403 Forbidden on history."""
+    """Verifies that token lacking chat:read scope receives 403 Forbidden on history, while standard pairing token succeeds."""
     client, session, _ = isolated_chat_env
     pair_res = _pair_patient_device(
         client, session, patient_id="pat-scope-chat-02", device_id="dev-scope-chat-02", raw_code="810002"
     )
-    headers = {"Authorization": f"Bearer {pair_res['access_token']}"}
+    # 1. Legacy token without chat:read receives 403
+    real_claims = verify_access_token(pair_res["access_token"])
+    legacy_jwt = create_access_token(
+        patient_id="pat-scope-chat-02",
+        device_id="dev-scope-chat-02",
+        family_id=real_claims.family_id,
+        scope=LEGACY_DEVICE_SCOPE,
+    ).access_token
+    legacy_headers = {"Authorization": f"Bearer {legacy_jwt}"}
 
-    resp = client.get("/api/v1/client/chat/athena/history", headers=headers)
+    resp = client.get("/api/v1/client/chat/athena/history", headers=legacy_headers)
     assert resp.status_code == 403
     assert resp.json()["detail"] == "Insufficient token scope for this operation."
+
+    # 2. Standard pairing token (with DEFAULT_DEVICE_SCOPE containing chat:read) succeeds with 200 OK
+    default_headers = {"Authorization": f"Bearer {pair_res['access_token']}"}
+    resp_std = client.get("/api/v1/client/chat/athena/history", headers=default_headers)
+    assert resp_std.status_code == 200
+    assert resp_std.json()["messages"] == []
 
 
 def test_client_device_token_rejected_on_admin_cascade_routes(isolated_chat_env):

@@ -6,8 +6,12 @@ import jwt
 from app.config import settings
 
 ALLOWED_JWT_ALGORITHMS: Tuple[str, ...] = ("HS256",)
-DEFAULT_DEVICE_SCOPE: str = "vitals:read vitals:write cycle:read"
 MIN_JWT_SECRET_LENGTH: int = 16
+
+# Standard mobile device scopes
+SCOPE_VITALS_READ: str = "vitals:read"
+SCOPE_VITALS_WRITE: str = "vitals:write"
+SCOPE_CYCLE_READ: str = "cycle:read"
 
 # Stage 5.4 Unified AI granular scopes
 SCOPE_CASCADE_INTAKE: str = "cascade:intake"
@@ -15,6 +19,27 @@ SCOPE_CASCADE_RUN: str = "cascade:run"
 SCOPE_REPORTS_READ: str = "reports:read"
 SCOPE_CHAT_READ: str = "chat:read"
 SCOPE_CHAT_WRITE: str = "chat:write"
+
+# Standard permissions issued to paired mobile devices
+STANDARD_DEVICE_SCOPES: Tuple[str, ...] = (
+    SCOPE_VITALS_READ,
+    SCOPE_VITALS_WRITE,
+    SCOPE_CYCLE_READ,
+    SCOPE_CASCADE_INTAKE,
+    SCOPE_CASCADE_RUN,
+    SCOPE_REPORTS_READ,
+    SCOPE_CHAT_READ,
+    SCOPE_CHAT_WRITE,
+)
+DEFAULT_DEVICE_SCOPE: str = " ".join(STANDARD_DEVICE_SCOPES)
+
+# Legacy Stage 5.3 baseline scope (for backwards-compatibility testing)
+LEGACY_STAGE_53_DEVICE_SCOPES: Tuple[str, ...] = (
+    SCOPE_VITALS_READ,
+    SCOPE_VITALS_WRITE,
+    SCOPE_CYCLE_READ,
+)
+LEGACY_DEVICE_SCOPE: str = " ".join(LEGACY_STAGE_53_DEVICE_SCOPES)
 
 
 class TokenError(ValueError):
