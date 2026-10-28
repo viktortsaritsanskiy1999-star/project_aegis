@@ -63,9 +63,13 @@ void main() => runApp(
 
       // 🔐 AuthSessionManager: Single process-wide session and token manager
       ChangeNotifierProvider<AuthSessionManager>(
-        create: (context) => AuthSessionManager(
-          apiClient: context.read<AegisApiClient>(),
-        ),
+        create: (context) {
+          final manager = AuthSessionManager(
+            apiClient: context.read<AegisApiClient>(),
+          );
+          context.read<VaultService>().bindAuthSessionManager(manager);
+          return manager;
+        },
       ),
 
       // 🔗 Persistent outbound vitals telemetry queue

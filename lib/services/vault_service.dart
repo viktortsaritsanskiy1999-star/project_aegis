@@ -1,4 +1,7 @@
+import 'dart:async';
+import 'dart:convert';
 import 'package:flutter/foundation.dart';
+import 'auth/auth_session_manager.dart';
 import 'vault_storage_service.dart';
 import 'vitals_alert_context.dart';
 
@@ -100,53 +103,299 @@ class VaultService extends ChangeNotifier {
 
   String? _selectedSystem;
 
+  final IVaultStorage _storage;
+  AuthSessionManager? _authSessionManager;
+  String? _activePatientId;
+  int _sessionEpoch = 0;
+  LegacyVaultStatus _legacyVaultStatus = LegacyVaultStatus.none;
+  bool _isInitialized = false;
+  bool _isDisposed = false;
+
+  /// Monotonic write sequence counter across instances.
+  static int _writeSequence = 0;
+
+  /// Chains of pending/active writes per storage key to guarantee sequential execution across instances.
+  static final Map<String, Future<void>> _writeChains = {};
+
+  /// Tracks highest committed write sequence number per storage key to prevent stale overwrites across instances.
+  static final Map<String, int> _lastCommittedSeqByKey = {};
+
+  /// Map of errors by storage key to ensure independent error accounting across keys.
+  static final Map<String, Object> _persistenceErrorsByKey = {};
+
   Future<void>? _initFuture;
   Future<void>? get initFuture => _initFuture;
 
-  VaultService() {
+  String? get activePatientId => _activePatientId;
+  bool get isAuthenticated => _activePatientId != null;
+  int get sessionEpoch => _sessionEpoch;
+  LegacyVaultStatus get legacyVaultStatus => _legacyVaultStatus;
+  bool get hasQuarantinedLegacyData => _legacyVaultStatus == LegacyVaultStatus.quarantined;
+  bool get isInitialized => _isInitialized;
+
+  /// Most recent persistence error encountered for active patient or unauthenticated storage.
+  Object? get lastPersistenceError {
+    if (_activePatientId != null) {
+      final key = VaultStorageService.derivePatientStorageKey(_activePatientId!);
+      return _persistenceErrorsByKey[key];
+    }
+    return _persistenceErrorsByKey[VaultStorageService.unauthenticatedStorageKey] ??
+        _persistenceErrorsByKey[VaultStorageService.guestDraftStorageKey];
+  }
+
+  /// Whether the active patient or unauthenticated storage encountered a persistence error.
+  bool get hasPersistenceError {
+    if (_activePatientId != null) {
+      final key = VaultStorageService.derivePatientStorageKey(_activePatientId!);
+      return _persistenceErrorsByKey.containsKey(key);
+    }
+    return _persistenceErrorsByKey.containsKey(VaultStorageService.unauthenticatedStorageKey) ||
+        _persistenceErrorsByKey.containsKey(VaultStorageService.guestDraftStorageKey);
+  }
+
+  /// Whether any storage key has an unhandled persistence error.
+  bool get hasAnyPersistenceError => _persistenceErrorsByKey.isNotEmpty;
+
+  /// Gets the persistence error for a specific [patientId] or [storageKey].
+  Object? getPersistenceError({String? patientId, String? storageKey}) {
+    if (storageKey != null) return _persistenceErrorsByKey[storageKey];
+    if (patientId != null) {
+      final key = VaultStorageService.derivePatientStorageKey(patientId);
+      return _persistenceErrorsByKey[key];
+    }
+    return lastPersistenceError;
+  }
+
+  /// Clears recorded persistence errors.
+  void clearPersistenceError({String? patientId, String? storageKey}) {
+    if (storageKey != null) {
+      _persistenceErrorsByKey.remove(storageKey);
+    } else if (patientId != null) {
+      final key = VaultStorageService.derivePatientStorageKey(patientId);
+      _persistenceErrorsByKey.remove(key);
+    } else {
+      _persistenceErrorsByKey.clear();
+    }
+  }
+
+  /// Resets write queue state for tests.
+  @visibleForTesting
+  static void resetWriteQueueForTesting() {
+    _writeChains.clear();
+    _lastCommittedSeqByKey.clear();
+    _persistenceErrorsByKey.clear();
+    _writeSequence = 0;
+  }
+
+  /// Awaits all pending writes for all storage keys or a specific patient.
+  /// Throws the persistence error for the target patient/storage key if one occurred.
+  Future<void> flushPendingWrites({String? patientId}) async {
+    if (patientId != null) {
+      final key = VaultStorageService.derivePatientStorageKey(patientId);
+      final chain = _writeChains[key];
+      if (chain != null) {
+        try {
+          await chain;
+        } catch (_) {}
+      }
+      final error = _persistenceErrorsByKey[key];
+      if (error != null) {
+        throw error;
+      }
+    } else {
+      final chains = _writeChains.values.toList();
+      if (chains.isNotEmpty) {
+        await Future.wait(chains.map((c) => c.catchError((_) {})));
+      }
+      if (_activePatientId != null) {
+        final activeKey = VaultStorageService.derivePatientStorageKey(_activePatientId!);
+        final activeError = _persistenceErrorsByKey[activeKey];
+        if (activeError != null) throw activeError;
+      } else {
+        final unauthKey = VaultStorageService.unauthenticatedStorageKey;
+        final guestKey = VaultStorageService.guestDraftStorageKey;
+        final error = _persistenceErrorsByKey[unauthKey] ?? _persistenceErrorsByKey[guestKey];
+        if (error != null) throw error;
+      }
+    }
+  }
+
+  VaultService({
+    AuthSessionManager? authSessionManager,
+    IVaultStorage? storage,
+  })  : _storage = storage ?? VaultStorageService.activeStorage,
+        _authSessionManager = authSessionManager {
+    if (_authSessionManager != null) {
+      _authSessionManager!.addListener(_onAuthSessionChanged);
+      _activePatientId = _authSessionManager!.confirmedAttributionPatientId;
+    }
     _initFuture = _initVault();
   }
 
+  /// Binds an [AuthSessionManager] to synchronize active patient attribution.
+  void bindAuthSessionManager(AuthSessionManager? manager) {
+    if (identical(_authSessionManager, manager)) return;
+    _authSessionManager?.removeListener(_onAuthSessionChanged);
+    _authSessionManager = manager;
+    if (manager != null) {
+      manager.addListener(_onAuthSessionChanged);
+      _onAuthSessionChanged();
+    }
+  }
+
+  void _onAuthSessionChanged() {
+    final manager = _authSessionManager;
+    if (manager == null) return;
+    final confirmedId = manager.confirmedAttributionPatientId;
+    setActivePatientId(confirmedId);
+  }
+
+  /// Switches active patient profile with immediate synchronous memory wipe
+  /// and epoch-fenced asynchronous restoration from secure storage.
+  Future<void> setActivePatientId(String? newPatientId) async {
+    if (_isDisposed) return;
+    final trimmed = (newPatientId != null && newPatientId.trim().isNotEmpty)
+        ? newPatientId.trim()
+        : null;
+
+    if (_activePatientId == trimmed) {
+      return;
+    }
+
+    _sessionEpoch++;
+    final currentEpoch = _sessionEpoch;
+    _activePatientId = trimmed;
+
+    // 1. SYNCHRONOUS PURGE: Old patient data MUST IMMEDIATELY disappear from memory
+    _clearSensitiveMemoryData();
+    notifyListeners();
+
+    // 2. ASYNCHRONOUS LOAD for the new profile
+    if (trimmed != null) {
+      await _loadPatientVaultAsync(trimmed, currentEpoch);
+    } else {
+      await _loadGuestVaultAsync(currentEpoch);
+    }
+  }
+
+  static Map<String, dynamic> _createDefaultHealthSystems() => {
+    "cvs": {
+      "name": "Cardiovascular",
+      "completeness": 0.0,
+      "color": "0xFFFF0000",
+      "markers": {
+        "smart_watch": {
+          "workout_sessions": <Map<String, dynamic>>[],
+          "heart_rate_samples": <Map<String, dynamic>>[],
+          "workout_context": <String, dynamic>{},
+          "workout_analysis_reports": <Map<String, dynamic>>[],
+        }
+      }
+    },
+    "gi_tract": {"name": "GI Tract", "completeness": 0.0, "color": "0xFFFFA500", "markers": {}},
+    "respiratory": {"name": "Respiratory", "completeness": 0.0, "color": "0xFF00FFFF", "markers": {}},
+    "nervous": {"name": "Nervous", "completeness": 0.0, "color": "0xFF8A2BE2", "markers": {}},
+    "musculoskeletal": {"name": "Musculoskeletal", "completeness": 0.0, "color": "0xFFB0C4DE", "markers": {}},
+    "kidneys": {"name": "Renal", "completeness": 0.0, "color": "0xFF0000FF", "markers": {}},
+    "immune": {"name": "Immune and Blood", "completeness": 0.0, "color": "0xFF32CD32", "markers": {}},
+    "endocrine": {"name": "Endocrine", "completeness": 0.0, "color": "0xFFEE82EE", "markers": {}},
+  };
+
+  static Map<String, Map<String, dynamic>> _createDefaultSystemFolders() => {
+    'respiratory': {
+      'labs': <String, dynamic>{},
+      'system_general_shelf': 'Analysis not performed',
+      'system_training_shelf': 'Logs are empty',
+    },
+    'immune': {
+      'labs': <String, dynamic>{},
+      'system_general_shelf': 'Analysis not performed',
+      'system_training_shelf': 'Logs are empty',
+    },
+    'cvs': {
+      'labs': <String, dynamic>{},
+      'system_general_shelf': 'Analysis not performed',
+      'system_training_shelf': 'Logs are empty',
+    },
+    'gi_tract': {
+      'labs': <String, dynamic>{},
+      'system_general_shelf': 'Analysis not performed',
+      'system_training_shelf': 'Logs are empty',
+    },
+    'kidneys': {
+      'labs': <String, dynamic>{},
+      'system_general_shelf': 'Analysis not performed',
+      'system_training_shelf': 'Logs are empty',
+    },
+    'endocrine': {
+      'labs': <String, dynamic>{},
+      'system_general_shelf': 'Analysis not performed',
+      'system_training_shelf': 'Logs are empty',
+    },
+    'nervous': {
+      'labs': <String, dynamic>{},
+      'system_general_shelf': 'Analysis not performed',
+      'system_training_shelf': 'Logs are empty',
+    },
+    'musculoskeletal': {
+      'labs': <String, dynamic>{},
+      'system_general_shelf': 'Analysis not performed',
+      'system_training_shelf': 'Logs are empty',
+    },
+    'core_cascade': {
+      'flash_general_shelf': 'Waiting for Gemini Flash output...',
+      'flash_training_shelf': 'Gemini Flash deficiency logs...',
+      'pro_general_shelf': 'Waiting for Gemini Pro output...',
+      'pro_training_shelf': 'Gemini Pro deficiency logs...',
+    },
+    'notes_export': <String, dynamic>{},
+    'global': {'labs': <String, dynamic>{}},
+    'training_sandbox': {
+      'raw_predictions': [],
+      'missing_data': [],
+      'risk_analysis': "PENDING...",
+    },
+  };
+
+  void _clearSensitiveMemoryData() {
+    _selectedSystem = null;
+    _hasUnreadAthenaMessage = false;
+    _curatorChatHistory.clear();
+    _athenaClinicalLogs.clear();
+
+    _data.clear();
+    _data.addAll({
+      'health_systems': _createDefaultHealthSystems(),
+    });
+
+    _systemFolders.clear();
+    _systemFolders.addAll(_createDefaultSystemFolders());
+  }
+
   Future<void> _initVault() async {
+    final hasLegacy = await _storage.hasLegacyVault();
+    if (hasLegacy) {
+      _legacyVaultStatus = LegacyVaultStatus.quarantined;
+    }
+
     final inMemorySessions = getWorkoutSessions();
     final inMemorySamples = getHeartRateSamples();
+    final currentEpoch = _sessionEpoch;
 
-    final loadedData = await VaultStorageService.loadVault();
-    debugPrint("💾 [_initVault] completed, loaded: ${loadedData.keys}");
-    if (loadedData.isNotEmpty) {
-      if (loadedData.containsKey('health_systems')) {
-        _data['health_systems'] = loadedData['health_systems'];
+    if (_activePatientId != null) {
+      await _loadPatientVaultAsync(_activePatientId!, currentEpoch);
+    } else {
+      final pendingUnauthed = _writeChains[VaultStorageService.unauthenticatedStorageKey];
+      if (pendingUnauthed != null) {
+        try {
+          await pendingUnauthed;
+        } catch (_) {}
       }
-      if (loadedData.containsKey('system_folders')) {
-        final savedFolders = loadedData['system_folders'] as Map<String, dynamic>;
-        savedFolders.forEach((key, value) {
-          if (_systemFolders.containsKey(key) && value is Map) {
-            _systemFolders[key] = Map<String, dynamic>.from(value);
-          }
-        });
-      }
-      if (loadedData.containsKey('curator_chat_history')) {
-        final savedChat = loadedData['curator_chat_history'] as List;
-        _curatorChatHistory.clear();
-        for (var item in savedChat) {
-          if (item is Map) {
-            _curatorChatHistory.add(Map<String, String>.from(item));
-          }
-        }
-      }
-      if (loadedData.containsKey('athena_clinical_logs')) {
-        final savedLogs = loadedData['athena_clinical_logs'] as List;
-        _athenaClinicalLogs.clear();
-        for (var item in savedLogs) {
-          if (item is Map) {
-            _athenaClinicalLogs.add(Map<String, dynamic>.from(item));
-          }
-        }
-      }
-
-      // 🎯 New: load vital sign thresholds if already established by the Chief Physician
-      if (loadedData.containsKey('vitals_thresholds')) {
-        _systemFolders['global']?['vitals_thresholds'] = loadedData['vitals_thresholds'];
+      final unauthed = await _storage.loadUnauthenticatedVault();
+      if (_sessionEpoch == currentEpoch && _activePatientId == null && unauthed.isNotEmpty) {
+        _applyLoadedSnapshot(unauthed);
+      } else {
+        await _loadGuestVaultAsync(currentEpoch);
       }
     }
 
@@ -172,18 +421,425 @@ class VaultService extends ChangeNotifier {
       sw['heart_rate_samples'] = existingSamples;
     }
 
+    if (_isDisposed) return;
+    _isInitialized = true;
     notifyListeners();
   }
 
-  void _persist() {
-    final Map<String, dynamic> snapshot = {
+  Future<void> _loadPatientVaultAsync(String patientId, int epoch) async {
+    final storageKey = VaultStorageService.derivePatientStorageKey(patientId);
+
+    // Drain any pending write for this patient first to ensure we read the latest state
+    final pendingChain = _writeChains[storageKey];
+    if (pendingChain != null) {
+      try {
+        await pendingChain;
+      } catch (_) {}
+    }
+
+    // FENCE CHECK before read
+    if (_isDisposed || _sessionEpoch != epoch || _activePatientId != patientId) {
+      return;
+    }
+
+    Map<String, dynamic> loadedData = {};
+    try {
+      loadedData = await _storage.loadPatientVault(storageKey);
+    } catch (e) {
+      _persistenceErrorsByKey[storageKey] = e;
+      debugPrint('[VaultService] Error loading patient vault: $e');
+    }
+
+    // FENCE CHECK after read: Discard stale completion if patient or epoch changed or disposed
+    if (_isDisposed || _sessionEpoch != epoch || _activePatientId != patientId) {
+      return;
+    }
+
+    if (loadedData.isNotEmpty) {
+      _applyLoadedSnapshot(loadedData);
+    }
+    _ensureSmartWatchStructure();
+    notifyListeners();
+  }
+
+  Future<void> _loadGuestVaultAsync(int epoch) async {
+    final pendingChain = _writeChains[VaultStorageService.guestDraftStorageKey];
+    if (pendingChain != null) {
+      try {
+        await pendingChain;
+      } catch (_) {}
+    }
+
+    // FENCE CHECK before read
+    if (_isDisposed || _sessionEpoch != epoch || _activePatientId != null) {
+      return;
+    }
+
+    Map<String, dynamic> guestDraft = {};
+    try {
+      guestDraft = await _storage.loadGuestDraft();
+    } catch (e) {
+      _persistenceErrorsByKey[VaultStorageService.guestDraftStorageKey] = e;
+      debugPrint('[VaultService] Error loading guest draft: $e');
+    }
+
+    // FENCE CHECK after read: Discard stale completion if patient or epoch changed or disposed
+    if (_isDisposed || _sessionEpoch != epoch || _activePatientId != null) {
+      return;
+    }
+
+    if (guestDraft.isNotEmpty) {
+      _applyGuestDraft(guestDraft);
+    }
+    _ensureSmartWatchStructure();
+    notifyListeners();
+  }
+
+  void _applyLoadedSnapshot(Map<String, dynamic> loadedData) {
+    if (loadedData.containsKey('health_systems')) {
+      _data['health_systems'] = loadedData['health_systems'];
+    }
+    if (loadedData.containsKey('system_folders')) {
+      final savedFolders = loadedData['system_folders'] as Map<String, dynamic>;
+      savedFolders.forEach((key, value) {
+        if (_systemFolders.containsKey(key) && value is Map) {
+          _systemFolders[key] = Map<String, dynamic>.from(value);
+        }
+      });
+    }
+    if (loadedData.containsKey('curator_chat_history')) {
+      final savedChat = loadedData['curator_chat_history'] as List;
+      _curatorChatHistory.clear();
+      for (var item in savedChat) {
+        if (item is Map) {
+          _curatorChatHistory.add(Map<String, String>.from(item));
+        }
+      }
+    }
+    if (loadedData.containsKey('athena_clinical_logs')) {
+      final savedLogs = loadedData['athena_clinical_logs'] as List;
+      _athenaClinicalLogs.clear();
+      for (var item in savedLogs) {
+        if (item is Map) {
+          _athenaClinicalLogs.add(Map<String, dynamic>.from(item));
+        }
+      }
+    }
+
+    if (loadedData.containsKey('vitals_thresholds')) {
+      _systemFolders['global']?['vitals_thresholds'] = loadedData['vitals_thresholds'];
+    }
+  }
+
+  Map<String, dynamic> _createSnapshot() {
+    final raw = {
       'health_systems': _data['health_systems'],
       'system_folders': _systemFolders,
       'curator_chat_history': _curatorChatHistory,
       'vitals_thresholds': _systemFolders['global']?['vitals_thresholds'],
-      'athena_clinical_logs': _athenaClinicalLogs, // 🎯 New
+      'athena_clinical_logs': _athenaClinicalLogs,
     };
-    VaultStorageService.saveVault(snapshot);
+    // Deep clone to isolate snapshot from subsequent in-memory mutations (e.g. profile wipe)
+    return json.decode(json.encode(raw)) as Map<String, dynamic>;
+  }
+
+  /// Persists current vault snapshot to secure storage.
+  /// Enforces sequential write ordering per storage key and prevents stale overwrites.
+  Future<void> _persist() {
+    if (_isDisposed) return Future.value();
+
+    final currentPatientId = _activePatientId;
+    final int currentEpoch = _sessionEpoch;
+    final int writeSeq = ++_writeSequence;
+    final snapshot = _createSnapshot();
+
+    if (currentPatientId != null) {
+      final storageKey = VaultStorageService.derivePatientStorageKey(currentPatientId);
+      return _enqueueWrite(
+        storageKey: storageKey,
+        writeSeq: writeSeq,
+        patientId: currentPatientId,
+        epoch: currentEpoch,
+        writeAction: () => _storage.savePatientVault(storageKey, snapshot),
+        errorContext: 'patient vault ($currentPatientId)',
+      );
+    } else {
+      final draft = _createGuestDraftSnapshot();
+      Future<void> guestFuture = Future.value();
+      if (draft.isNotEmpty) {
+        guestFuture = _enqueueWrite(
+          storageKey: VaultStorageService.guestDraftStorageKey,
+          writeSeq: writeSeq,
+          patientId: null,
+          epoch: currentEpoch,
+          writeAction: () => _storage.saveGuestDraft(draft),
+          errorContext: 'guest draft',
+        );
+      }
+      final unauthedFuture = _enqueueWrite(
+        storageKey: VaultStorageService.unauthenticatedStorageKey,
+        writeSeq: writeSeq,
+        patientId: null,
+        epoch: currentEpoch,
+        writeAction: () => _storage.saveUnauthenticatedVault(snapshot),
+        errorContext: 'unauthenticated vault',
+      );
+      return Future.wait([guestFuture, unauthedFuture]);
+    }
+  }
+
+  Future<void> _enqueueWrite({
+    required String storageKey,
+    required int writeSeq,
+    required String? patientId,
+    required int epoch,
+    required Future<void> Function() writeAction,
+    required String errorContext,
+  }) {
+    final completer = Completer<void>();
+    // Attach error listener so unawaited futures never produce unhandled errors in the zone
+    completer.future.catchError((_) {});
+
+    Future<void> runTask() async {
+      final lastCommitted = _lastCommittedSeqByKey[storageKey] ?? 0;
+      if (writeSeq <= lastCommitted) {
+        debugPrint(
+          '[VaultService] Skipping obsolete write #$writeSeq for $storageKey (already committed #$lastCommitted)',
+        );
+        if (!completer.isCompleted) completer.complete();
+        return;
+      }
+
+      try {
+        await writeAction();
+        _lastCommittedSeqByKey[storageKey] = writeSeq;
+        _persistenceErrorsByKey.remove(storageKey);
+        if (!completer.isCompleted) completer.complete();
+      } catch (e) {
+        _persistenceErrorsByKey[storageKey] = e;
+        debugPrint('[VaultService] Failed to persist $errorContext: $e');
+        if (!completer.isCompleted) completer.completeError(e);
+      }
+    }
+
+    final activeChain = _writeChains[storageKey];
+    if (activeChain == null) {
+      // No write in flight for this storage key: start immediately
+      late final Future<void> immediateFuture;
+      immediateFuture = runTask().whenComplete(() {
+        if (identical(_writeChains[storageKey], immediateFuture)) {
+          _writeChains.remove(storageKey);
+        }
+      });
+      _writeChains[storageKey] = immediateFuture;
+    } else {
+      // Write already in flight: serialize behind previous write
+      late final Future<void> nextChain;
+      nextChain = activeChain
+          .catchError((_) {})
+          .then((_) => runTask())
+          .whenComplete(() {
+            if (identical(_writeChains[storageKey], nextChain)) {
+              _writeChains.remove(storageKey);
+            }
+          });
+      _writeChains[storageKey] = nextChain;
+    }
+
+    return completer.future;
+  }
+
+  Map<String, dynamic> _createGuestDraftSnapshot() {
+    final global = _systemFolders['global'] ?? {};
+    final notes = _systemFolders['notes_export'] ?? {};
+
+    final anamnesisGlobal = <String, dynamic>{};
+    for (final entry in global.entries) {
+      final k = entry.key;
+      if (k == 'vitals_thresholds' || k == 'athena_sprint_day' || k == 'athena_last_prompt_time') {
+        continue;
+      }
+      anamnesisGlobal[k] = entry.value;
+    }
+
+    if (anamnesisGlobal.isEmpty) {
+      return {};
+    }
+
+    final raw = {
+      'version': 1,
+      'global': anamnesisGlobal,
+      'notes_export': notes,
+      'timestamp': DateTime.now().toUtc().toIso8601String(),
+    };
+    return json.decode(json.encode(raw)) as Map<String, dynamic>;
+  }
+
+  void _applyGuestDraft(Map<String, dynamic> draft) {
+    final globalDraft = draft['global'];
+    if (globalDraft is Map) {
+      final currentGlobal = _systemFolders['global'] ??= <String, dynamic>{};
+      globalDraft.forEach((k, v) {
+        final keyStr = k.toString();
+        currentGlobal[keyStr] = v;
+        _applySingleAnamnesisDerivation(keyStr, v);
+      });
+    }
+    final notesDraft = draft['notes_export'];
+    if (notesDraft is Map) {
+      final currentNotes = _systemFolders['notes_export'] ??= <String, dynamic>{};
+      notesDraft.forEach((k, v) {
+        currentNotes[k.toString()] = v;
+      });
+    }
+  }
+
+  /// Checks if a guest anamnesis draft is stored locally.
+  Future<bool> hasGuestAnamnesisDraft() async {
+    final pendingChain = _writeChains[VaultStorageService.guestDraftStorageKey];
+    if (pendingChain != null) {
+      try {
+        await pendingChain;
+      } catch (_) {}
+    }
+    final draft = await _storage.loadGuestDraft();
+    return draft.isNotEmpty;
+  }
+
+  /// Retrieves the guest anamnesis draft, if any.
+  Future<Map<String, dynamic>?> getGuestAnamnesisDraft() async {
+    final pendingChain = _writeChains[VaultStorageService.guestDraftStorageKey];
+    if (pendingChain != null) {
+      try {
+        await pendingChain;
+      } catch (_) {}
+    }
+    final draft = await _storage.loadGuestDraft();
+    return draft.isNotEmpty ? draft : null;
+  }
+
+  /// Associates the existing guest anamnesis draft with the currently active confirmed patient.
+  /// Does NOT delete the original draft until confirmed server synchronization.
+  Future<bool> associateGuestDraftToActivePatient({bool overwriteExisting = false}) async {
+    if (_isDisposed) return false;
+
+    // 1. Capture confirmed patientId and sessionEpoch BEFORE await
+    final confirmedPatientId = _activePatientId;
+    final capturedEpoch = _sessionEpoch;
+
+    if (confirmedPatientId == null) {
+      return false;
+    }
+
+    // Await any pending guest draft write to ensure reading the latest state
+    final pendingGuestChain = _writeChains[VaultStorageService.guestDraftStorageKey];
+    if (pendingGuestChain != null) {
+      try {
+        await pendingGuestChain;
+      } catch (_) {}
+    }
+
+    final draft = await _storage.loadGuestDraft();
+
+    // 2. RE-VERIFY BOTH VALUES AFTER ASYNC READ
+    // If session changed, user logged out, pairing cancelled, or switched to another patient:
+    if (_isDisposed ||
+        _sessionEpoch != capturedEpoch ||
+        _activePatientId != confirmedPatientId) {
+      debugPrint('[VaultService] Aborting guest draft association: session changed during read.');
+      return false;
+    }
+
+    if (draft.isEmpty) {
+      return false;
+    }
+    final globalDraft = draft['global'];
+    if (globalDraft is! Map) {
+      return false;
+    }
+
+    final currentGlobal = _systemFolders['global'] ??= <String, dynamic>{};
+    globalDraft.forEach((k, v) {
+      final keyStr = k.toString();
+      if (overwriteExisting || !currentGlobal.containsKey(keyStr)) {
+        currentGlobal[keyStr] = v;
+        _mirrorToNotesExport('anamnesis_$keyStr', v);
+        _applySingleAnamnesisDerivation(keyStr, v);
+      }
+    });
+
+    // 3. Persist to active patient secure vault and verify success
+    final activeKey = VaultStorageService.derivePatientStorageKey(confirmedPatientId);
+    try {
+      await _persist();
+    } catch (e) {
+      debugPrint('[VaultService] Storage failure during guest draft association: $e');
+      return false;
+    }
+
+    if (_persistenceErrorsByKey.containsKey(activeKey)) {
+      return false;
+    }
+
+    notifyListeners();
+    return true;
+  }
+
+  /// Clears the guest anamnesis draft ONLY after confirmed server persistence.
+  /// Enqueued through the write queue so any in-flight write finishes before clearing.
+  Future<void> clearGuestDraftAfterServerSync() async {
+    final clearSeq = ++_writeSequence;
+    await _enqueueWrite(
+      storageKey: VaultStorageService.guestDraftStorageKey,
+      writeSeq: clearSeq,
+      patientId: null,
+      epoch: _sessionEpoch,
+      writeAction: () => _storage.clearGuestDraft(),
+      errorContext: 'clear guest draft',
+    );
+  }
+
+  /// Clears persisted vault data for [patientId] (or active patient).
+  /// Serialized through write queue: awaits pending writes before clearing,
+  /// and prevents subsequent writes from bypassing the clear operation.
+  Future<void> clearPatientVault([String? patientId]) async {
+    final targetId = patientId ?? _activePatientId;
+    final String storageKey = targetId != null
+        ? VaultStorageService.derivePatientStorageKey(targetId)
+        : VaultStorageService.unauthenticatedStorageKey;
+
+    final clearSeq = ++_writeSequence;
+    await _enqueueWrite(
+      storageKey: storageKey,
+      writeSeq: clearSeq,
+      patientId: targetId,
+      epoch: _sessionEpoch,
+      writeAction: () async {
+        if (targetId != null) {
+          await _storage.clearPatientVault(storageKey);
+        } else {
+          await _storage.clearUnauthenticatedVault();
+        }
+      },
+      errorContext: 'clear patient vault ($storageKey)',
+    );
+
+    if (targetId == _activePatientId) {
+      _clearSensitiveMemoryData();
+      notifyListeners();
+    }
+  }
+
+  /// Inspects quarantined legacy vault data without attributing it to any patient.
+  Future<Map<String, dynamic>?> inspectQuarantinedLegacyData() async {
+    return await _storage.loadLegacyVault();
+  }
+
+  @override
+  void dispose() {
+    _isDisposed = true;
+    _authSessionManager?.removeListener(_onAuthSessionChanged);
+    super.dispose();
   }
 
   String? get selectedSystem => _selectedSystem;
@@ -226,6 +882,9 @@ class VaultService extends ChangeNotifier {
 
   // METHOD FOR SAVING ANAMNESIS
   void saveAnamnesis(String cardId, dynamic value, {String userText = ""}) {
+    if (_systemFolders['global'] == null) {
+      _systemFolders['global'] = {};
+    }
     _systemFolders['global']![cardId] = value;
     if (userText.isNotEmpty) {
       _systemFolders['global']!['text_$cardId'] = userText;
@@ -236,6 +895,13 @@ class VaultService extends ChangeNotifier {
       _mirrorToNotesExport('anamnesis_text_$cardId', userText);
     }
 
+    _applySingleAnamnesisDerivation(cardId, value);
+
+    _persist();
+    notifyListeners();
+  }
+
+  void _applySingleAnamnesisDerivation(String cardId, dynamic value) {
     final String valueString = value.toString().toLowerCase();
 
     switch (cardId) {
@@ -448,8 +1114,6 @@ class VaultService extends ChangeNotifier {
         }
         break;
     }
-
-    notifyListeners();
   }
 
 // ==========================================
@@ -494,7 +1158,7 @@ class VaultService extends ChangeNotifier {
   }
 
 // Progress calculation
-  void _calculateProgress(String key) {
+  void calculateProgress(String key) {
     var markers = _data['health_systems'][key]['markers'] as Map;
     if (markers.isEmpty) return;
     int filled = markers.values.where((v) => v != 0 && v != null).length;
@@ -1178,7 +1842,28 @@ class VaultService extends ChangeNotifier {
     _athenaClinicalLogs.clear();
     _systemFolders['global']?['athena_sprint_day'] = 1;
     _hasUnreadAthenaMessage = false;
-    await VaultStorageService.clearVault();
+    if (_activePatientId != null) {
+      final key = VaultStorageService.derivePatientStorageKey(_activePatientId!);
+      final clearSeq = ++_writeSequence;
+      await _enqueueWrite(
+        storageKey: key,
+        writeSeq: clearSeq,
+        patientId: _activePatientId,
+        epoch: _sessionEpoch,
+        writeAction: () => _storage.clearPatientVault(key),
+        errorContext: 'clear patient vault ($_activePatientId)',
+      );
+    } else {
+      final clearSeq = ++_writeSequence;
+      await _enqueueWrite(
+        storageKey: VaultStorageService.unauthenticatedStorageKey,
+        writeSeq: clearSeq,
+        patientId: null,
+        epoch: _sessionEpoch,
+        writeAction: () => _storage.clearUnauthenticatedVault(),
+        errorContext: 'clear unauthenticated vault',
+      );
+    }
     _selectedSystem = null;
     _curatorChatHistory.clear();
     _athenaClinicalLogs.clear();
@@ -1227,7 +1912,7 @@ class VaultService extends ChangeNotifier {
       'global': {'labs': <String, dynamic>{}},
       'training_sandbox': {'raw_predictions': [], 'missing_data': [], 'risk_analysis': "PENDING..."},
     });
-    _persist();
+    await _persist();
     notifyListeners();
   }
 
