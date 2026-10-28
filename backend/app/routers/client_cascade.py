@@ -1,6 +1,16 @@
 from datetime import datetime, timezone
-from typing import Callable, Dict, Optional
-from fastapi import APIRouter, Depends, Header, HTTPException, Response, status
+from typing import Callable, Dict, List, Optional
+from fastapi import (
+    APIRouter,
+    Depends,
+    File,
+    Form,
+    Header,
+    HTTPException,
+    Response,
+    UploadFile,
+    status,
+)
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy.orm import Session
 
@@ -13,6 +23,7 @@ from app.schemas.consilium import (
     AnamnesisIntakeClientResponse,
     ClientVitalsThresholds,
     LabLedgerStateResponse,
+    LabVisionIntakeClientResponse,
     PrimaryConsiliumClientResponse,
     SYSTEM_KEYS,
 )
@@ -40,6 +51,10 @@ from app.services.primary_consilium_service import (
 from app.services.lab_revision_consilium_service import (
     LabRevisionConsiliumService,
     LABORATORY_LEDGER_REPORT_TYPE,
+)
+from app.services.lab_vision_ocr_service import (
+    LabVisionOcrService,
+    LabVisionValidationError,
 )
 
 router = APIRouter(prefix="/api/v1/client", tags=["Client Medical Operations"])
@@ -263,6 +278,91 @@ def get_client_cascade_status(
         is_primary_consilium_completed=is_completed,
         has_unreviewed_lab_changes=has_unreviewed,
     )
+
+
+@router.post(
+    "/cascade/intake/labs",
+    response_model=LabVisionIntakeClientResponse,
+    summary="Upload laboratory document images and run Vision OCR for authenticated patient (Patient-Isolated, Auto-Cycle)",
+    description=(
+        "Patient-scoped endpoint receiving 1 to 15 laboratory document images (JPEG, PNG, WEBP, HEIC/HEIF). "
+        "Strictly requires authenticated `DeviceSession` with `cascade:intake` scope. "
+        "Atomically resolves or provisions the active clinical cycle for the authenticated patient without "
+        "allowing arbitrary client-supplied cycle IDs. Validates real image magic bytes and resource limits, "
+        "extracts laboratory markers via server-side Gemini Vision OCR, and atomically synchronizes observations "
+        "into the versioned laboratory ledger."
+    ),
+)
+@router.post(
+    "/labs/upload",
+    response_model=LabVisionIntakeClientResponse,
+    include_in_schema=False,
+)
+async def submit_client_lab_document_intake(
+    files: Optional[List[UploadFile]] = File(None),
+    file: Optional[UploadFile] = File(None),
+    is_correction: bool = Form(default=False),
+    sample_date: Optional[str] = Form(default=None),
+    db: Session = Depends(get_db),
+    session: DeviceSession = Depends(require_device_session),
+    _scope: DeviceSession = Depends(require_scopes(SCOPE_CASCADE_INTAKE)),
+    gateway: GeminiGateway = Depends(get_gemini_gateway),
+    now_provider: Callable[[], datetime] = Depends(get_server_now_provider),
+) -> LabVisionIntakeClientResponse:
+    upload_files: List[UploadFile] = []
+    if files:
+        upload_files.extend(files)
+    elif file:
+        upload_files.append(file)
+
+    if not upload_files:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="At least one laboratory report image page must be uploaded.",
+        )
+
+    # 1. Atomically resolve or provision active cycle for authenticated patient
+    cycle_repo = MedicalCycleRepository(db)
+    cycle, _created = cycle_repo.get_or_create_active_for_patient(session.patient_id)
+
+    # 2. Process lab images via LabVisionOcrService with atomic ledger integration
+    service = LabVisionOcrService(
+        db=db,
+        gateway=gateway,
+        now_provider=now_provider,
+    )
+    try:
+        return await service.process_lab_images(
+            cycle_id=cycle.cycle_id,
+            files=upload_files,
+            is_correction=is_correction,
+            sample_date_override=sample_date,
+        )
+    except ConsiliumCycleNotFoundError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=str(exc),
+        ) from exc
+    except (ConsiliumConcurrencyConflictError, ReportVersionConflictError) as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=str(exc),
+        ) from exc
+    except LabVisionValidationError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(exc),
+        ) from exc
+    except GeminiGatewayError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Gemini Vision OCR extraction failed. Please retry later.",
+        ) from exc
+    except ConsiliumError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=str(exc),
+        ) from exc
 
 
 @router.get(
