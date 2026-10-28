@@ -62,6 +62,13 @@ from app.schemas.consilium import (
     VisionEcgModelOutput,
     EcgVisionIntakeClientResponse,
 )
+from app.schemas.chat import (
+    AthenaVitalsAlertContext,
+    AthenaChatRequest,
+    AthenaChatResponse,
+    AthenaChatMessageItem,
+    AthenaChatHistoryResponse,
+)
 
 __all__ = [
     "HealthResponse",
@@ -128,4 +135,9 @@ __all__ = [
     "HealthMeasurementResponse",
     "HealthMeasurementBatchResponse",
     "VitalsStreamResponse",
+    "AthenaVitalsAlertContext",
+    "AthenaChatRequest",
+    "AthenaChatResponse",
+    "AthenaChatMessageItem",
+    "AthenaChatHistoryResponse",
 ]

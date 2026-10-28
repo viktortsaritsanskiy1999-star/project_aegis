@@ -11,6 +11,8 @@ from app.routers import (
     reports_router,
     cascade_router,
     vitals_router,
+    client_cascade_router,
+    client_chat_router,
 )
 
 
@@ -49,3 +51,5 @@ app.include_router(cycles_router)
 app.include_router(reports_router)
 app.include_router(cascade_router)
 app.include_router(vitals_router)
+app.include_router(client_cascade_router)
+app.include_router(client_chat_router)

@@ -256,43 +256,51 @@ class GeminiGateway:
 
     async def generate_raw_text(
         self,
-        prompt: str,
+        prompt: Optional[str] = None,
         model: GeminiModelRole | str = GeminiModelRole.FLASH,
         system_instruction: Optional[str] = None,
         response_mime_type: str = "application/json",
         max_output_tokens: int = 8192,
         inline_images: Optional[List[Dict[str, str]]] = None,
+        contents: Optional[List[Dict[str, Any]]] = None,
     ) -> str:
         """
         Executes a call to Gemini generateContent endpoint with bounded retries on transient 429/503/timeout.
-        Supports multimodal requests with inline base64 images.
+        Supports multimodal requests with inline base64 images and multi-turn contents sequences.
         Never retries auth, billing, or validation errors.
         """
         api_key = self._require_api_key()
-        if not isinstance(prompt, str) or not prompt.strip():
-            raise GeminiValidationError("Prompt must be a non-empty string.")
 
-        resolved_model = self.resolve_model_name(model)
-        url = f"{self.base_url}/models/{resolved_model}:generateContent"
+        if contents is not None:
+            if not isinstance(contents, list) or not contents:
+                raise GeminiValidationError("contents must be a non-empty list of turn objects.")
+            request_contents = contents
+        else:
+            if not isinstance(prompt, str) or not prompt.strip():
+                raise GeminiValidationError("Prompt must be a non-empty string when contents is not provided.")
 
-        parts: List[Dict[str, Any]] = []
-        if inline_images:
-            for img in inline_images:
-                parts.append({
-                    "inlineData": {
-                        "mimeType": img["mime_type"],
-                        "data": img["data_base64"],
-                    }
-                })
-        parts.append({"text": prompt})
-
-        request_body: Dict[str, Any] = {
-            "contents": [
+            parts: List[Dict[str, Any]] = []
+            if inline_images:
+                for img in inline_images:
+                    parts.append({
+                        "inlineData": {
+                            "mimeType": img["mime_type"],
+                            "data": img["data_base64"],
+                        }
+                    })
+            parts.append({"text": prompt})
+            request_contents = [
                 {
                     "role": "user",
                     "parts": parts,
                 }
-            ],
+            ]
+
+        resolved_model = self.resolve_model_name(model)
+        url = f"{self.base_url}/models/{resolved_model}:generateContent"
+
+        request_body: Dict[str, Any] = {
+            "contents": request_contents,
             "generationConfig": {
                 "responseMimeType": response_mime_type,
                 "maxOutputTokens": max_output_tokens,
