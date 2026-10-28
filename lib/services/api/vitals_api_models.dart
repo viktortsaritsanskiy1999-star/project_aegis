@@ -34,6 +34,21 @@ class AegisForbiddenException extends AegisApiException {
   });
 }
 
+class AegisInsufficientScopeException extends AegisForbiddenException {
+  final String? requiredScope;
+
+  const AegisInsufficientScopeException(
+    super.message, {
+    super.statusCode = 403,
+    super.responseBody,
+    this.requiredScope,
+  });
+
+  @override
+  String toString() =>
+      'AegisInsufficientScopeException: $message (requiredScope: $requiredScope, status: $statusCode)';
+}
+
 class AegisBadRequestException extends AegisApiException {
   const AegisBadRequestException(super.message, {super.statusCode, super.responseBody});
 }
@@ -52,6 +67,18 @@ class AegisValidationException extends AegisApiException {
 
 class AegisServerException extends AegisApiException {
   const AegisServerException(super.message, {super.statusCode, super.responseBody});
+}
+
+class AegisServiceUnavailableException extends AegisServerException {
+  const AegisServiceUnavailableException(
+    super.message, {
+    super.statusCode = 503,
+    super.responseBody,
+  });
+
+  bool get isBlockedPendingDistributedLease =>
+      responseBody != null &&
+      responseBody.toString().contains('BLOCKED_PENDING_DISTRIBUTED_LEASE');
 }
 
 class AegisRateLimitException extends AegisApiException {

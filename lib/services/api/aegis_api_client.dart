@@ -4,6 +4,7 @@ import 'dart:io';
 import 'package:flutter/foundation.dart';
 import 'package:http/http.dart' as http;
 import '../auth/auth_models.dart';
+import 'medical_ai_api_models.dart';
 import 'vitals_api_models.dart';
 
 typedef TokenProvider = Future<String?> Function();
@@ -164,6 +165,18 @@ class AegisApiClient {
       case 401:
         throw AegisAuthException(safeDetail, statusCode: 401, responseBody: safeBody);
       case 403:
+        if (safeDetail.toLowerCase().contains('scope')) {
+          final scopeMatch = RegExp(
+            r'(?:Missing required scope|insufficient scope)[:\s]+([a-zA-Z0-9_:-]+)',
+            caseSensitive: false,
+          ).firstMatch(safeDetail);
+          throw AegisInsufficientScopeException(
+            safeDetail,
+            statusCode: 403,
+            responseBody: safeBody,
+            requiredScope: scopeMatch?.group(1),
+          );
+        }
         throw AegisForbiddenException(safeDetail, statusCode: 403, responseBody: safeBody);
       case 404:
         throw AegisCycleNotFoundException(safeDetail, statusCode: 404, responseBody: safeBody);
@@ -179,7 +192,7 @@ class AegisApiClient {
           retryAfter: _extractRetryAfter(response.headers),
         );
       case 503:
-        throw AegisServerException(safeDetail, statusCode: 503, responseBody: safeBody);
+        throw AegisServiceUnavailableException(safeDetail, statusCode: 503, responseBody: safeBody);
       default:
         if (response.statusCode >= 500) {
           throw AegisServerException(
@@ -194,6 +207,42 @@ class AegisApiClient {
           responseBody: safeBody,
         );
     }
+  }
+
+  /// Sends an authenticated request with automatic single token refresh retry on HTTP 401.
+  /// Strictly retries at most once. Never retries if an explicit access token was provided.
+  Future<http.Response> _sendWithAuthRetry({
+    required Future<http.Response> Function(String? token) sendRequest,
+    String? explicitAccessToken,
+  }) async {
+    String? token = explicitAccessToken;
+    if (token == null && _tokenProvider != null) {
+      token = await _tokenProvider!();
+    }
+
+    var response = await sendRequest(token);
+
+    if (response.statusCode == 401 && explicitAccessToken == null) {
+      _log('Received 401 Unauthorized. Attempting single token refresh...');
+      String? refreshedToken;
+      try {
+        if (_attachedSessionManager != null) {
+          final dynamic mgr = _attachedSessionManager;
+          refreshedToken = await mgr.refreshSession();
+        } else if (_tokenProvider != null) {
+          refreshedToken = await _tokenProvider!();
+        }
+      } catch (e) {
+        _log('Token refresh attempt failed: $e');
+      }
+
+      if (refreshedToken != null && refreshedToken.isNotEmpty) {
+        _log('Retrying request with refreshed access token...');
+        response = await sendRequest(refreshedToken);
+      }
+    }
+
+    return response;
   }
 
   /// Atomically pair a mobile device using a single-use 6-digit pairing code (`POST /api/v1/auth/pair`).
@@ -297,9 +346,14 @@ class AegisApiClient {
   Future<MedicalCycleResponse> getCurrentCycle({String? accessToken}) async {
     final uri = Uri.parse('$baseUrl/api/v1/cycle/current');
     try {
-      final headers = await _buildHeaders(accessToken: accessToken);
-      _log('GET $uri');
-      final response = await _client.get(uri, headers: headers).timeout(timeout);
+      final response = await _sendWithAuthRetry(
+        sendRequest: (token) async {
+          final headers = await _buildHeaders(accessToken: token);
+          _log('GET $uri');
+          return await _client.get(uri, headers: headers).timeout(timeout);
+        },
+        explicitAccessToken: accessToken,
+      );
 
       if (response.statusCode == 200) {
         final data = json.decode(response.body) as Map<String, dynamic>;
@@ -326,9 +380,14 @@ class AegisApiClient {
     final uri = Uri.parse('$baseUrl/api/v1/vitals/batch');
     final payloadJson = json.encode(batch.toJson());
     try {
-      final headers = await _buildHeaders(accessToken: accessToken);
-      _log('POST $uri (${batch.measurements.length} items for cycle ${batch.cycleId})');
-      final response = await _client.post(uri, headers: headers, body: payloadJson).timeout(timeout);
+      final response = await _sendWithAuthRetry(
+        sendRequest: (token) async {
+          final headers = await _buildHeaders(accessToken: token);
+          _log('POST $uri (${batch.measurements.length} items for cycle ${batch.cycleId})');
+          return await _client.post(uri, headers: headers, body: payloadJson).timeout(timeout);
+        },
+        explicitAccessToken: accessToken,
+      );
 
       if (response.statusCode == 200 || response.statusCode == 201) {
         final data = json.decode(response.body) as Map<String, dynamic>;
@@ -355,9 +414,14 @@ class AegisApiClient {
     final uri = Uri.parse('$baseUrl/api/v1/vitals/measurement');
     final payloadJson = json.encode(measurement.toJson());
     try {
-      final headers = await _buildHeaders(accessToken: accessToken);
-      _log('POST $uri (pulse: ${measurement.pulse}, source: ${measurement.source})');
-      final response = await _client.post(uri, headers: headers, body: payloadJson).timeout(timeout);
+      final response = await _sendWithAuthRetry(
+        sendRequest: (token) async {
+          final headers = await _buildHeaders(accessToken: token);
+          _log('POST $uri (pulse: ${measurement.pulse}, source: ${measurement.source})');
+          return await _client.post(uri, headers: headers, body: payloadJson).timeout(timeout);
+        },
+        explicitAccessToken: accessToken,
+      );
 
       if (response.statusCode == 200 || response.statusCode == 201) {
         final data = json.decode(response.body) as Map<String, dynamic>;
@@ -387,9 +451,14 @@ class AegisApiClient {
       if (includeSimulated) 'include_simulated': 'true',
     });
     try {
-      final headers = await _buildHeaders(accessToken: accessToken);
-      _log('GET $uri');
-      final response = await _client.get(uri, headers: headers).timeout(timeout);
+      final response = await _sendWithAuthRetry(
+        sendRequest: (token) async {
+          final headers = await _buildHeaders(accessToken: token);
+          _log('GET $uri');
+          return await _client.get(uri, headers: headers).timeout(timeout);
+        },
+        explicitAccessToken: accessToken,
+      );
 
       if (response.statusCode == 200) {
         final data = json.decode(response.body) as Map<String, dynamic>;
@@ -399,6 +468,249 @@ class AegisApiClient {
     } on TimeoutException catch (e) {
       _log('Timeout on $uri: $e');
       throw AegisTimeoutException('Latest vitals query timed out after ${timeout.inSeconds}s');
+    } on SocketException catch (e) {
+      _log('Socket error on $uri: $e');
+      throw AegisNetworkException('Network connection failed: ${e.message}');
+    } on http.ClientException catch (e) {
+      _log('Client error on $uri: $e');
+      throw AegisNetworkException('HTTP client error: ${e.message}');
+    }
+  }
+
+  /// Submit raw 17-card anamnesis questionnaire answers (`POST /api/v1/client/cascade/intake/anamnesis`).
+  /// Requires `cascade:intake` scope.
+  Future<AnamnesisIntakeClientResponse> submitAnamnesisIntake(
+    AnamnesisIntakeRequest request, {
+    String? accessToken,
+  }) async {
+    final uri = Uri.parse('$baseUrl/api/v1/client/cascade/intake/anamnesis');
+    final payloadJson = json.encode(request.toJson());
+    try {
+      final response = await _sendWithAuthRetry(
+        sendRequest: (token) async {
+          final headers = await _buildHeaders(accessToken: token);
+          _log('POST $uri');
+          return await _client.post(uri, headers: headers, body: payloadJson).timeout(timeout);
+        },
+        explicitAccessToken: accessToken,
+      );
+
+      if (response.statusCode == 200) {
+        final data = json.decode(response.body) as Map<String, dynamic>;
+        return AnamnesisIntakeClientResponse.fromJson(data);
+      }
+      _handleErrorResponse(response);
+    } on TimeoutException catch (e) {
+      _log('Timeout on $uri: $e');
+      throw AegisTimeoutException('Anamnesis intake timed out after ${timeout.inSeconds}s');
+    } on SocketException catch (e) {
+      _log('Socket error on $uri: $e');
+      throw AegisNetworkException('Network connection failed: ${e.message}');
+    } on http.ClientException catch (e) {
+      _log('Client error on $uri: $e');
+      throw AegisNetworkException('HTTP client error: ${e.message}');
+    }
+  }
+
+  /// Query clinical pipeline readiness status for authenticated patient (`GET /api/v1/client/cascade/status`).
+  /// Requires `cycle:read` scope.
+  Future<ClientCascadeStatusResponse> getCascadeStatus({String? accessToken}) async {
+    final uri = Uri.parse('$baseUrl/api/v1/client/cascade/status');
+    try {
+      final response = await _sendWithAuthRetry(
+        sendRequest: (token) async {
+          final headers = await _buildHeaders(accessToken: token);
+          _log('GET $uri');
+          return await _client.get(uri, headers: headers).timeout(timeout);
+        },
+        explicitAccessToken: accessToken,
+      );
+
+      if (response.statusCode == 200) {
+        final data = json.decode(response.body) as Map<String, dynamic>;
+        return ClientCascadeStatusResponse.fromJson(data);
+      }
+      _handleErrorResponse(response);
+    } on TimeoutException catch (e) {
+      _log('Timeout on $uri: $e');
+      throw AegisTimeoutException('Cascade status request timed out after ${timeout.inSeconds}s');
+    } on SocketException catch (e) {
+      _log('Socket error on $uri: $e');
+      throw AegisNetworkException('Network connection failed: ${e.message}');
+    } on http.ClientException catch (e) {
+      _log('Client error on $uri: $e');
+      throw AegisNetworkException('HTTP client error: ${e.message}');
+    }
+  }
+
+  /// Query laboratory ledger state and unreviewed changes indicator (`GET /api/v1/client/labs/state`).
+  /// Requires `cycle:read` scope.
+  Future<LabLedgerStateResponse> getLabLedgerState({String? accessToken}) async {
+    final uri = Uri.parse('$baseUrl/api/v1/client/labs/state');
+    try {
+      final response = await _sendWithAuthRetry(
+        sendRequest: (token) async {
+          final headers = await _buildHeaders(accessToken: token);
+          _log('GET $uri');
+          return await _client.get(uri, headers: headers).timeout(timeout);
+        },
+        explicitAccessToken: accessToken,
+      );
+
+      if (response.statusCode == 200) {
+        final data = json.decode(response.body) as Map<String, dynamic>;
+        return LabLedgerStateResponse.fromJson(data);
+      }
+      _handleErrorResponse(response);
+    } on TimeoutException catch (e) {
+      _log('Timeout on $uri: $e');
+      throw AegisTimeoutException('Lab ledger state request timed out after ${timeout.inSeconds}s');
+    } on SocketException catch (e) {
+      _log('Socket error on $uri: $e');
+      throw AegisNetworkException('Network connection failed: ${e.message}');
+    } on http.ClientException catch (e) {
+      _log('Client error on $uri: $e');
+      throw AegisNetworkException('HTTP client error: ${e.message}');
+    }
+  }
+
+  /// Run or recover Primary Consilium for authenticated patient (`POST /api/v1/client/cascade/run-primary`).
+  /// Requires `cascade:run` scope.
+  /// If completed, recovers existing reports directly. If fresh un-fenced execution is requested,
+  /// server blocks with HTTP 503 until distributed lease protocol is implemented in Stage 5.4E.
+  Future<PrimaryConsiliumClientResponse> runPrimaryConsilium({
+    String? idempotencyKey,
+    String? accessToken,
+  }) async {
+    final uri = Uri.parse('$baseUrl/api/v1/client/cascade/run-primary');
+    try {
+      final response = await _sendWithAuthRetry(
+        sendRequest: (token) async {
+          final headers = await _buildHeaders(accessToken: token);
+          if (idempotencyKey != null && idempotencyKey.trim().isNotEmpty) {
+            headers['Idempotency-Key'] = idempotencyKey.trim();
+          }
+          _log('POST $uri (idempotencyKey: $idempotencyKey)');
+          return await _client.post(uri, headers: headers).timeout(timeout);
+        },
+        explicitAccessToken: accessToken,
+      );
+
+      if (response.statusCode == 200) {
+        final data = json.decode(response.body) as Map<String, dynamic>;
+        return PrimaryConsiliumClientResponse.fromJson(data);
+      }
+      _handleErrorResponse(response);
+    } on TimeoutException catch (e) {
+      _log('Timeout on $uri: $e');
+      throw AegisTimeoutException('Primary consilium request timed out after ${timeout.inSeconds}s');
+    } on SocketException catch (e) {
+      _log('Socket error on $uri: $e');
+      throw AegisNetworkException('Network connection failed: ${e.message}');
+    } on http.ClientException catch (e) {
+      _log('Client error on $uri: $e');
+      throw AegisNetworkException('HTTP client error: ${e.message}');
+    }
+  }
+
+  /// Run Weekly Consilium for authenticated patient (`POST /api/v1/client/cascade/run-weekly`).
+  /// Requires `cascade:run` scope.
+  /// Blocked on the server with HTTP 503 pending Stage 5.4F.
+  Future<void> runWeeklyConsilium({String? accessToken}) async {
+    final uri = Uri.parse('$baseUrl/api/v1/client/cascade/run-weekly');
+    try {
+      final response = await _sendWithAuthRetry(
+        sendRequest: (token) async {
+          final headers = await _buildHeaders(accessToken: token);
+          _log('POST $uri');
+          return await _client.post(uri, headers: headers).timeout(timeout);
+        },
+        explicitAccessToken: accessToken,
+      );
+
+      if (response.statusCode == 200) {
+        return;
+      }
+      _handleErrorResponse(response);
+    } on TimeoutException catch (e) {
+      _log('Timeout on $uri: $e');
+      throw AegisTimeoutException('Weekly consilium request timed out after ${timeout.inSeconds}s');
+    } on SocketException catch (e) {
+      _log('Socket error on $uri: $e');
+      throw AegisNetworkException('Network connection failed: ${e.message}');
+    } on http.ClientException catch (e) {
+      _log('Client error on $uri: $e');
+      throw AegisNetworkException('HTTP client error: ${e.message}');
+    }
+  }
+
+  /// Send an interactive chat turn to Athena wellness curator (`POST /api/v1/client/chat/athena`).
+  /// Requires `chat:write` scope.
+  /// Strictly preserves the caller's [AthenaChatRequest.idempotencyKey] across automatic 401 refresh retries
+  /// and application-level network retries (e.g. after timeouts or connection drops).
+  Future<AthenaChatResponse> sendAthenaMessage(
+    AthenaChatRequest request, {
+    String? accessToken,
+  }) async {
+    if (request.idempotencyKey.trim().isEmpty) {
+      throw ArgumentError.value(
+        request.idempotencyKey,
+        'request.idempotencyKey',
+        'AthenaChatRequest must possess a non-empty idempotencyKey to ensure replay safety.',
+      );
+    }
+    final uri = Uri.parse('$baseUrl/api/v1/client/chat/athena');
+    final payloadJson = json.encode(request.toJson());
+
+    try {
+      final response = await _sendWithAuthRetry(
+        sendRequest: (token) async {
+          final headers = await _buildHeaders(accessToken: token);
+          _log('POST $uri (eventType: ${request.eventType}, idempotencyKey: ${request.idempotencyKey})');
+          return await _client.post(uri, headers: headers, body: payloadJson).timeout(timeout);
+        },
+        explicitAccessToken: accessToken,
+      );
+
+      if (response.statusCode == 200) {
+        final data = json.decode(response.body) as Map<String, dynamic>;
+        return AthenaChatResponse.fromJson(data);
+      }
+      _handleErrorResponse(response);
+    } on TimeoutException catch (e) {
+      _log('Timeout on $uri: $e');
+      throw AegisTimeoutException('Athena chat timed out after ${timeout.inSeconds}s');
+    } on SocketException catch (e) {
+      _log('Socket error on $uri: $e');
+      throw AegisNetworkException('Network connection failed: ${e.message}');
+    } on http.ClientException catch (e) {
+      _log('Client error on $uri: $e');
+      throw AegisNetworkException('HTTP client error: ${e.message}');
+    }
+  }
+
+  /// Retrieve sanitized dialogue history for Athena curator (`GET /api/v1/client/chat/athena/history`).
+  /// Requires `chat:read` scope.
+  Future<AthenaChatHistoryResponse> getAthenaHistory({String? accessToken}) async {
+    final uri = Uri.parse('$baseUrl/api/v1/client/chat/athena/history');
+    try {
+      final response = await _sendWithAuthRetry(
+        sendRequest: (token) async {
+          final headers = await _buildHeaders(accessToken: token);
+          _log('GET $uri');
+          return await _client.get(uri, headers: headers).timeout(timeout);
+        },
+        explicitAccessToken: accessToken,
+      );
+
+      if (response.statusCode == 200) {
+        final data = json.decode(response.body) as Map<String, dynamic>;
+        return AthenaChatHistoryResponse.fromJson(data);
+      }
+      _handleErrorResponse(response);
+    } on TimeoutException catch (e) {
+      _log('Timeout on $uri: $e');
+      throw AegisTimeoutException('Athena history request timed out after ${timeout.inSeconds}s');
     } on SocketException catch (e) {
       _log('Socket error on $uri: $e');
       throw AegisNetworkException('Network connection failed: ${e.message}');
