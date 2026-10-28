@@ -1,9 +1,54 @@
 import 'dart:async';
 import 'dart:convert';
 import 'package:flutter/foundation.dart';
+import 'api/aegis_api_client.dart';
+import 'api/medical_ai_api_models.dart';
+import 'api/vitals_api_models.dart';
+import 'auth/auth_models.dart';
 import 'auth/auth_session_manager.dart';
 import 'vault_storage_service.dart';
 import 'vitals_alert_context.dart';
+
+/// Synchronization status of raw anamnesis questionnaire with Aegis Server M1.
+enum AnamnesisSyncStatus {
+  idle,
+  draftSaved,
+  syncing,
+  synced,
+  offline,
+  unauthorized,
+  insufficientScopes,
+  error,
+}
+
+/// Result of an anamnesis synchronization attempt with server M1.
+class AnamnesisSyncResult {
+  final bool isSuccess;
+  final AnamnesisSyncStatus status;
+  final AnamnesisIntakeClientResponse? response;
+  final String? errorMessage;
+
+  const AnamnesisSyncResult._({
+    required this.isSuccess,
+    required this.status,
+    this.response,
+    this.errorMessage,
+  });
+
+  factory AnamnesisSyncResult.success(AnamnesisIntakeClientResponse response) =>
+      AnamnesisSyncResult._(
+        isSuccess: true,
+        status: AnamnesisSyncStatus.synced,
+        response: response,
+      );
+
+  factory AnamnesisSyncResult.failure(AnamnesisSyncStatus status, String errorMessage) =>
+      AnamnesisSyncResult._(
+        isSuccess: false,
+        status: status,
+        errorMessage: errorMessage,
+      );
+}
 
 class VaultService extends ChangeNotifier {
   // Your data for Atlas
@@ -132,6 +177,34 @@ class VaultService extends ChangeNotifier {
   LegacyVaultStatus get legacyVaultStatus => _legacyVaultStatus;
   bool get hasQuarantinedLegacyData => _legacyVaultStatus == LegacyVaultStatus.quarantined;
   bool get isInitialized => _isInitialized;
+
+  AnamnesisSyncStatus _anamnesisSyncStatus = AnamnesisSyncStatus.idle;
+  String? _anamnesisCycleId;
+  int? _anamnesisIntakeVersion;
+  DateTime? _anamnesisSyncedAt;
+  String? _anamnesisSyncError;
+  bool _isAnamnesisSyncing = false;
+
+  /// Current synchronization status of anamnesis with Aegis Server M1.
+  AnamnesisSyncStatus get anamnesisSyncStatus => _anamnesisSyncStatus;
+
+  /// Active medical cycle ID returned by server intake confirmation.
+  String? get anamnesisCycleId => _anamnesisCycleId;
+
+  /// Intake version returned by server intake confirmation.
+  int? get anamnesisIntakeVersion => _anamnesisIntakeVersion;
+
+  /// UTC timestamp of confirmed server intake synchronization.
+  DateTime? get anamnesisSyncedAt => _anamnesisSyncedAt;
+
+  /// Most recent anamnesis sync error message, if any.
+  String? get anamnesisSyncError => _anamnesisSyncError;
+
+  /// Whether an anamnesis synchronization request is currently in-flight.
+  bool get isAnamnesisSyncing => _isAnamnesisSyncing;
+
+  /// Whether anamnesis has been confirmed by the server for the active patient profile.
+  bool get isAnamnesisSynced => _anamnesisSyncStatus == AnamnesisSyncStatus.synced;
 
   /// Most recent persistence error encountered for active patient or unauthenticated storage.
   Object? get lastPersistenceError {
@@ -370,6 +443,13 @@ class VaultService extends ChangeNotifier {
 
     _systemFolders.clear();
     _systemFolders.addAll(_createDefaultSystemFolders());
+
+    _anamnesisSyncStatus = AnamnesisSyncStatus.idle;
+    _anamnesisCycleId = null;
+    _anamnesisIntakeVersion = null;
+    _anamnesisSyncedAt = null;
+    _anamnesisSyncError = null;
+    _isAnamnesisSyncing = false;
   }
 
   Future<void> _initVault() async {
@@ -529,6 +609,27 @@ class VaultService extends ChangeNotifier {
     if (loadedData.containsKey('vitals_thresholds')) {
       _systemFolders['global']?['vitals_thresholds'] = loadedData['vitals_thresholds'];
     }
+
+    if (loadedData.containsKey('anamnesis_sync') && loadedData['anamnesis_sync'] is Map) {
+      final syncMap = loadedData['anamnesis_sync'] as Map;
+      _anamnesisCycleId = syncMap['cycle_id'] as String?;
+      _anamnesisIntakeVersion = syncMap['intake_version'] as int?;
+      if (syncMap['synced_at'] != null) {
+        _anamnesisSyncedAt = DateTime.tryParse(syncMap['synced_at'].toString());
+      }
+      final statusStr = syncMap['status'] as String?;
+      if (statusStr != null) {
+        _anamnesisSyncStatus = AnamnesisSyncStatus.values.firstWhere(
+          (e) => e.name == statusStr,
+          orElse: () => AnamnesisSyncStatus.idle,
+        );
+      }
+    } else {
+      _anamnesisCycleId = null;
+      _anamnesisIntakeVersion = null;
+      _anamnesisSyncedAt = null;
+      _anamnesisSyncStatus = AnamnesisSyncStatus.idle;
+    }
   }
 
   Map<String, dynamic> _createSnapshot() {
@@ -538,6 +639,12 @@ class VaultService extends ChangeNotifier {
       'curator_chat_history': _curatorChatHistory,
       'vitals_thresholds': _systemFolders['global']?['vitals_thresholds'],
       'athena_clinical_logs': _athenaClinicalLogs,
+      'anamnesis_sync': {
+        'status': _anamnesisSyncStatus.name,
+        'cycle_id': _anamnesisCycleId,
+        'intake_version': _anamnesisIntakeVersion,
+        'synced_at': _anamnesisSyncedAt?.toIso8601String(),
+      },
     };
     // Deep clone to isolate snapshot from subsequent in-memory mutations (e.g. profile wipe)
     return json.decode(json.encode(raw)) as Map<String, dynamic>;
@@ -785,6 +892,344 @@ class VaultService extends ChangeNotifier {
     return true;
   }
 
+  /// Validates and constructs typed [AnamnesisQuestionnaireAnswers] from vault data.
+  /// Returns null if any of the mandatory 17 card answers are missing or invalid.
+  AnamnesisQuestionnaireAnswers? buildAnamnesisAnswers() {
+    final global = _systemFolders['global'];
+    if (global == null) return null;
+
+    final ageConf = global['age_confirmation']?.toString().trim();
+    if (ageConf == null || ageConf.isEmpty) return null;
+
+    final gender = global['gender']?.toString().trim();
+    if (gender == null || gender.isEmpty) return null;
+
+    final ageRaw = global['age'];
+    final int? age = ageRaw is int ? ageRaw : int.tryParse(ageRaw?.toString().trim() ?? '');
+    if (age == null || age < 18 || age > 120) return null;
+
+    final heightRaw = global['height'];
+    final int? height = heightRaw is int ? heightRaw : int.tryParse(heightRaw?.toString().trim() ?? '');
+    if (height == null || height < 50 || height > 260) return null;
+
+    final weightRaw = global['weight'];
+    final int? weight = weightRaw is int ? weightRaw : int.tryParse(weightRaw?.toString().trim() ?? '');
+    if (weight == null || weight < 30 || weight > 350) return null;
+
+    final nicotineStatus = global['nicotine_status']?.toString().trim();
+    if (nicotineStatus == null || nicotineStatus.isEmpty) return null;
+
+    final alcoholStatus = global['alcohol_status']?.toString().trim();
+    if (alcoholStatus == null || alcoholStatus.isEmpty) return null;
+
+    final specFactors = global['spec_factors']?.toString().trim();
+    if (specFactors == null || specFactors.isEmpty) return null;
+
+    final sleepQuality = global['sleep_quality']?.toString().trim();
+    if (sleepQuality == null || sleepQuality.isEmpty) return null;
+
+    final dietTypes = global['diet_types']?.toString().trim();
+    if (dietTypes == null || dietTypes.isEmpty) return null;
+
+    final dietHabits = global['diet_habits']?.toString().trim();
+    if (dietHabits == null || dietHabits.isEmpty) return null;
+
+    final giSignals = global['gi_signals']?.toString().trim();
+    if (giSignals == null || giSignals.isEmpty) return null;
+
+    final workType = global['work_type']?.toString().trim();
+    if (workType == null || workType.isEmpty) return null;
+
+    final chronicDiseases = global['chronic_diseases']?.toString().trim();
+    if (chronicDiseases == null || chronicDiseases.isEmpty) return null;
+
+    final recentIllness = global['recent_illness']?.toString().trim();
+    if (recentIllness == null || recentIllness.isEmpty) return null;
+
+    final criticalInfections = global['critical_infections']?.toString().trim();
+    if (criticalInfections == null || criticalInfections.isEmpty) return null;
+
+    final heredityRisks = global['heredity_risks']?.toString().trim();
+    if (heredityRisks == null || heredityRisks.isEmpty) return null;
+
+    final medications = global['medications']?.toString().trim();
+    if (medications == null || medications.isEmpty) return null;
+
+    return AnamnesisQuestionnaireAnswers(
+      ageConfirmation: ageConf,
+      gender: gender,
+      age: age,
+      height: height,
+      weight: weight,
+      nicotineStatus: nicotineStatus,
+      nicotineYears: global['nicotine_years']?.toString().trim(),
+      nicotineFreq: global['nicotine_freq']?.toString().trim(),
+      alcoholStatus: alcoholStatus,
+      alcoholType: global['alcohol_type']?.toString().trim(),
+      specFactors: specFactors,
+      sleepQuality: sleepQuality,
+      dietTypes: dietTypes,
+      dietHabits: dietHabits,
+      giSignals: giSignals,
+      workType: workType,
+      workSchedule: global['work_schedule']?.toString().trim(),
+      sportLevel: global['sport_level']?.toString().trim(),
+      chronicDiseases: chronicDiseases,
+      oncoStatus: global['onco_status']?.toString().trim(),
+      recentIllness: recentIllness,
+      criticalInfections: criticalInfections,
+      heredityRisks: heredityRisks,
+      medications: medications,
+      userTextMedications: global['text_medications']?.toString().trim(),
+      userTextHeredityRisks: global['text_heredity_risks']?.toString().trim(),
+      userTextChronicDiseases: global['text_chronic_diseases']?.toString().trim(),
+      userTextRecentIllness: global['text_recent_illness']?.toString().trim(),
+      userTextCriticalInfections: global['text_critical_infections']?.toString().trim(),
+      userTextSpecFactors: global['text_spec_factors']?.toString().trim(),
+      userTextDietHabits: global['text_diet_habits']?.toString().trim(),
+      userTextGiSignals: global['text_gi_signals']?.toString().trim(),
+    );
+  }
+
+  /// Whether the anamnesis questionnaire is fully answered and ready for server intake.
+  bool get isAnamnesisComplete => buildAnamnesisAnswers() != null;
+
+  /// Synchronizes complete raw anamnesis questionnaire with Aegis Server M1.
+  /// Follows strict Project Aegis Stage 5.4D-3 protocol:
+  /// 1. Concurrency guard prevents duplicate in-flight requests.
+  /// 2. Completeness validation: rejects submission if any of the 17 cards are incomplete.
+  /// 3. Confirmed patient authorization: checks active session binding.
+  /// 4. Scope verification: requires `cascade:intake` permission.
+  /// 5. Epoch fencing: verifies patient attribution both before and after network dispatch.
+  /// 6. Confirmation: updates sync status and clears guest draft ONLY upon HTTP 200 confirmation.
+  Future<AnamnesisSyncResult> syncAnamnesisToServer({
+    required AegisApiClient apiClient,
+    AuthSessionManager? authSessionManager,
+  }) async {
+    // 1. Guard against parallel concurrent submissions
+    if (_isAnamnesisSyncing) {
+      debugPrint('[VaultService] Anamnesis sync already in progress. Ignoring concurrent call.');
+      return AnamnesisSyncResult.failure(
+        _anamnesisSyncStatus,
+        'Sync already in progress',
+      );
+    }
+
+    // 2. Completeness validation: do not submit incomplete anamnesis
+    final answers = buildAnamnesisAnswers();
+    if (answers == null) {
+      _anamnesisSyncStatus = AnamnesisSyncStatus.draftSaved;
+      _anamnesisSyncError = 'Anamnesis questionnaire is incomplete.';
+      notifyListeners();
+      return AnamnesisSyncResult.failure(
+        AnamnesisSyncStatus.draftSaved,
+        'Cannot submit incomplete anamnesis: all 17 cards must be completed.',
+      );
+    }
+
+    // 3. Authorization check
+    final sessionManager = authSessionManager ?? _authSessionManager;
+    final String? confirmedPatientId = sessionManager?.confirmedAttributionPatientId ?? _activePatientId;
+    final bool isAuthenticated = (sessionManager?.isAuthenticated ?? false) && confirmedPatientId != null;
+
+    if (!isAuthenticated) {
+      _anamnesisSyncStatus = AnamnesisSyncStatus.unauthorized;
+      _anamnesisSyncError = 'Device pairing required to synchronize anamnesis with server.';
+      notifyListeners();
+      return AnamnesisSyncResult.failure(
+        AnamnesisSyncStatus.unauthorized,
+        'Device pairing required to synchronize anamnesis with Aegis server.',
+      );
+    }
+
+    // 4. Capture session epoch and patient attribution
+    final int capturedEpoch = _sessionEpoch;
+    final String capturedPatientId = confirmedPatientId;
+
+    // ACQUIRE SINGLE-FLIGHT LOCK BEFORE ANY ASYNC OPERATIONS (including scope upgrade)
+    _isAnamnesisSyncing = true;
+    _anamnesisSyncStatus = AnamnesisSyncStatus.syncing;
+    _anamnesisSyncError = null;
+    notifyListeners();
+
+    try {
+      // 5. Scope check & planned upgrade: cascade:intake required
+      final session = sessionManager?.currentSession;
+      if (session != null && !session.hasScope('cascade:intake')) {
+        if (sessionManager != null) {
+          // Attempt planned one-off token rotation via ensureRequiredScopes
+          final upgraded = await sessionManager.ensureRequiredScopes(
+            requiredScopes: const [AegisScopes.cascadeIntake],
+          );
+          // Epoch fencing check after async scope upgrade
+          if (_isDisposed ||
+              _sessionEpoch != capturedEpoch ||
+              _activePatientId != capturedPatientId) {
+            return AnamnesisSyncResult.failure(
+              AnamnesisSyncStatus.idle,
+              'Patient switched during scope upgrade; aborting sync.',
+            );
+          }
+          if (!upgraded ||
+              sessionManager.currentSession == null ||
+              !sessionManager.currentSession!.hasScope('cascade:intake')) {
+            _anamnesisSyncStatus = AnamnesisSyncStatus.insufficientScopes;
+            _anamnesisSyncError = 'Access denied: session lacks required scope (cascade:intake).';
+            notifyListeners();
+            return AnamnesisSyncResult.failure(
+              AnamnesisSyncStatus.insufficientScopes,
+              'Access denied: session lacks required scope (cascade:intake).',
+            );
+          }
+        } else {
+          _anamnesisSyncStatus = AnamnesisSyncStatus.insufficientScopes;
+          _anamnesisSyncError = 'Access denied: session lacks required scope (cascade:intake).';
+          notifyListeners();
+          return AnamnesisSyncResult.failure(
+            AnamnesisSyncStatus.insufficientScopes,
+            'Access denied: session lacks required scope (cascade:intake).',
+          );
+        }
+      }
+
+      // 6. Ensure all pending local storage writes are committed before network call
+      await flushPendingWrites(patientId: capturedPatientId);
+
+      // Epoch fencing check after local write flush
+      if (_isDisposed ||
+          _sessionEpoch != capturedEpoch ||
+          _activePatientId != capturedPatientId) {
+        return AnamnesisSyncResult.failure(
+          AnamnesisSyncStatus.idle,
+          'Patient switched during local write flush; aborting sync.',
+        );
+      }
+
+      // 7. Dispatch to server
+      final request = AnamnesisIntakeRequest(answers: answers);
+      final response = await apiClient.submitAnamnesisIntake(request);
+
+      // 8. Re-verify epoch and patient attribution after async network call
+      if (_isDisposed ||
+          _sessionEpoch != capturedEpoch ||
+          _activePatientId != capturedPatientId) {
+        debugPrint('[VaultService] Discarding anamnesis response: active patient or session epoch changed during request.');
+        return AnamnesisSyncResult.failure(
+          AnamnesisSyncStatus.idle,
+          'Patient switched during network dispatch; response discarded.',
+        );
+      }
+
+      // 9. Server confirmed 200 OK:
+      // Update in-memory sync metadata and establish final synced status
+      _anamnesisCycleId = response.cycleId;
+      _anamnesisIntakeVersion = response.intakeVersion;
+      _anamnesisSyncedAt = DateTime.now().toUtc();
+      _anamnesisSyncStatus = AnamnesisSyncStatus.synced;
+      _anamnesisSyncError = null;
+
+      // Update shelf for consilium status in UI
+      _systemFolders['core_cascade']?['flash_general_shelf'] =
+          'Anamnesis processed by server (Cycle ${response.cycleId}, v${response.intakeVersion})';
+
+      // 10. Persist confirmed sync state in patient secure vault and VERIFY PERSISTENCE!
+      // This ensures status: 'synced' is written to storage BEFORE guest draft deletion.
+      try {
+        await _persist();
+        await flushPendingWrites(patientId: capturedPatientId);
+      } catch (storageError) {
+        debugPrint('[VaultService] Secure storage failed to persist sync metadata: $storageError');
+        _anamnesisSyncStatus = AnamnesisSyncStatus.error;
+        _anamnesisSyncError = 'Failed to securely persist sync confirmation: $storageError';
+        notifyListeners();
+        // CRITICAL: Return failure; guest draft is NOT cleared!
+        return AnamnesisSyncResult.failure(
+          AnamnesisSyncStatus.error,
+          'Failed to securely persist intake confirmation: $storageError',
+        );
+      }
+
+      // 11. Re-verify epoch after patient vault persistence
+      if (_isDisposed ||
+          _sessionEpoch != capturedEpoch ||
+          _activePatientId != capturedPatientId) {
+        debugPrint('[VaultService] Patient changed during persistence; aborting draft cleanup.');
+        return AnamnesisSyncResult.failure(
+          AnamnesisSyncStatus.idle,
+          'Patient switched during storage write; cleanup aborted.',
+        );
+      }
+
+      // 12. Local persistence confirmed! NOW AND ONLY NOW: clear guest draft
+      await clearGuestDraftAfterServerSync();
+
+      // 13. Re-verify epoch after draft cleanup
+      if (_isDisposed ||
+          _sessionEpoch != capturedEpoch ||
+          _activePatientId != capturedPatientId) {
+        return AnamnesisSyncResult.failure(
+          AnamnesisSyncStatus.idle,
+          'Patient switched after draft clear; response discarded.',
+        );
+      }
+
+      notifyListeners();
+      return AnamnesisSyncResult.success(response);
+    } on AegisForbiddenException catch (e) {
+      if (_sessionEpoch == capturedEpoch) {
+        _anamnesisSyncStatus = AnamnesisSyncStatus.insufficientScopes;
+        _anamnesisSyncError = 'Access denied: ${e.message}';
+        notifyListeners();
+      }
+      return AnamnesisSyncResult.failure(
+        AnamnesisSyncStatus.insufficientScopes,
+        'Forbidden: missing cascade:intake scope.',
+      );
+    } on AegisAuthException catch (e) {
+      if (_sessionEpoch == capturedEpoch) {
+        _anamnesisSyncStatus = AnamnesisSyncStatus.unauthorized;
+        _anamnesisSyncError = 'Session expired: ${e.message}';
+        notifyListeners();
+      }
+      return AnamnesisSyncResult.failure(
+        AnamnesisSyncStatus.unauthorized,
+        'Unauthorized: session expired or token invalid.',
+      );
+    } on AegisTimeoutException catch (e) {
+      if (_sessionEpoch == capturedEpoch) {
+        _anamnesisSyncStatus = AnamnesisSyncStatus.offline;
+        _anamnesisSyncError = 'Connection timed out. Draft saved securely. Tap to retry.';
+        notifyListeners();
+      }
+      return AnamnesisSyncResult.failure(
+        AnamnesisSyncStatus.offline,
+        'Timeout during intake submission: ${e.message}',
+      );
+    } on AegisNetworkException catch (e) {
+      if (_sessionEpoch == capturedEpoch) {
+        _anamnesisSyncStatus = AnamnesisSyncStatus.offline;
+        _anamnesisSyncError = 'Network connection failed. Draft saved securely. Tap to retry.';
+        notifyListeners();
+      }
+      return AnamnesisSyncResult.failure(
+        AnamnesisSyncStatus.offline,
+        'Network error: ${e.message}',
+      );
+    } catch (e) {
+      if (_sessionEpoch == capturedEpoch) {
+        _anamnesisSyncStatus = AnamnesisSyncStatus.error;
+        _anamnesisSyncError = 'Sync failed: $e';
+        notifyListeners();
+      }
+      return AnamnesisSyncResult.failure(
+        AnamnesisSyncStatus.error,
+        'Intake submission failed: $e',
+      );
+    } finally {
+      _isAnamnesisSyncing = false;
+    }
+  }
+
   /// Clears the guest anamnesis draft ONLY after confirmed server persistence.
   /// Enqueued through the write queue so any in-flight write finishes before clearing.
   Future<void> clearGuestDraftAfterServerSync() async {
@@ -838,6 +1283,7 @@ class VaultService extends ChangeNotifier {
   @override
   void dispose() {
     _isDisposed = true;
+    _isAnamnesisSyncing = false;
     _authSessionManager?.removeListener(_onAuthSessionChanged);
     super.dispose();
   }

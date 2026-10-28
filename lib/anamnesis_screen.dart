@@ -1,7 +1,10 @@
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
+import 'services/api/aegis_api_client.dart';
+import 'services/auth/auth_session_manager.dart';
 import 'services/vault_service.dart';
 import 'services/brain_service.dart';
+import 'widgets/aegis_device_pairing_modal.dart';
 import 'package:aegis_health/screens/smart_watch_import_screen.dart';
 
 class AnamnesisScreen extends StatefulWidget {
@@ -22,6 +25,57 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
   bool _isAlcoholBranch = false;
   bool _isWorkFrequencyBranch = false;
   bool _isOncoBranch = false;
+  bool _isSubmitting = false;
+  int? _lastSeenEpoch;
+  String? _lastSeenPatientId;
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    final vault = Provider.of<VaultService>(context, listen: true);
+    if (_lastSeenPatientId != null &&
+        (_lastSeenPatientId != vault.activePatientId || _lastSeenEpoch != vault.sessionEpoch)) {
+      _resetLocalState();
+    } else if (_lastSeenPatientId == null && vault.activePatientId != null) {
+      _restoreLocalStateFromVault(vault);
+    }
+    _lastSeenPatientId = vault.activePatientId;
+    _lastSeenEpoch = vault.sessionEpoch;
+  }
+
+  void _restoreLocalStateFromVault(VaultService vault) {
+    final global = vault.getSystemContext('global');
+    if (global.isEmpty) return;
+    if (_selectedGender == null && global['gender'] != null) {
+      final g = global['gender'].toString().toLowerCase();
+      if (g == 'male') _selectedGender = 'm';
+      if (g == 'female') _selectedGender = 'f';
+    }
+    if (hController.text.isEmpty && global['height'] != null) {
+      hController.text = global['height'].toString();
+    }
+    if (wController.text.isEmpty && global['weight'] != null) {
+      wController.text = global['weight'].toString();
+    }
+  }
+
+  void _resetLocalState() {
+    _selectedGender = null;
+    _multiSelect.clear();
+    _customInputController.clear();
+    hController.clear();
+    wController.clear();
+    _isSmokingBranch = false;
+    _isSmokingFrequencyBranch = false;
+    _isAlcoholBranch = false;
+    _isWorkFrequencyBranch = false;
+    _isOncoBranch = false;
+    _currentError = null;
+    _currentPage = 0;
+    if (_controller.hasClients) {
+      _controller.jumpToPage(0);
+    }
+  }
 
   final Set<String> _multiSelect = {};
 
@@ -569,13 +623,12 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
       }
 
       // 2. Get services
-      final brain = context.read<BrainService>();
+      final brain = Provider.of<BrainService?>(context, listen: false);
       final vault = context.read<VaultService>();
 
       // 3. First AI determines systems (if there is text)
-      List<String>? systems;
-      if (hasText) {
-        systems = await brain.identifySystems(textInput);
+      if (hasText && brain != null) {
+        await brain.identifySystems(textInput);
       }
 
       // 4. SAVING: Now without await and without systemsFromAi
@@ -914,31 +967,101 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
     const SizedBox(height: 20),
 
     _buildSelectableOption("Finish 🚀", false, () async {
-      final vault = context.read<VaultService>();
-      final brain = context.read<BrainService>();
-      final String textInput = _customInputController.text.trim();
+      if (_isSubmitting) return;
 
-      // 1. Form the final medication string
-      String result = _multiSelect.join(', ');
-      if (textInput.isNotEmpty) {
-        result += (result.isEmpty ? "" : ", ") + textInput;
-      }
+      setState(() {
+        _isSubmitting = true;
+      });
 
-      // 2. Local save to Vault (instant)
-      vault.saveAnamnesis(
+      try {
+        final vault = context.read<VaultService>();
+        final auth = Provider.of<AuthSessionManager?>(context, listen: false);
+        final apiClient = Provider.of<AegisApiClient?>(context, listen: false);
+        final String textInput = _customInputController.text.trim();
+
+        // 1. Form the final medication string
+        String result = _multiSelect.join(', ');
+        if (textInput.isNotEmpty) {
+          result += (result.isEmpty ? "" : ", ") + textInput;
+        }
+
+        // 2. Local save to Vault (instant)
+        vault.saveAnamnesis(
           'medications',
           result,
-          userText: textInput
-      );
+          userText: textInput,
+        );
 
-      // 3. TRANSITION TO LOADING SCREEN (so the user doesn't double-tap)
-      setState(() => _currentError = "Launching medical intelligence...");
+        // 3. Ensure local persistence completes
+        await vault.flushPendingWrites();
+        if (!mounted) return;
 
-      // 4. MAIN EXECUTION (Await response from Gemini)
-      await brain.processFullAnamnesis(vault);
+        // 4. Check device authentication
+        if (auth == null || !auth.isAuthenticated) {
+          setState(() => _currentError = "Device pairing required to synchronize anamnesis with Aegis Server.");
+          await AegisDevicePairingModal.show(context);
+          if (!mounted) return;
 
-      // 5. Proceed to the final screen once everything is categorized
-      _nextPage();
+          if (auth == null || !auth.isAuthenticated) {
+            setState(() => _currentError = "Draft saved securely. Pair device to synchronize with Aegis Server.");
+            return;
+          }
+
+          // Newly paired: associate guest draft to active patient
+          await vault.associateGuestDraftToActivePatient();
+          if (!mounted) return;
+
+          setState(() => _currentError = "Device paired! Tap 'Finish 🚀' to synchronize anamnesis with Aegis Server.");
+          return;
+        }
+
+        // 5. Server synchronization via AegisApiClient
+        if (apiClient == null) {
+          setState(() => _currentError = "API client unavailable. Draft saved securely.");
+          return;
+        }
+
+        setState(() {
+          _currentError = "Synchronizing with Aegis Server (M1)...";
+        });
+
+        final syncResult = await vault.syncAnamnesisToServer(
+          apiClient: apiClient,
+          authSessionManager: auth,
+        );
+
+        if (!mounted) return;
+
+        if (syncResult.isSuccess) {
+          setState(() {
+            _currentError = null;
+          });
+          _nextPage();
+        } else {
+          setState(() {
+            if (syncResult.status == AnamnesisSyncStatus.offline) {
+              _currentError = "Connection timeout or network failure. Draft saved securely. Tap 'Finish 🚀' to retry.";
+            } else if (syncResult.status == AnamnesisSyncStatus.insufficientScopes) {
+              _currentError = "Access denied: session lacks 'cascade:intake' scope. Please re-pair device.";
+            } else if (syncResult.status == AnamnesisSyncStatus.unauthorized) {
+              _currentError = "Session expired or device not paired. Tap 'Finish 🚀' to re-authenticate.";
+            } else {
+              _currentError = syncResult.errorMessage ?? "Synchronization failed. Draft saved securely.";
+            }
+          });
+        }
+      } catch (e) {
+        if (!mounted) return;
+        setState(() {
+          _currentError = "Error: $e. Draft saved securely. Tap 'Finish 🚀' to retry.";
+        });
+      } finally {
+        if (mounted) {
+          setState(() {
+            _isSubmitting = false;
+          });
+        }
+      }
     }),
   ]);
 
