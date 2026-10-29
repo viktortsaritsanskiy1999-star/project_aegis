@@ -22,6 +22,7 @@ from app.schemas.consilium import (
     AnamnesisQuestionnaireAnswers,
     AnamnesisIntakeClientResponse,
     ClientVitalsThresholds,
+    EcgVisionIntakeClientResponse,
     LabLedgerStateResponse,
     LabVisionIntakeClientResponse,
     PrimaryConsiliumClientResponse,
@@ -55,6 +56,10 @@ from app.services.lab_revision_consilium_service import (
 from app.services.lab_vision_ocr_service import (
     LabVisionOcrService,
     LabVisionValidationError,
+)
+from app.services.ecg_vision_service import (
+    EcgVisionService,
+    EcgVisionValidationError,
 )
 
 router = APIRouter(prefix="/api/v1/client", tags=["Client Medical Operations"])
@@ -389,6 +394,140 @@ def get_client_lab_ledger_state(
 ) -> LabLedgerStateResponse:
     lab_service = LabRevisionConsiliumService(db=db, gateway=gateway, now_provider=now_provider)
     return lab_service.get_lab_ledger_state(cycle.cycle_id)
+
+
+@router.post(
+    "/cascade/intake/ecg",
+    response_model=EcgVisionIntakeClientResponse,
+    summary="Upload electrocardiogram image and run Vision ECG for authenticated patient (Patient-Isolated, Auto-Cycle)",
+    description=(
+        "Patient-scoped endpoint receiving an electrocardiogram tracing image (JPEG, PNG, WEBP, HEIC/HEIF). "
+        "Strictly requires authenticated `DeviceSession` with `cascade:intake` scope. "
+        "Atomically resolves or provisions the active clinical cycle for the authenticated patient without "
+        "allowing arbitrary client-supplied cycle IDs or patient IDs. Validates real image magic bytes and 10MB limit, "
+        "extracts ECG features via server-side Gemini Vision under server_only privacy level, "
+        "and securely returns operational metadata without leaking internal clinical hypotheses."
+    ),
+)
+@router.post(
+    "/ecg/upload",
+    response_model=EcgVisionIntakeClientResponse,
+    include_in_schema=False,
+)
+async def submit_client_ecg_document_intake(
+    file: Optional[UploadFile] = File(None),
+    files: Optional[List[UploadFile]] = File(None),
+    record_date: Optional[str] = Form(default=None),
+    db: Session = Depends(get_db),
+    session: DeviceSession = Depends(require_device_session),
+    _scope: DeviceSession = Depends(require_scopes(SCOPE_CASCADE_INTAKE)),
+    gateway: GeminiGateway = Depends(get_gemini_gateway),
+    now_provider: Callable[[], datetime] = Depends(get_server_now_provider),
+) -> EcgVisionIntakeClientResponse:
+    target_file = file
+    if target_file is None and files:
+        target_file = files[0]
+
+    if not target_file:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="An electrocardiogram image file must be uploaded.",
+        )
+
+    # 1. Atomically resolve or provision active cycle for authenticated patient
+    cycle_repo = MedicalCycleRepository(db)
+    cycle, _created = cycle_repo.get_or_create_active_for_patient(session.patient_id)
+
+    # 2. Process ECG image via EcgVisionService with content-hash deduplication and versioning
+    service = EcgVisionService(
+        db=db,
+        gateway=gateway,
+        now_provider=now_provider,
+    )
+    try:
+        return await service.process_ecg_image(
+            cycle_id=cycle.cycle_id,
+            file=target_file,
+            record_date_override=record_date,
+        )
+    except ConsiliumCycleNotFoundError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=str(exc),
+        ) from exc
+    except (ConsiliumConcurrencyConflictError, ReportVersionConflictError) as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=str(exc),
+        ) from exc
+    except EcgVisionValidationError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(exc),
+        ) from exc
+    except GeminiGatewayError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Gemini Vision ECG extraction failed. Please retry later.",
+        ) from exc
+    except ConsiliumError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=str(exc),
+        ) from exc
+
+
+@router.get(
+    "/cascade/ecg/latest",
+    response_model=EcgVisionIntakeClientResponse,
+    summary="Get latest electrocardiogram intake confirmation for authenticated patient (Patient-Isolated)",
+    description=(
+        "Returns the latest confirmed electrocardiogram intake metadata for the patient's active cycle. "
+        "Strictly requires `cycle:read` scope and patient device session."
+    ),
+)
+@router.get(
+    "/ecg/latest",
+    response_model=EcgVisionIntakeClientResponse,
+    include_in_schema=False,
+)
+def get_client_latest_ecg(
+    cycle: MedicalCycle = Depends(resolve_active_cycle_for_patient),
+    db: Session = Depends(get_db),
+    _scope: DeviceSession = Depends(require_scopes("cycle:read")),
+    gateway: GeminiGateway = Depends(get_gemini_gateway),
+) -> EcgVisionIntakeClientResponse:
+    report_repo = ModelReportRepository(db)
+    ecg_reports = report_repo.list_server_only(
+        cycle_id=cycle.cycle_id,
+        report_type=PREPARATORY_ECG_REPORT_TYPE,
+    )
+    if not ecg_reports:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"No electrocardiogram report found for active cycle '{cycle.cycle_id}'.",
+        )
+
+    latest = ecg_reports[0]
+    content = latest.content or {}
+    primary_service = PrimaryConsiliumService(db=db, gateway=gateway)
+    primary_concluded = primary_service.is_primary_consilium_completed(cycle.cycle_id)
+
+    created_at_iso = (
+        latest.created_at.replace(tzinfo=timezone.utc).isoformat()
+        if latest.created_at and latest.created_at.tzinfo is None
+        else (latest.created_at.astimezone(timezone.utc).isoformat() if latest.created_at else datetime.now(timezone.utc).isoformat())
+    )
+
+    return EcgVisionIntakeClientResponse(
+        cycle_id=cycle.cycle_id,
+        status="processed",
+        intake_version=latest.version,
+        recording_type=str(content.get("recording_type", "unknown")),
+        recording_quality=str(content.get("recording_quality", "moderate")),
+        created_at_utc=created_at_iso,
+        primary_consilium_concluded=primary_concluded,
+    )
 
 
 @router.post(

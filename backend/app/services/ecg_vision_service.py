@@ -146,27 +146,26 @@ class EcgVisionService:
                 cycle_id=cycle_id,
                 report_type=PREPARATORY_ECG_REPORT_TYPE,
             )
-            if existing_reports:
-                latest = existing_reports[0]
-                latest_content = latest.content or {}
-                if latest_content.get("image_hash") == image_hash:
+            for report in existing_reports:
+                report_content = report.content or {}
+                if report_content.get("image_hash") == image_hash:
                     logger.info(
                         "Idempotent ECG upload detected for cycle '%s' (version %d, hash %.10s).",
                         cycle_id,
-                        latest.version,
+                        report.version,
                         image_hash,
                     )
                     created_at_iso = (
-                        latest.created_at.replace(tzinfo=timezone.utc).isoformat()
-                        if latest.created_at and latest.created_at.tzinfo is None
-                        else (latest.created_at.astimezone(timezone.utc).isoformat() if latest.created_at else now_iso)
+                        report.created_at.replace(tzinfo=timezone.utc).isoformat()
+                        if report.created_at and report.created_at.tzinfo is None
+                        else (report.created_at.astimezone(timezone.utc).isoformat() if report.created_at else now_iso)
                     )
                     return EcgVisionIntakeClientResponse(
                         cycle_id=cycle_id,
                         status="processed",
-                        intake_version=latest.version,
-                        recording_type=str(latest_content.get("recording_type", "unknown")),
-                        recording_quality=str(latest_content.get("recording_quality", "moderate")),
+                        intake_version=report.version,
+                        recording_type=str(report_content.get("recording_type", "unknown")),
+                        recording_quality=str(report_content.get("recording_quality", "moderate")),
                         created_at_utc=created_at_iso,
                         primary_consilium_concluded=primary_concluded,
                     )
