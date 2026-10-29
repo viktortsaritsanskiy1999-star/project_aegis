@@ -669,6 +669,107 @@ class AegisApiClient {
     }
   }
 
+  /// Upload an electrocardiogram tracing image for server-side Vision ECG analysis.
+  /// (`POST /api/v1/client/cascade/intake/ecg`).
+  /// Requires `cascade:intake` scope.
+  Future<EcgVisionIntakeClientResponse> uploadEcgDocument({
+    required EcgUploadFileItem file,
+    String? recordDate,
+    String? accessToken,
+  }) async {
+    // 1. Client-side pre-validation
+    if (file.bytes.isEmpty) {
+      throw const AegisValidationException('ECG file is empty.');
+    }
+    if (file.bytes.length > 10 * 1024 * 1024) {
+      throw AegisValidationException(
+        'File "${file.filename}" exceeds the maximum allowed size of 10 MB.',
+      );
+    }
+    if (!EcgUploadFileItem.isSupportedFormat(file.filename, file.bytes)) {
+      throw AegisValidationException(
+        'File "${file.filename}" has an unsupported format. Supported formats: JPEG, PNG, WEBP, HEIC.',
+      );
+    }
+
+    final uri = Uri.parse('$baseUrl/api/v1/client/cascade/intake/ecg');
+
+    try {
+      final response = await _sendWithAuthRetry(
+        sendRequest: (token) async {
+          final request = http.MultipartRequest('POST', uri);
+          if (token != null && token.trim().isNotEmpty) {
+            request.headers['Authorization'] = 'Bearer ${token.trim()}';
+          }
+          request.headers['Accept'] = 'application/json';
+
+          if (recordDate != null && recordDate.trim().isNotEmpty) {
+            request.fields['record_date'] = recordDate.trim();
+          }
+
+          request.files.add(
+            http.MultipartFile.fromBytes(
+              'file',
+              file.bytes,
+              filename: file.filename,
+            ),
+          );
+
+          _log('POST (multipart) $uri: file "${file.filename}" (${(file.bytes.length / 1024).toStringAsFixed(1)} KB)');
+          final streamed = await _client.send(request).timeout(timeout);
+          return await http.Response.fromStream(streamed);
+        },
+        explicitAccessToken: accessToken,
+      );
+
+      if (response.statusCode == 200) {
+        final data = json.decode(response.body) as Map<String, dynamic>;
+        return EcgVisionIntakeClientResponse.fromJson(data);
+      }
+      _handleErrorResponse(response);
+    } on TimeoutException catch (e) {
+      _log('Timeout on $uri: $e');
+      throw AegisTimeoutException('ECG intake request timed out after ${timeout.inSeconds}s');
+    } on SocketException catch (e) {
+      _log('Socket error on $uri: $e');
+      throw AegisNetworkException('Network connection failed: ${e.message}');
+    } on http.ClientException catch (e) {
+      _log('Client error on $uri: $e');
+      throw AegisNetworkException('HTTP client error: ${e.message}');
+    }
+  }
+
+  /// Query latest confirmed electrocardiogram intake record (`GET /api/v1/client/cascade/ecg/latest`).
+  /// Requires `cycle:read` scope.
+  Future<EcgVisionIntakeClientResponse> getLatestEcg({String? accessToken}) async {
+    final uri = Uri.parse('$baseUrl/api/v1/client/cascade/ecg/latest');
+    try {
+      final response = await _sendWithAuthRetry(
+        sendRequest: (token) async {
+          final headers = await _buildHeaders(accessToken: token);
+          _log('GET $uri');
+          return await _client.get(uri, headers: headers).timeout(timeout);
+        },
+        explicitAccessToken: accessToken,
+      );
+
+      if (response.statusCode == 200) {
+        final data = json.decode(response.body) as Map<String, dynamic>;
+        return EcgVisionIntakeClientResponse.fromJson(data);
+      }
+      _handleErrorResponse(response);
+    } on TimeoutException catch (e) {
+      _log('Timeout on $uri: $e');
+      throw AegisTimeoutException('Latest ECG request timed out after ${timeout.inSeconds}s');
+    } on SocketException catch (e) {
+      _log('Socket error on $uri: $e');
+      throw AegisNetworkException('Network connection failed: ${e.message}');
+    } on http.ClientException catch (e) {
+      _log('Client error on $uri: $e');
+      throw AegisNetworkException('HTTP client error: ${e.message}');
+    }
+  }
+
   /// Run or recover Primary Consilium for authenticated patient (`POST /api/v1/client/cascade/run-primary`).
   /// Requires `cascade:run` scope.
   /// If completed, recovers existing reports directly. If fresh un-fenced execution is requested,

@@ -1648,6 +1648,106 @@ class VaultService extends ChangeNotifier {
     notifyListeners();
   }
 
+  /// Records a confirmed electrocardiogram Vision intake result into the patient vault.
+  /// Preserves previous ECG history records without overwriting past versions.
+  /// Returns `true` only after local secure persistence is fully confirmed.
+  /// Returns `false` if local secure persistence fails.
+  Future<bool> recordEcgIntake({
+    required EcgVisionIntakeClientResponse response,
+    String? recordDate,
+    String? localFilename,
+  }) async {
+    final healthSystems = Map<String, dynamic>.from(_data['health_systems'] ?? <String, dynamic>{});
+    final cvs = Map<String, dynamic>.from(healthSystems['cvs'] ?? <String, dynamic>{});
+    final markers = Map<String, dynamic>.from(cvs['markers'] ?? <String, dynamic>{});
+
+    final Map<String, dynamic> smartWatch = markers.containsKey('smart_watch') && markers['smart_watch'] != null
+        ? Map<String, dynamic>.from(markers['smart_watch'])
+        : <String, dynamic>{};
+
+    final qualityLabel = response.isUnreadable
+        ? 'Unreadable'
+        : (response.isPoorQuality ? 'Poor quality' : 'Accepted');
+    final statusSummary = 'ECG $qualityLabel (v${response.intakeVersion})';
+
+    smartWatch['ecg_status'] = <String, dynamic>{
+      "value": statusSummary,
+      "date": recordDate ?? DateTime.now().toIso8601String().split('T')[0],
+      "intake_version": response.intakeVersion,
+      "recording_type": response.recordingType,
+      "recording_quality": response.recordingQuality,
+      "created_at_utc": response.createdAtUtc,
+      "primary_consilium_concluded": response.primaryConsiliumConcluded,
+      ...? (localFilename != null ? {"local_path": localFilename} : null),
+    };
+
+    // Append to versioned history (ecg_records)
+    final List<dynamic> existingHistory = smartWatch['ecg_records'] is List
+        ? List<dynamic>.from(smartWatch['ecg_records'])
+        : <dynamic>[];
+
+    final newEntry = {
+      'version': response.intakeVersion,
+      'recording_type': response.recordingType,
+      'recording_quality': response.recordingQuality,
+      'created_at_utc': response.createdAtUtc,
+      ...? (recordDate != null ? {'record_date': recordDate} : null),
+      ...? (localFilename != null ? {'local_filename': localFilename} : null),
+      'status': response.status,
+    };
+
+    final existingIndex = existingHistory.indexWhere(
+      (e) => e is Map && e['version'] == response.intakeVersion,
+    );
+    if (existingIndex >= 0) {
+      existingHistory[existingIndex] = newEntry;
+    } else {
+      existingHistory.add(newEntry);
+    }
+    smartWatch['ecg_records'] = existingHistory;
+
+    markers['smart_watch'] = smartWatch;
+    cvs['markers'] = markers;
+    healthSystems['cvs'] = cvs;
+    _data['health_systems'] = healthSystems;
+
+    _mirrorToNotesExport('vitals_smart_watch', smartWatch);
+
+    try {
+      await _persist();
+      await flushPendingWrites(patientId: _activePatientId);
+      if (hasPersistenceError) {
+        return false;
+      }
+    } catch (e) {
+      debugPrint('[VaultService] Failed to persist ECG intake to storage: $e');
+      return false;
+    }
+
+    notifyListeners();
+    return true;
+  }
+
+  /// Returns versioned history of recorded ECG intake documents.
+  List<Map<String, dynamic>> get ecgRecords {
+    final sw = _smartWatchData;
+    final records = sw['ecg_records'];
+    if (records is List) {
+      return records.whereType<Map<String, dynamic>>().toList();
+    }
+    return [];
+  }
+
+  /// Returns latest recorded ECG status metadata or null if not yet uploaded.
+  Map<String, dynamic>? get latestEcgRecord {
+    final sw = _smartWatchData;
+    final status = sw['ecg_status'];
+    if (status is Map<String, dynamic>) {
+      return status;
+    }
+    return null;
+  }
+
 // Direct saving method for vital parameters
   void updateSmartWatchMetrics({
     int? systolic,

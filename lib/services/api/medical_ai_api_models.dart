@@ -1224,3 +1224,207 @@ class LabVisionIntakeClientResponse {
     if (privacyNotice != null) 'privacy_notice': privacyNotice,
   };
 }
+
+/// Represents an uploaded electrocardiogram image file item.
+/// Performs client-side binary magic byte sniffing for JPEG, PNG, WEBP, HEIC/HEIF.
+class EcgUploadFileItem {
+  final String filename;
+  final List<int> bytes;
+  final String mimeType;
+
+  EcgUploadFileItem({
+    required this.filename,
+    required this.bytes,
+    String? mimeType,
+  }) : mimeType = mimeType ?? resolveMimeType(filename, bytes);
+
+  static String resolveMimeType(String filename, List<int> bytes) {
+    if (bytes.length >= 3 && bytes[0] == 0xFF && bytes[1] == 0xD8 && bytes[2] == 0xFF) {
+      return 'image/jpeg';
+    }
+    if (bytes.length >= 8 &&
+        bytes[0] == 0x89 && bytes[1] == 0x50 && bytes[2] == 0x4E && bytes[3] == 0x47 &&
+        bytes[4] == 0x0D && bytes[5] == 0x0A && bytes[6] == 0x1A && bytes[7] == 0x0A) {
+      return 'image/png';
+    }
+    if (bytes.length >= 12 &&
+        bytes[0] == 0x52 && bytes[1] == 0x49 && bytes[2] == 0x46 && bytes[3] == 0x46 &&
+        bytes[8] == 0x57 && bytes[9] == 0x45 && bytes[10] == 0x42 && bytes[11] == 0x50) {
+      return 'image/webp';
+    }
+    if (bytes.length >= 8 &&
+        bytes[4] == 0x66 && bytes[5] == 0x74 && bytes[6] == 0x79 && bytes[7] == 0x70) {
+      return 'image/heic';
+    }
+    final lower = filename.toLowerCase();
+    if (lower.endsWith('.png')) return 'image/png';
+    if (lower.endsWith('.webp')) return 'image/webp';
+    if (lower.endsWith('.heic') || lower.endsWith('.heif')) return 'image/heic';
+    return 'image/jpeg';
+  }
+
+  static bool isSupportedFormat(String filename, List<int> bytes) {
+    final lower = filename.toLowerCase();
+    final hasValidExt = lower.endsWith('.jpg') ||
+        lower.endsWith('.jpeg') ||
+        lower.endsWith('.png') ||
+        lower.endsWith('.webp') ||
+        lower.endsWith('.heic') ||
+        lower.endsWith('.heif');
+    if (!hasValidExt) return false;
+    if (bytes.isEmpty) return false;
+    final mime = resolveMimeType(filename, bytes);
+    return mime == 'image/jpeg' ||
+        mime == 'image/png' ||
+        mime == 'image/webp' ||
+        mime == 'image/heic';
+  }
+
+  static Future<EcgUploadFileItem> fromXFile(XFile file) async {
+    final fileBytes = await file.readAsBytes();
+    return EcgUploadFileItem(
+      filename: file.name.isNotEmpty
+          ? file.name
+          : (file.path.isNotEmpty ? file.path.split(RegExp(r'[\\/]')).last : 'ecg_strip.jpg'),
+      bytes: fileBytes,
+    );
+  }
+}
+
+/// Safe client-facing confirmation of electrocardiogram Vision processing.
+/// Matches server `EcgVisionIntakeClientResponse` schema:
+/// Never exposes raw Gemini JSON, internal agent reasoning, or raw tracing images.
+class EcgVisionIntakeClientResponse {
+  final String cycleId;
+  final String status;
+  final int intakeVersion;
+  final String recordingType;
+  final String recordingQuality;
+  final String createdAtUtc;
+  final bool primaryConsiliumConcluded;
+  final String privacyNotice;
+
+  const EcgVisionIntakeClientResponse({
+    required this.cycleId,
+    this.status = 'processed',
+    required this.intakeVersion,
+    required this.recordingType,
+    required this.recordingQuality,
+    required this.createdAtUtc,
+    this.primaryConsiliumConcluded = false,
+    required this.privacyNotice,
+  });
+
+  factory EcgVisionIntakeClientResponse.fromJson(Map<String, dynamic> json) {
+    return EcgVisionIntakeClientResponse(
+      cycleId: json['cycle_id'] as String? ?? '',
+      status: json['status'] as String? ?? 'processed',
+      intakeVersion: (json['intake_version'] as num?)?.toInt() ?? 1,
+      recordingType: json['recording_type'] as String? ?? 'unknown',
+      recordingQuality: json['recording_quality'] as String? ?? 'moderate',
+      createdAtUtc: json['created_at_utc'] as String? ?? '',
+      primaryConsiliumConcluded: json['primary_consilium_concluded'] == true,
+      privacyNotice: json['privacy_notice'] as String? ?? '',
+    );
+  }
+
+  Map<String, dynamic> toJson() => {
+    'cycle_id': cycleId,
+    'status': status,
+    'intake_version': intakeVersion,
+    'recording_type': recordingType,
+    'recording_quality': recordingQuality,
+    'created_at_utc': createdAtUtc,
+    'primary_consilium_concluded': primaryConsiliumConcluded,
+    'privacy_notice': privacyNotice,
+  };
+
+  bool get isUnreadable => recordingQuality.toLowerCase() == 'unreadable';
+  bool get isPoorQuality => recordingQuality.toLowerCase() == 'poor';
+  bool get isGoodOrModerate => !isUnreadable && !isPoorQuality;
+  bool get requiresVerification => isUnreadable || isPoorQuality;
+
+  String get recordingTypeDisplay {
+    switch (recordingType.toLowerCase()) {
+      case 'single_lead_smartwatch':
+        return 'Smartwatch (Single Lead)';
+      case 'standard_12_lead':
+        return '12-Lead Diagnostic ECG';
+      case 'other_multichannel':
+        return 'Multi-channel ECG';
+      default:
+        return 'Electrocardiogram';
+    }
+  }
+
+  String get qualityDisplay {
+    switch (recordingQuality.toLowerCase()) {
+      case 'good':
+        return 'Good';
+      case 'moderate':
+        return 'Moderate';
+      case 'poor':
+        return 'Poor / Artifacts';
+      case 'unreadable':
+        return 'Unreadable';
+      default:
+        return recordingQuality;
+    }
+  }
+}
+
+/// Represents an historical ECG record in Vault persistence.
+class EcgRecordEntry {
+  final int version;
+  final String recordingType;
+  final String recordingQuality;
+  final String createdAtUtc;
+  final String? recordDate;
+  final String? localFilename;
+  final String status;
+
+  const EcgRecordEntry({
+    required this.version,
+    required this.recordingType,
+    required this.recordingQuality,
+    required this.createdAtUtc,
+    this.recordDate,
+    this.localFilename,
+    this.status = 'processed',
+  });
+
+  factory EcgRecordEntry.fromResponse(
+    EcgVisionIntakeClientResponse response, {
+    String? recordDate,
+    String? localFilename,
+  }) =>
+      EcgRecordEntry(
+        version: response.intakeVersion,
+        recordingType: response.recordingType,
+        recordingQuality: response.recordingQuality,
+        createdAtUtc: response.createdAtUtc,
+        recordDate: recordDate,
+        localFilename: localFilename,
+        status: response.status,
+      );
+
+  factory EcgRecordEntry.fromJson(Map<String, dynamic> json) => EcgRecordEntry(
+    version: (json['version'] as num?)?.toInt() ?? 1,
+    recordingType: json['recording_type'] as String? ?? 'unknown',
+    recordingQuality: json['recording_quality'] as String? ?? 'moderate',
+    createdAtUtc: json['created_at_utc'] as String? ?? '',
+    recordDate: json['record_date'] as String?,
+    localFilename: json['local_filename'] as String?,
+    status: json['status'] as String? ?? 'processed',
+  );
+
+  Map<String, dynamic> toJson() => {
+    'version': version,
+    'recording_type': recordingType,
+    'recording_quality': recordingQuality,
+    'created_at_utc': createdAtUtc,
+    if (recordDate != null) 'record_date': recordDate,
+    if (localFilename != null) 'local_filename': localFilename,
+    'status': status,
+  };
+}
