@@ -2705,6 +2705,25 @@ class VaultService extends ChangeNotifier {
     notifyListeners();
   }
 
+  /// Synchronizes sanitized curator chat history from server for active patient.
+  /// Strictly checks [expectedPatientId] against active patient attribution to prevent cross-patient contamination.
+  /// Preserves local history if incoming history is empty or if patient attribution does not match.
+  bool syncCuratorChatHistory(List<Map<String, String>> history, {String? expectedPatientId}) {
+    if (expectedPatientId != null && _activePatientId != expectedPatientId) {
+      debugPrint('[VaultService] Patient attribution mismatch when syncing curator chat history. Discarding.');
+      return false;
+    }
+    if (history.isEmpty && _curatorChatHistory.isNotEmpty) {
+      debugPrint('[VaultService] Incoming history is empty while local vault has history. Preserving local history.');
+      return false;
+    }
+    _curatorChatHistory.clear();
+    _curatorChatHistory.addAll(history);
+    _persist();
+    notifyListeners();
+    return true;
+  }
+
   // ==========================================
   // STORAGE FOR ATHENA'S HIDDEN CLINICAL REPORTS
   // ==========================================
