@@ -16,6 +16,7 @@ import 'widgets/workout_session_modal.dart';
 import 'widgets/emergency_medical_modal.dart';
 import 'services/health_data_provider.dart';
 import 'services/api/aegis_api_client.dart';
+import 'services/api/vitals_api_models.dart';
 import 'services/auth/auth_session_manager.dart';
 import 'services/sync/vitals_sync_queue.dart';
 import 'widgets/aegis_device_pairing_modal.dart';
@@ -222,6 +223,11 @@ class _AtlasScreenState extends State<AtlasScreen> {
 
   // 1. Храним ссылку на сервис для отписки в dispose
   VitalsMonitorService? _vitalsService;
+  AuthSessionManager? _authSessionManager;
+  String? _trackedPatientId;
+  bool _isLoadingConsilium = false;
+  String? _consiliumErrorMessage;
+  int _consiliumFetchEpoch = 0;
   bool _isActivityModalOpen = false;
   bool _isWorkoutModalOpen = false;
   bool _isCriticalModalOpen = false;
@@ -248,7 +254,164 @@ class _AtlasScreenState extends State<AtlasScreen> {
       // 2. Сохраняем экземпляр и подписываемся
       _vitalsService = context.read<VitalsMonitorService>();
       _vitalsService?.addListener(_onVitalsStateChanged);
+
+      _authSessionManager = context.read<AuthSessionManager>();
+      _trackedPatientId = _authSessionManager?.confirmedAttributionPatientId;
+      _authSessionManager?.addListener(_onAuthSessionChanged);
+
+      _fetchPrimaryConsiliumReports();
     });
+  }
+
+  void _onAuthSessionChanged() {
+    if (!mounted) return;
+    final currentId = _authSessionManager?.confirmedAttributionPatientId;
+    if (currentId != _trackedPatientId) {
+      _trackedPatientId = currentId;
+      _fetchPrimaryConsiliumReports();
+    }
+  }
+
+  /// Queries Primary Consilium status and client reports without initiating an execution cascade.
+  /// Strictly avoids POST /api/v1/client/cascade/run-primary during passive screen viewing.
+  Future<void> _fetchPrimaryConsiliumReports({bool force = false}) async {
+    if (!mounted) return;
+
+    final authManager = context.read<AuthSessionManager>();
+    if (!authManager.isAuthenticated) {
+      if (mounted) {
+        setState(() {
+          _isLoadingConsilium = false;
+          _consiliumErrorMessage = null;
+        });
+      }
+      return;
+    }
+
+    final String? patientId = authManager.confirmedAttributionPatientId;
+    if (patientId == null) {
+      if (mounted) {
+        setState(() {
+          _isLoadingConsilium = false;
+          _consiliumErrorMessage = null;
+        });
+      }
+      return;
+    }
+
+    final int fetchEpoch = ++_consiliumFetchEpoch;
+
+    setState(() {
+      _isLoadingConsilium = true;
+      _consiliumErrorMessage = null;
+    });
+
+    final apiClient = context.read<AegisApiClient>();
+    final vaultService = context.read<VaultService>();
+
+    try {
+      final status = await apiClient.getCascadeStatus();
+
+      // Epoch & attribution fence check after getCascadeStatus
+      if (!mounted || _consiliumFetchEpoch != fetchEpoch || authManager.confirmedAttributionPatientId != patientId) {
+        return;
+      }
+
+      if (status.hasActiveCycle && status.isPrimaryConsiliumCompleted && status.activeCycleId != null) {
+        final reports = await apiClient.getClientReports(cycleId: status.activeCycleId!);
+
+        // Epoch & attribution fence check after getClientReports
+        if (!mounted || _consiliumFetchEpoch != fetchEpoch || authManager.confirmedAttributionPatientId != patientId) {
+          return;
+        }
+
+        final bool saved = await vaultService.recordClientReports(
+          cycleId: status.activeCycleId!,
+          reports: reports,
+          expectedPatientId: patientId,
+        );
+
+        // Epoch & attribution fence check after vault persistence
+        if (!mounted || _consiliumFetchEpoch != fetchEpoch || authManager.confirmedAttributionPatientId != patientId) {
+          return;
+        }
+
+        if (!saved) {
+          setState(() {
+            _isLoadingConsilium = false;
+            _consiliumErrorMessage = 'Failed to securely persist consilium reports locally.';
+          });
+          return;
+        }
+
+        setState(() {
+          _isLoadingConsilium = false;
+          _consiliumErrorMessage = null;
+        });
+      } else {
+        // Active cycle is pending or not yet completed
+        if (status.activeCycleId != null) {
+          final bool marked = await vaultService.markConsiliumPending(
+            cycleId: status.activeCycleId!,
+            expectedPatientId: patientId,
+          );
+
+          if (!mounted || _consiliumFetchEpoch != fetchEpoch || authManager.confirmedAttributionPatientId != patientId) {
+            return;
+          }
+
+          if (!marked) {
+            setState(() {
+              _isLoadingConsilium = false;
+              _consiliumErrorMessage = 'Failed to update consilium status locally.';
+            });
+            return;
+          }
+        } else if (vaultService.isConsiliumCompleted) {
+          await vaultService.markConsiliumPending(
+            cycleId: '',
+            expectedPatientId: patientId,
+          );
+
+          if (!mounted || _consiliumFetchEpoch != fetchEpoch || authManager.confirmedAttributionPatientId != patientId) {
+            return;
+          }
+        }
+
+        setState(() {
+          _isLoadingConsilium = false;
+          _consiliumErrorMessage = null;
+        });
+      }
+    } on AegisNetworkException catch (e) {
+      if (mounted && _consiliumFetchEpoch == fetchEpoch && authManager.confirmedAttributionPatientId == patientId) {
+        setState(() {
+          _isLoadingConsilium = false;
+          _consiliumErrorMessage = 'Network error: ${e.message}';
+        });
+      }
+    } on AegisTimeoutException catch (_) {
+      if (mounted && _consiliumFetchEpoch == fetchEpoch && authManager.confirmedAttributionPatientId == patientId) {
+        setState(() {
+          _isLoadingConsilium = false;
+          _consiliumErrorMessage = 'Request timed out';
+        });
+      }
+    } on AegisApiException catch (e) {
+      if (mounted && _consiliumFetchEpoch == fetchEpoch && authManager.confirmedAttributionPatientId == patientId) {
+        setState(() {
+          _isLoadingConsilium = false;
+          _consiliumErrorMessage = e.message;
+        });
+      }
+    } catch (e) {
+      if (mounted && _consiliumFetchEpoch == fetchEpoch && authManager.confirmedAttributionPatientId == patientId) {
+        setState(() {
+          _isLoadingConsilium = false;
+          _consiliumErrorMessage = 'Error: $e';
+        });
+      }
+    }
   }
 
   void _onVitalsStateChanged() {
@@ -346,7 +509,8 @@ class _AtlasScreenState extends State<AtlasScreen> {
 
   @override
   void dispose() {
-    // 4. Обязательно отписываемся от слушателя
+    // 4. Обязательно отписываемся от слушателей
+    _authSessionManager?.removeListener(_onAuthSessionChanged);
     _vitalsService?.removeListener(_onVitalsStateChanged);
     _athenaTriggerService.dispose();
     super.dispose();
@@ -485,6 +649,111 @@ class _AtlasScreenState extends State<AtlasScreen> {
       case 'endocrine': return 'assets/images/endocrynesystem.png';
       default: return 'assets/images/allsystems.png';
     }
+  }
+
+  Widget _buildConsiliumStatusBadge(VaultService vault) {
+    if (_isLoadingConsilium) {
+      return Container(
+        key: const Key('consilium_status_loading'),
+        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+        decoration: BoxDecoration(
+          color: const Color(0xFF0D1117).withOpacity(0.85),
+          borderRadius: BorderRadius.circular(12),
+          border: Border.all(color: Colors.cyanAccent.withOpacity(0.5), width: 1),
+        ),
+        child: const Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            SizedBox(
+              width: 10,
+              height: 10,
+              child: CircularProgressIndicator(strokeWidth: 1.5, color: Colors.cyanAccent),
+            ),
+            SizedBox(width: 6),
+            Text(
+              "Синхронизация консилиума...",
+              style: TextStyle(color: Colors.cyanAccent, fontSize: 10),
+            ),
+          ],
+        ),
+      );
+    }
+
+    if (_consiliumErrorMessage != null) {
+      return GestureDetector(
+        key: const Key('consilium_status_error'),
+        onTap: () => _fetchPrimaryConsiliumReports(force: true),
+        child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+          decoration: BoxDecoration(
+            color: const Color(0xFF0D1117).withOpacity(0.85),
+            borderRadius: BorderRadius.circular(12),
+            border: Border.all(color: Colors.amberAccent.withOpacity(0.6), width: 1),
+          ),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const Icon(Icons.sync_problem_rounded, color: Colors.amberAccent, size: 12),
+              const SizedBox(width: 6),
+              Text(
+                "Связь прервана (нажмите для повтора)",
+                style: TextStyle(color: Colors.amberAccent.withOpacity(0.9), fontSize: 10),
+              ),
+            ],
+          ),
+        ),
+      );
+    }
+
+    if (vault.isConsiliumCompleted) {
+      return GestureDetector(
+        key: const Key('consilium_status_ready'),
+        onTap: () => _showCascadeCoreVault(context),
+        child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+          decoration: BoxDecoration(
+            color: const Color(0xFF0D1117).withOpacity(0.85),
+            borderRadius: BorderRadius.circular(12),
+            border: Border.all(color: Colors.greenAccent.withOpacity(0.6), width: 1),
+          ),
+          child: const Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Icon(Icons.verified_outlined, color: Colors.greenAccent, size: 12),
+              SizedBox(width: 6),
+              Text(
+                "Консилиум сформирован",
+                style: TextStyle(color: Colors.greenAccent, fontSize: 10, fontWeight: FontWeight.bold),
+              ),
+            ],
+          ),
+        ),
+      );
+    }
+
+    return GestureDetector(
+      key: const Key('consilium_status_pending'),
+      onTap: () => _fetchPrimaryConsiliumReports(),
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+        decoration: BoxDecoration(
+          color: const Color(0xFF0D1117).withOpacity(0.85),
+          borderRadius: BorderRadius.circular(12),
+          border: Border.all(color: Colors.white24, width: 1),
+        ),
+        child: const Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(Icons.hourglass_empty_rounded, color: Colors.white54, size: 12),
+            SizedBox(width: 6),
+            Text(
+              "Ожидание первичного консилиума",
+              style: TextStyle(color: Colors.white70, fontSize: 10),
+            ),
+          ],
+        ),
+      ),
+    );
   }
 
   void _openCuratorVault(BuildContext context) {
@@ -679,6 +948,18 @@ class _AtlasScreenState extends State<AtlasScreen> {
                 ),
               ),
 
+              // 2.1 PRIMARY CONSILIUM STATUS BADGE
+              Positioned(
+                top: 92,
+                left: 15,
+                right: 15,
+                child: SafeArea(
+                  child: Center(
+                    child: _buildConsiliumStatusBadge(vault),
+                  ),
+                ),
+              ),
+
               // 3️⃣ LEFT COLUMN OF ORGAN FOLDERS
               Positioned(
                   left: 20, top: 0, bottom: 0, width: 120,
@@ -706,6 +987,7 @@ class _AtlasScreenState extends State<AtlasScreen> {
               Positioned(
                 bottom: 30, left: 20,
                 child: FloatingActionButton.small(
+                  key: const Key('anamnesis_vault_fab'),
                   heroTag: 'anamnesis_vault_fab',
                   backgroundColor: Colors.purpleAccent.withOpacity(0.1),
                   elevation: 0,
@@ -829,6 +1111,7 @@ class _AtlasScreenState extends State<AtlasScreen> {
               Positioned(
                 bottom: 30, right: 20,
                 child: FloatingActionButton.small(
+                  key: const Key('cascade_vault_fab'),
                   heroTag: 'cascade_vault_fab',
                   backgroundColor: Colors.blueAccent.withOpacity(0.1),
                   elevation: 0,
@@ -864,6 +1147,7 @@ class _AtlasScreenState extends State<AtlasScreen> {
               children: [
                 if (!isLeft)
                   IconButton(
+                    key: Key('folder_btn_$folderKey'),
                     padding: EdgeInsets.zero,
                     constraints: const BoxConstraints(),
                     icon: Icon(Icons.folder_open, color: color.withOpacity(isSelected ? 1.0 : 0.3), size: 16),
@@ -885,6 +1169,7 @@ class _AtlasScreenState extends State<AtlasScreen> {
                 if (isLeft) const SizedBox(width: 6),
                 if (isLeft)
                   IconButton(
+                    key: Key('folder_btn_$folderKey'),
                     padding: EdgeInsets.zero,
                     constraints: const BoxConstraints(),
                     icon: Icon(Icons.folder_open, color: color.withOpacity(isSelected ? 1.0 : 0.3), size: 16),
@@ -975,7 +1260,8 @@ class _AtlasScreenState extends State<AtlasScreen> {
 
   void _showCascadeCoreVault(BuildContext context) {
     final vault = Provider.of<VaultService>(context, listen: false);
-    final cascadeData = vault.getSystemContext('core_cascade');
+    final overall = vault.cachedOverallReport;
+    final isDone = vault.isConsiliumCompleted;
 
     showDialog(
       context: context,
@@ -985,7 +1271,7 @@ class _AtlasScreenState extends State<AtlasScreen> {
             side: const BorderSide(color: Colors.blueAccent, width: 1),
             borderRadius: BorderRadius.circular(12)
         ),
-        title: const Text("CLINICAL CASCADE :: MAIN MODELS",
+        title: const Text("PRIMARY CONSILIUM :: CLINICAL SUMMARY",
             style: TextStyle(color: Colors.blueAccent, fontSize: 14, fontWeight: FontWeight.bold, letterSpacing: 1.2)),
         content: SizedBox(
           width: double.maxFinite,
@@ -993,25 +1279,82 @@ class _AtlasScreenState extends State<AtlasScreen> {
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                const Text("⚡ GEMINI FLASH (DEPUTY CHIEF DOCTOR) — GENERAL OUTPUT:", style: TextStyle(color: Colors.orangeAccent, fontSize: 11, fontWeight: FontWeight.bold)),
-                const Divider(color: Colors.white24),
-                Text(cascadeData['flash_general_shelf'] ?? "Waiting for launch...", style: const TextStyle(color: Colors.white, fontSize: 12)),
-
-                const SizedBox(height: 15),
-                const Text("🛠 GEMINI FLASH — TRAINING SHELF (DEFICITS):", style: TextStyle(color: Colors.orangeAccent, fontSize: 10, fontFamily: 'Courier', fontWeight: FontWeight.bold)),
-                const Divider(color: Colors.white24),
-                Text(cascadeData['flash_training_shelf'] ?? "Logs are empty", style: const TextStyle(color: Colors.white70, fontSize: 11, fontFamily: 'Courier')),
-
-                const SizedBox(height: 25),
-
-                const Text("🧠 GEMINI PRO (CHIEF DOCTOR) — GENERAL OUTPUT:", style: TextStyle(color: Colors.purpleAccent, fontSize: 11, fontWeight: FontWeight.bold)),
-                const Divider(color: Colors.white24),
-                Text(cascadeData['pro_general_shelf'] ?? "Waiting for cascade...", style: const TextStyle(color: Colors.white, fontSize: 12)),
-
-                const SizedBox(height: 15),
-                const Text("🛠 GEMINI PRO — TRAINING SHELF (SPECIFIC DIAGNOSES):", style: TextStyle(color: Colors.purpleAccent, fontSize: 10, fontFamily: 'Courier', fontWeight: FontWeight.bold)),
-                const Divider(color: Colors.white24),
-                Text(cascadeData['pro_training_shelf'] ?? "Logs are empty", style: const TextStyle(color: Colors.white70, fontSize: 11, fontFamily: 'Courier')),
+                if (isDone && overall != null) ...[
+                  Text(
+                    overall.content.title.isNotEmpty ? overall.content.title.toUpperCase() : "OVERALL CLINICAL SYNTHESIS",
+                    style: const TextStyle(color: Colors.purpleAccent, fontSize: 11, fontWeight: FontWeight.bold),
+                  ),
+                  const Divider(color: Colors.white24),
+                  Text(
+                    overall.content.summary,
+                    style: const TextStyle(color: Colors.white, fontSize: 12),
+                  ),
+                  if (overall.content.highlights.isNotEmpty) ...[
+                    const SizedBox(height: 15),
+                    const Text("KEY CLINICAL HIGHLIGHTS:",
+                        style: TextStyle(color: Colors.orangeAccent, fontSize: 11, fontWeight: FontWeight.bold)),
+                    const Divider(color: Colors.white24),
+                    ...overall.content.highlights.map(
+                      (h) => Padding(
+                        padding: const EdgeInsets.symmetric(vertical: 2.0),
+                        child: Row(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            const Text("• ", style: TextStyle(color: Colors.orangeAccent, fontSize: 12)),
+                            Expanded(
+                              child: Text(h, style: const TextStyle(color: Colors.white70, fontSize: 11)),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
+                  ],
+                  if (overall.content.reportDate != null) ...[
+                    const SizedBox(height: 10),
+                    Text(
+                      "Report Date: ${overall.content.reportDate}",
+                      style: const TextStyle(fontSize: 10, fontFamily: 'Courier', color: Colors.white38),
+                    ),
+                  ],
+                  const SizedBox(height: 20),
+                  const Text("ORGAN SYSTEMS STATUS:",
+                      style: TextStyle(color: Colors.cyanAccent, fontSize: 11, fontWeight: FontWeight.bold)),
+                  const Divider(color: Colors.white24),
+                  ...vault.cachedSystemReports.entries.map((e) => Padding(
+                        padding: const EdgeInsets.symmetric(vertical: 4.0),
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Text(
+                              "${e.key.toUpperCase()}: ${e.value.content.title}",
+                              style: const TextStyle(fontSize: 11, fontWeight: FontWeight.bold, color: Colors.cyanAccent),
+                            ),
+                            Text(
+                              e.value.content.summary,
+                              maxLines: 2,
+                              overflow: TextOverflow.ellipsis,
+                              style: const TextStyle(fontSize: 10, color: Colors.white70),
+                            ),
+                          ],
+                        ),
+                      )),
+                ] else if (isDone) ...[
+                  const Text("OVERALL CLINICAL SUMMARY:",
+                      style: TextStyle(color: Colors.purpleAccent, fontSize: 11, fontWeight: FontWeight.bold)),
+                  const Divider(color: Colors.white24),
+                  Text(
+                    vault.lastProGeneralOutput ?? "Consilium completed.",
+                    style: const TextStyle(color: Colors.white, fontSize: 12),
+                  ),
+                ] else ...[
+                  const Text("STATUS: PENDING CONSILIUM",
+                      style: TextStyle(color: Colors.amberAccent, fontSize: 11, fontWeight: FontWeight.bold)),
+                  const Divider(color: Colors.white24),
+                  const Text(
+                    "Primary Consilium analysis has not been performed yet. Data is being prepared for clinical synthesis.",
+                    style: TextStyle(color: Colors.white70, fontSize: 12),
+                  ),
+                ],
               ],
             ),
           ),
@@ -1026,9 +1369,9 @@ class _AtlasScreenState extends State<AtlasScreen> {
   void _showSystemLog(BuildContext context, String systemKey) {
     final vault = Provider.of<VaultService>(context, listen: false);
     final folder = vault.getSystemContext(systemKey);
+    final clientReport = vault.getClientReportForSystem(systemKey);
 
-    final dynamic m1Facts = folder['data'] ?? folder['facts'] ?? folder['system_facts'] ?? "Sterile facts are missing";
-    final dynamic m1Summary = folder['internal_comment'] ?? folder['first_model_short_summary'] ?? folder['summary'] ?? "Internal comment M1 is missing";
+    final dynamic m1Facts = folder['data'] ?? folder['facts'] ?? folder['system_facts'] ?? "No anamnesis facts recorded";
 
     final Map<String, dynamic> labsShelf = folder.containsKey('labs') && folder['labs'] is Map
         ? Map<String, dynamic>.from(folder['labs'])
@@ -1119,27 +1462,62 @@ class _AtlasScreenState extends State<AtlasScreen> {
 
                 const SizedBox(height: 20),
 
-                const Text("SYSTEM FACTS (RAW DATA FROM M1):", style: TextStyle(color: Colors.orangeAccent, fontSize: 10, fontWeight: FontWeight.bold)),
+                const Text("SYSTEM FACTS (RAW DATA):", style: TextStyle(color: Colors.orangeAccent, fontSize: 10, fontWeight: FontWeight.bold)),
                 const Divider(color: Colors.white10),
                 Text(m1Facts.toString(), style: const TextStyle(fontSize: 11, fontFamily: 'Courier', color: Colors.white70)),
 
                 const SizedBox(height: 20),
 
-                const Text("ANAMNESIS MODEL BRIEF SYSTEM SUMMARY:", style: TextStyle(color: Colors.purpleAccent, fontSize: 10, fontWeight: FontWeight.bold)),
+                const Text("VERIFIED CONSILIUM CONCLUSION:", style: TextStyle(color: Colors.cyanAccent, fontSize: 10, fontWeight: FontWeight.bold)),
                 const Divider(color: Colors.white10),
-                Text(m1Summary.toString(), style: const TextStyle(fontSize: 11, color: Colors.white)),
-
-                const SizedBox(height: 20),
-
-                const Text("SYSTEM MODEL OUTPUT SHELF (CASCADE STAGE):", style: TextStyle(color: Colors.cyanAccent, fontSize: 10, fontWeight: FontWeight.bold)),
-                const Divider(color: Colors.white10),
-                Text(folder['system_general_shelf'] ?? "Analysis was not performed", style: const TextStyle(fontSize: 12, color: Colors.white)),
-
-                const SizedBox(height: 20),
-
-                const Text("TRAINING OUTPUT SHELF (LOGS FOR FINE-TUNING):", style: TextStyle(color: Colors.redAccent, fontSize: 10, fontWeight: FontWeight.bold)),
-                const Divider(color: Colors.white10),
-                Text(folder['system_training_shelf'] ?? "Logs are missing", style: const TextStyle(fontSize: 11, fontFamily: 'Courier', color: Colors.white70)),
+                if (clientReport != null) ...[
+                  if (clientReport.content.title.isNotEmpty)
+                    Padding(
+                      padding: const EdgeInsets.only(bottom: 6.0),
+                      child: Text(
+                        clientReport.content.title,
+                        style: const TextStyle(fontSize: 12, fontWeight: FontWeight.bold, color: Colors.cyanAccent),
+                      ),
+                    ),
+                  Text(
+                    clientReport.content.summary.isNotEmpty
+                        ? clientReport.content.summary
+                        : "Analysis completed. No specific findings.",
+                    style: const TextStyle(fontSize: 12, color: Colors.white),
+                  ),
+                  if (clientReport.content.highlights.isNotEmpty) ...[
+                    const SizedBox(height: 8),
+                    ...clientReport.content.highlights.map(
+                      (h) => Padding(
+                        padding: const EdgeInsets.symmetric(vertical: 2.0),
+                        child: Row(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            const Text("• ", style: TextStyle(color: Colors.cyanAccent, fontSize: 12)),
+                            Expanded(
+                              child: Text(h, style: const TextStyle(color: Colors.white70, fontSize: 11)),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
+                  ],
+                  if (clientReport.content.reportDate != null)
+                    Padding(
+                      padding: const EdgeInsets.only(top: 8.0),
+                      child: Text(
+                        "Date: ${clientReport.content.reportDate}",
+                        style: const TextStyle(fontSize: 10, fontFamily: 'Courier', color: Colors.white38),
+                      ),
+                    ),
+                ] else ...[
+                  Text(
+                    vault.isConsiliumCompleted
+                        ? (folder['system_general_shelf'] ?? "Analysis completed")
+                        : "Primary consilium analysis pending",
+                    style: const TextStyle(fontSize: 12, color: Colors.white60),
+                  ),
+                ],
               ],
             ),
           ),

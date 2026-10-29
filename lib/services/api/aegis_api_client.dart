@@ -840,6 +840,97 @@ class AegisApiClient {
     }
   }
 
+  /// Retrieve client-facing model reports for a cycle (`GET /api/v1/reports/client?cycle_id=...`).
+  /// Requires `cycle:read` and `reports:read` scopes.
+  /// Returns strictly client_facing reports. Server-only private clinical reasoning is excluded.
+  Future<List<ClientModelReportResponse>> getClientReports({
+    required String cycleId,
+    String? reportType,
+    String? accessToken,
+  }) async {
+    final cleanCycleId = cycleId.trim();
+    if (cleanCycleId.isEmpty) {
+      throw const AegisValidationException('cycleId must not be empty.');
+    }
+    final queryParams = <String, String>{
+      'cycle_id': cleanCycleId,
+    };
+    if (reportType != null && reportType.trim().isNotEmpty) {
+      queryParams['report_type'] = reportType.trim();
+    }
+    final uri = Uri.parse('$baseUrl/api/v1/reports/client').replace(
+      queryParameters: queryParams,
+    );
+    try {
+      final response = await _sendWithAuthRetry(
+        sendRequest: (token) async {
+          final headers = await _buildHeaders(accessToken: token);
+          _log('GET $uri');
+          return await _client.get(uri, headers: headers).timeout(timeout);
+        },
+        explicitAccessToken: accessToken,
+      );
+
+      if (response.statusCode == 200) {
+        final decoded = json.decode(response.body);
+        if (decoded is! List) {
+          throw const FormatException('Expected JSON list from /api/v1/reports/client');
+        }
+        return decoded
+            .map((e) => ClientModelReportResponse.fromJson(Map<String, dynamic>.from(e as Map)))
+            .toList();
+      }
+      _handleErrorResponse(response);
+    } on TimeoutException catch (e) {
+      _log('Timeout on $uri: $e');
+      throw AegisTimeoutException('Client reports request timed out after ${timeout.inSeconds}s');
+    } on SocketException catch (e) {
+      _log('Socket error on $uri: $e');
+      throw AegisNetworkException('Network connection failed: ${e.message}');
+    } on http.ClientException catch (e) {
+      _log('Client error on $uri: $e');
+      throw AegisNetworkException('HTTP client error: ${e.message}');
+    }
+  }
+
+  /// Retrieve a single client-facing model report by ID (`GET /api/v1/reports/client/{report_id}`).
+  /// Requires `cycle:read` and `reports:read` scopes.
+  Future<ClientModelReportResponse> getSingleClientReport({
+    required String reportId,
+    String? accessToken,
+  }) async {
+    final cleanReportId = reportId.trim();
+    if (cleanReportId.isEmpty) {
+      throw const AegisValidationException('reportId must not be empty.');
+    }
+    final uri = Uri.parse('$baseUrl/api/v1/reports/client/$cleanReportId');
+    try {
+      final response = await _sendWithAuthRetry(
+        sendRequest: (token) async {
+          final headers = await _buildHeaders(accessToken: token);
+          _log('GET $uri');
+          return await _client.get(uri, headers: headers).timeout(timeout);
+        },
+        explicitAccessToken: accessToken,
+      );
+
+      if (response.statusCode == 200) {
+        final data = json.decode(response.body) as Map<String, dynamic>;
+        return ClientModelReportResponse.fromJson(data);
+      }
+      _handleErrorResponse(response);
+    } on TimeoutException catch (e) {
+      _log('Timeout on $uri: $e');
+      throw AegisTimeoutException('Single client report request timed out after ${timeout.inSeconds}s');
+    } on SocketException catch (e) {
+      _log('Socket error on $uri: $e');
+      throw AegisNetworkException('Network connection failed: ${e.message}');
+    } on http.ClientException catch (e) {
+      _log('Client error on $uri: $e');
+      throw AegisNetworkException('HTTP client error: ${e.message}');
+    }
+  }
+
   /// Send an interactive chat turn to Athena wellness curator (`POST /api/v1/client/chat/athena`).
   /// Requires `chat:write` scope.
   /// Strictly preserves the caller's [AthenaChatRequest.idempotencyKey] across automatic 401 refresh retries

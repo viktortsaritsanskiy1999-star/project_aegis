@@ -174,6 +174,13 @@ class VaultService extends ChangeNotifier {
   String? get activePatientId => _activePatientId;
   bool get isAuthenticated => _activePatientId != null;
   int get sessionEpoch => _sessionEpoch;
+
+  // Client-facing Primary Consilium reports
+  final Map<String, ClientModelReportResponse> _clientSystemReports = {};
+  ClientModelReportResponse? _clientOverallReport;
+  bool _isConsiliumCompleted = false;
+  String? _consiliumCycleId;
+  final Map<String, Map<String, dynamic>> _consiliumHistory = {};
   LegacyVaultStatus get legacyVaultStatus => _legacyVaultStatus;
   bool get hasQuarantinedLegacyData => _legacyVaultStatus == LegacyVaultStatus.quarantined;
   bool get isInitialized => _isInitialized;
@@ -451,6 +458,11 @@ class VaultService extends ChangeNotifier {
     _anamnesisSyncError = null;
     _isAnamnesisSyncing = false;
     _cachedLabLedgerState = null;
+    _clientSystemReports.clear();
+    _clientOverallReport = null;
+    _isConsiliumCompleted = false;
+    _consiliumCycleId = null;
+    _consiliumHistory.clear();
   }
 
   Future<void> _initVault() async {
@@ -643,6 +655,51 @@ class VaultService extends ChangeNotifier {
     } else {
       _cachedLabLedgerState = null;
     }
+
+    if (loadedData.containsKey('client_consilium') && loadedData['client_consilium'] is Map) {
+      final consiliumMap = loadedData['client_consilium'] as Map;
+      _isConsiliumCompleted = consiliumMap['is_completed'] == true;
+      _consiliumCycleId = consiliumMap['cycle_id'] as String?;
+      if (consiliumMap['overall_report'] is Map) {
+        try {
+          _clientOverallReport = ClientModelReportResponse.fromJson(
+            Map<String, dynamic>.from(consiliumMap['overall_report'] as Map),
+          );
+        } catch (_) {
+          _clientOverallReport = null;
+        }
+      } else {
+        _clientOverallReport = null;
+      }
+
+      _clientSystemReports.clear();
+      if (consiliumMap['system_reports'] is Map) {
+        (consiliumMap['system_reports'] as Map).forEach((k, v) {
+          if (v is Map) {
+            try {
+              _clientSystemReports[k.toString()] = ClientModelReportResponse.fromJson(
+                Map<String, dynamic>.from(v),
+              );
+            } catch (_) {}
+          }
+        });
+      }
+
+      _consiliumHistory.clear();
+      if (consiliumMap['history'] is Map) {
+        (consiliumMap['history'] as Map).forEach((k, v) {
+          if (v is Map) {
+            _consiliumHistory[k.toString()] = Map<String, dynamic>.from(v);
+          }
+        });
+      }
+    } else {
+      _isConsiliumCompleted = false;
+      _consiliumCycleId = null;
+      _clientOverallReport = null;
+      _clientSystemReports.clear();
+      _consiliumHistory.clear();
+    }
   }
 
   Map<String, dynamic> _createSnapshot() {
@@ -657,6 +714,13 @@ class VaultService extends ChangeNotifier {
         'cycle_id': _anamnesisCycleId,
         'intake_version': _anamnesisIntakeVersion,
         'synced_at': _anamnesisSyncedAt?.toIso8601String(),
+      },
+      'client_consilium': {
+        'is_completed': _isConsiliumCompleted,
+        'cycle_id': _consiliumCycleId,
+        'overall_report': _clientOverallReport?.toJson(),
+        'system_reports': _clientSystemReports.map((k, v) => MapEntry(k, v.toJson())),
+        'history': _consiliumHistory,
       },
     };
     // Deep clone to isolate snapshot from subsequent in-memory mutations (e.g. profile wipe)
@@ -1748,7 +1812,227 @@ class VaultService extends ChangeNotifier {
     return null;
   }
 
-// Direct saving method for vital parameters
+  // =========================================================================
+  // PRIMARY CONSILIUM CLIENT REPORTS (Stage 5.4E-2)
+  // =========================================================================
+
+  /// Whether Primary Consilium has been completed on the server and synced to vault.
+  bool get isConsiliumCompleted => _isConsiliumCompleted;
+
+  /// Identifier of the medical cycle for which consilium was generated.
+  String? get consiliumCycleId => _consiliumCycleId;
+
+  /// Cached client-facing overall report (`user_overall_report`).
+  ClientModelReportResponse? get cachedOverallReport => _clientOverallReport;
+
+  /// Read-only map of system reports (`system_user_report_<systemKey>`).
+  Map<String, ClientModelReportResponse> get cachedSystemReports =>
+      Map.unmodifiable(_clientSystemReports);
+
+  /// Retrieves client-facing report for a specific organ system (e.g. 'cvs', 'gi_tract').
+  ClientModelReportResponse? getClientReportForSystem(String systemKey) =>
+      _clientSystemReports[systemKey];
+
+  /// Read-only map of historical consilium conclusions by cycleId.
+  Map<String, Map<String, dynamic>> get consiliumHistory =>
+      Map.unmodifiable(_consiliumHistory);
+
+  /// Retrieves historical consilium snapshot for a past medical cycle if available.
+  Map<String, dynamic>? getHistoricalConsilium(String cycleId) =>
+      _consiliumHistory[cycleId];
+
+  /// Atomically records published client-facing Primary Consilium reports in local vault.
+  /// Enforces epoch check and patient attribution fencing.
+  /// Requires user_overall_report to mark consilium completed.
+  /// Archives previous cycle consilium and cleans old active shelves to avoid cross-cycle mixing.
+  /// Returns 	rue only after local secure persistence is fully confirmed.
+  Future<bool> recordClientReports({
+    required String cycleId,
+    required List<ClientModelReportResponse> reports,
+    String? expectedPatientId,
+  }) async {
+    if (_isDisposed) return false;
+
+    // 1. Patient fencing: verify attribution if provided or active
+    final activeId = _activePatientId;
+    if (expectedPatientId != null && expectedPatientId != activeId) {
+      debugPrint('[VaultService] Patient attribution mismatch when recording client reports. Discarding.');
+      return false;
+    }
+
+    final int capturedEpoch = _sessionEpoch;
+
+    // 2. Parse and assign reports
+    ClientModelReportResponse? overall;
+    final Map<String, ClientModelReportResponse> systems = {};
+
+    for (final rep in reports) {
+      if (rep.privacyLevel != 'client_facing') {
+        debugPrint('[VaultService] Security violation: non-client_facing report ignored: ');
+        continue;
+      }
+
+      if (rep.reportType == 'user_overall_report') {
+        overall = rep;
+      } else if (rep.reportType.startsWith('system_user_report_')) {
+        final sysKey = rep.reportType.substring('system_user_report_'.length);
+        systems[sysKey] = rep;
+      } else if (rep.content.systemKey != null && rep.content.systemKey!.isNotEmpty) {
+        systems[rep.content.systemKey!] = rep;
+      }
+    }
+
+    // Require user_overall_report: consilium cannot be marked completed without overall synthesis
+    if (overall == null) {
+      debugPrint('[VaultService] Cannot record consilium: missing required user_overall_report.');
+      return false;
+    }
+
+    // 3. Preserve history: archive previous completed cycle if different
+    if (_isConsiliumCompleted && _consiliumCycleId != null && _consiliumCycleId != cycleId && _clientOverallReport != null) {
+      _consiliumHistory[_consiliumCycleId!] = {
+        'cycle_id': _consiliumCycleId,
+        'is_completed': true,
+        'overall_report': _clientOverallReport!.toJson(),
+        'system_reports': _clientSystemReports.map((k, v) => MapEntry(k, v.toJson())),
+        'archived_at': DateTime.now().toUtc().toIso8601String(),
+      };
+    }
+
+    // 4. Update in-memory state: isolate new cycle and clear previous active shelves
+    _clientSystemReports.clear();
+    _clientOverallReport = overall;
+    _isConsiliumCompleted = true;
+    _consiliumCycleId = cycleId;
+
+    // Clean all 8 organ shelves and core cascade to prevent stale remnants of previous cycles
+    for (final sysKey in _systemFolders.keys) {
+      if (sysKey != 'notes_export' && sysKey != 'global' && sysKey != 'core_cascade') {
+        _systemFolders[sysKey]?.remove('system_user_report');
+        _systemFolders[sysKey]?['system_general_shelf'] = null;
+      }
+    }
+
+    _systemFolders['core_cascade']?['pro_general_shelf'] = overall.content.summary;
+    _systemFolders['core_cascade']?['flash_general_shelf'] = overall.content.summary;
+
+    if (overall.content.metrics.isNotEmpty) {
+      _systemFolders['global']?['vitals_thresholds'] = overall.content.metrics;
+    }
+
+    for (final entry in systems.entries) {
+      final key = entry.key;
+      final rep = entry.value;
+      _clientSystemReports[key] = rep;
+      if (_systemFolders.containsKey(key)) {
+        _systemFolders[key]!['system_general_shelf'] = rep.content.summary;
+        _systemFolders[key]!['system_user_report'] = rep.toJson();
+      }
+    }
+
+    // Record new cycle to history as well
+    _consiliumHistory[cycleId] = {
+      'cycle_id': cycleId,
+      'is_completed': true,
+      'overall_report': overall.toJson(),
+      'system_reports': systems.map((k, v) => MapEntry(k, v.toJson())),
+      'recorded_at': DateTime.now().toUtc().toIso8601String(),
+    };
+
+    // 5. Epoch fencing check before persistence
+    if (_isDisposed || _sessionEpoch != capturedEpoch || _activePatientId != activeId) {
+      return false;
+    }
+
+    // 6. Persist to storage with post-persist fence
+    try {
+      await _persist();
+      if (_isDisposed || _sessionEpoch != capturedEpoch || _activePatientId != activeId) {
+        return false;
+      }
+      if (activeId != null) {
+        await flushPendingWrites(patientId: activeId);
+        if (_isDisposed || _sessionEpoch != capturedEpoch || _activePatientId != activeId) {
+          return false;
+        }
+      }
+      notifyListeners();
+      return true;
+    } catch (e) {
+      debugPrint('[VaultService] Failed to securely persist client reports: $e');
+      notifyListeners();
+      return false;
+    }
+  }
+
+  /// Safely transitions the active consilium view to pending state for a cycle.
+  /// Archives any previous completed consilium into history to prevent mixing cycles
+  /// or showing stale conclusions for a pending cycle.
+  Future<bool> markConsiliumPending({
+    required String cycleId,
+    String? expectedPatientId,
+  }) async {
+    if (_isDisposed) return false;
+
+    final activeId = _activePatientId;
+    if (expectedPatientId != null && expectedPatientId != activeId) {
+      debugPrint('[VaultService] Patient attribution mismatch when marking consilium pending. Discarding.');
+      return false;
+    }
+
+    final int capturedEpoch = _sessionEpoch;
+
+    // Archive previous completed consilium if present
+    if (_isConsiliumCompleted && _consiliumCycleId != null && _clientOverallReport != null) {
+      _consiliumHistory[_consiliumCycleId!] = {
+        'cycle_id': _consiliumCycleId,
+        'is_completed': true,
+        'overall_report': _clientOverallReport!.toJson(),
+        'system_reports': _clientSystemReports.map((k, v) => MapEntry(k, v.toJson())),
+        'archived_at': DateTime.now().toUtc().toIso8601String(),
+      };
+    }
+
+    _isConsiliumCompleted = false;
+    _consiliumCycleId = cycleId.isNotEmpty ? cycleId : null;
+    _clientOverallReport = null;
+    _clientSystemReports.clear();
+
+    // Reset active shelves
+    for (final sysKey in _systemFolders.keys) {
+      if (sysKey != 'notes_export' && sysKey != 'global' && sysKey != 'core_cascade') {
+        _systemFolders[sysKey]?.remove('system_user_report');
+        _systemFolders[sysKey]?['system_general_shelf'] = null;
+      }
+    }
+    _systemFolders['core_cascade']?['pro_general_shelf'] = null;
+    _systemFolders['core_cascade']?['flash_general_shelf'] = null;
+
+    if (_isDisposed || _sessionEpoch != capturedEpoch || _activePatientId != activeId) {
+      return false;
+    }
+
+    try {
+      await _persist();
+      if (_isDisposed || _sessionEpoch != capturedEpoch || _activePatientId != activeId) {
+        return false;
+      }
+      if (activeId != null) {
+        await flushPendingWrites(patientId: activeId);
+        if (_isDisposed || _sessionEpoch != capturedEpoch || _activePatientId != activeId) {
+          return false;
+        }
+      }
+      notifyListeners();
+      return true;
+    } catch (e) {
+      debugPrint('[VaultService] Failed to securely persist pending consilium state: $e');
+      notifyListeners();
+      return false;
+    }
+  }
+
+  // Direct saving method for vital parameters
   void updateSmartWatchMetrics({
     int? systolic,
     int? diastolic,
