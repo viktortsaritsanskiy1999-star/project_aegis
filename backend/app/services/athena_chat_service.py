@@ -24,7 +24,11 @@ from app.schemas.consilium import (
 from app.schemas.privacy import PrivacyLevel
 from app.services.consilium_prompts import build_athena_system_prompt
 from app.services.gemini_gateway import GeminiGateway, GeminiModelRole
-from app.services.primary_consilium_service import ConsiliumContextMissingError
+from app.services.primary_consilium_service import (
+    ConsiliumContextMissingError,
+    PREPARATORY_ANAMNESIS_REPORT_TYPE,
+    RAW_USER_ANAMNESIS_REPORT_TYPE,
+)
 from app.services.weekly_consilium_service import (
     WeeklyConsiliumService,
     ATHENA_CHAT_HISTORY_REPORT_TYPE,
@@ -85,11 +89,21 @@ class AthenaChatService:
         *,
         patient_id: str,
         request: AthenaChatRequest,
+        cycle_id: Optional[str] = None,
     ) -> AthenaChatResponse:
         clean_patient_id = patient_id.strip()
 
         # 1. Resolve patient's active medical cycle atomically
-        cycle, _ = self.cycle_repo.get_or_create_active_for_patient(clean_patient_id)
+        if cycle_id is not None and cycle_id.strip():
+            clean_cycle_id = cycle_id.strip()
+            cycle = self.cycle_repo.get(clean_cycle_id)
+            if cycle is None or cycle.patient_id != clean_patient_id:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail=f"Medical cycle '{clean_cycle_id}' not found for active patient.",
+                )
+        else:
+            cycle, _ = self.cycle_repo.get_or_create_active_for_patient(clean_patient_id)
         cycle_id = cycle.cycle_id
 
         # 2. Idempotency Check: if client submitted an idempotency_key, check for existing turn
@@ -168,13 +182,27 @@ class AthenaChatService:
             created_at=now_iso,
         )
 
-    def get_sanitized_history(self, *, patient_id: str) -> AthenaChatHistoryResponse:
+    def get_sanitized_history(
+        self,
+        *,
+        patient_id: str,
+        cycle_id: Optional[str] = None,
+    ) -> AthenaChatHistoryResponse:
         """
         Retrieves sanitized chat history for the patient's active cycle.
         Contains strictly user and curator messages, never exposing internal clinical logs.
         """
         clean_patient_id = patient_id.strip()
-        cycle, _ = self.cycle_repo.get_or_create_active_for_patient(clean_patient_id)
+        if cycle_id is not None and cycle_id.strip():
+            clean_cycle_id = cycle_id.strip()
+            cycle = self.cycle_repo.get(clean_cycle_id)
+            if cycle is None or cycle.patient_id != clean_patient_id:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail=f"Medical cycle '{clean_cycle_id}' not found for active patient.",
+                )
+        else:
+            cycle, _ = self.cycle_repo.get_or_create_active_for_patient(clean_patient_id)
         raw_messages = self.weekly_service.get_athena_chat_history(cycle.cycle_id)
 
         sanitized_items = [
@@ -271,21 +299,212 @@ class AthenaChatService:
 
         return False, None
 
+    def build_patient_medical_context(self, cycle_id: str) -> str:
+        """
+        Assembles the authoritative medical context of the active patient cycle:
+        1. Anamnesis (M1 validated output or raw questionnaire answers; explicitly noted if missing).
+        2. Laboratory findings (active markers from authoritative ledger or OCR fallback; explicitly noted if absent).
+        3. ECG examination (structured findings and metrics; explicitly noted if not conducted).
+        4. Primary Consilium published client-facing conclusions (overall report + 8 system summaries; explicitly noted if pending).
+        Strictly scopes all queries to `cycle_id` to prevent cross-cycle data mixing.
+        """
+        # 1. Anamnesis
+        anamnesis_lines: List[str] = []
+        m1_reports = self.report_repo.list_server_only(
+            cycle_id=cycle_id,
+            report_type=PREPARATORY_ANAMNESIS_REPORT_TYPE,
+        )
+        if m1_reports:
+            m1_content = m1_reports[0].content or {}
+            user_view = m1_content.get("user_view") or {}
+            summary = user_view.get("summary")
+            if summary:
+                anamnesis_lines.append(f"- Anamnesis summary: {summary.strip()}")
+            system_logic = m1_content.get("system_logic") or {}
+            facts: List[str] = []
+            for sys_k in sorted(system_logic.keys()):
+                organ_val = system_logic[sys_k]
+                if isinstance(organ_val, dict):
+                    data_str = organ_val.get("data")
+                    if data_str and str(data_str).strip():
+                        facts.append(f"{sys_k}: {data_str.strip()}")
+            if facts:
+                anamnesis_lines.append(f"- Clinical facts: {'; '.join(facts)}")
+        else:
+            raw_reports = self.report_repo.list_server_only(
+                cycle_id=cycle_id,
+                report_type=RAW_USER_ANAMNESIS_REPORT_TYPE,
+            )
+            if raw_reports:
+                raw_answers = (raw_reports[0].content or {}).get("answers") or {}
+                raw_summary_parts: List[str] = []
+                if raw_answers.get("age"):
+                    raw_summary_parts.append(f"Age: {raw_answers.get('age')}")
+                if raw_answers.get("gender"):
+                    raw_summary_parts.append(f"Gender: {raw_answers.get('gender')}")
+                if raw_answers.get("height") and raw_answers.get("weight"):
+                    raw_summary_parts.append(
+                        f"Height/Weight: {raw_answers.get('height')} cm / {raw_answers.get('weight')} kg"
+                    )
+                if raw_answers.get("chronic_diseases") and str(raw_answers.get("chronic_diseases")).lower() != "none":
+                    raw_summary_parts.append(f"Chronic diseases: {raw_answers.get('chronic_diseases')}")
+                if raw_answers.get("medications") and str(raw_answers.get("medications")).lower() != "none":
+                    raw_summary_parts.append(f"Medications: {raw_answers.get('medications')}")
+                if raw_answers.get("sleep_quality"):
+                    raw_summary_parts.append(f"Sleep quality: {raw_answers.get('sleep_quality')}")
+                if raw_answers.get("diet_types"):
+                    raw_summary_parts.append(f"Diet: {raw_answers.get('diet_types')}")
+                if raw_summary_parts:
+                    anamnesis_lines.append(f"- Baseline intake answers: {'; '.join(raw_summary_parts)}")
+                else:
+                    anamnesis_lines.append("- Baseline intake answers recorded.")
+            else:
+                anamnesis_lines.append("- Status: Not completed (questionnaire pending).")
+
+        # 2. Laboratory Studies
+        from app.services.lab_context_service import assemble_consilium_laboratory_context
+        lab_ctx = assemble_consilium_laboratory_context(self.db, cycle_id)
+        lab_lines: List[str] = []
+        if lab_ctx.shared_labs_table:
+            for marker_key in sorted(lab_ctx.shared_labs_table.keys()):
+                marker = lab_ctx.shared_labs_table[marker_key]
+                if isinstance(marker, dict):
+                    disp = marker.get("display_name") or marker_key
+                    val = marker.get("value")
+                    unit = marker.get("unit") or ""
+                    ref = marker.get("reference_range")
+                    ref_str = ""
+                    if isinstance(ref, dict):
+                        ref_text = ref.get("text") or (
+                            f"{ref.get('low')}-{ref.get('high')}"
+                            if ref.get("low") is not None or ref.get("high") is not None
+                            else ""
+                        )
+                        if ref_text:
+                            ref_str = f" [Ref: {ref_text}]"
+                    date_str = f" ({marker.get('sample_date')})" if marker.get("sample_date") else ""
+                    lab_lines.append(f"- {disp}: {val} {unit}{ref_str}{date_str}".strip())
+                else:
+                    lab_lines.append(f"- {marker_key}: {marker}")
+        else:
+            lab_lines.append("- Status: No laboratory studies recorded for this cycle.")
+
+        # 3. ECG Examination
+        from app.services.ecg_context_service import assemble_consilium_ecg_context
+        ecg_ctx = assemble_consilium_ecg_context(self.db, cycle_id)
+        ecg_lines: List[str] = []
+        if ecg_ctx.is_conducted:
+            ecg_lines.append(f"- Summary: {ecg_ctx.ecg_summary}")
+            if ecg_ctx.heart_rate_bpm:
+                ecg_lines.append(f"- Heart rate: {ecg_ctx.heart_rate_bpm} bpm")
+            if ecg_ctx.rhythm_type:
+                reg_str = f" ({ecg_ctx.rhythm_regularity})" if ecg_ctx.rhythm_regularity else ""
+                ecg_lines.append(f"- Rhythm: {ecg_ctx.rhythm_type}{reg_str}")
+            if ecg_ctx.record_date:
+                ecg_lines.append(f"- Recording date: {ecg_ctx.record_date}")
+        else:
+            ecg_lines.append("- Status: Not conducted (no ECG recorded for this cycle).")
+
+        # 4. Primary Consilium Published Conclusions (Client-Facing)
+        consilium_lines: List[str] = []
+        overall_reports = self.report_repo.list_client_facing(
+            cycle_id=cycle_id,
+            report_type="user_overall_report",
+        )
+        if overall_reports:
+            overall_content = overall_reports[0].content or {}
+            title = overall_content.get("title", "Primary Health Consilium")
+            summary = overall_content.get("summary", "")
+            highlights = overall_content.get("highlights") or []
+            consilium_lines.append(f"- Overall conclusion ({title}): {summary}")
+            if highlights:
+                consilium_lines.append(f"- Key highlights: {'; '.join(str(h) for h in highlights)}")
+            # Personalized vitals thresholds from published overall report
+            metrics = overall_content.get("metrics")
+            if isinstance(metrics, dict) and metrics:
+                metric_parts: List[str] = []
+                min_hr = metrics.get("min_pessimum_bpm")
+                max_hr = metrics.get("max_pessimum_bpm")
+                spike_delta = metrics.get("max_spike_delta_bpm")
+
+                if min_hr is not None:
+                    metric_parts.append(f"min {min_hr} bpm")
+                if max_hr is not None:
+                    metric_parts.append(f"max {max_hr} bpm")
+                if spike_delta is not None:
+                    metric_parts.append(f"max spike delta {spike_delta} bpm")
+
+                if metric_parts:
+                    consilium_lines.append(f"- Monitored thresholds: {', '.join(metric_parts)}.")
+                else:
+                    consilium_lines.append("- Monitored thresholds: Individual vitals thresholds unavailable.")
+            else:
+                consilium_lines.append("- Monitored thresholds: Individual vitals thresholds unavailable.")
+
+            client_reports = self.report_repo.list_client_facing(cycle_id=cycle_id)
+            for r in client_reports:
+                if r.report_type.startswith("system_user_report_"):
+                    c = r.content or {}
+                    sys_title = c.get("title") or r.report_type
+                    sys_summary = c.get("summary") or ""
+                    if sys_summary:
+                        consilium_lines.append(f"- {sys_title}: {sys_summary}")
+        else:
+            consilium_lines.append("- Status: Primary Consilium has not been executed yet for this cycle.")
+
+        sections = [
+            "=== AUTHORITATIVE PATIENT MEDICAL CONTEXT (ACTIVE CYCLE) ===",
+            "1. ANAMNESIS:",
+            "\n".join(anamnesis_lines),
+            "",
+            "2. LABORATORY STUDIES:",
+            "\n".join(lab_lines),
+            "",
+            "3. ELECTROCARDIOGRAM (ECG):",
+            "\n".join(ecg_lines),
+            "",
+            "4. PRIMARY CONSILIUM CONCLUSIONS (PUBLISHED):",
+            "\n".join(consilium_lines),
+        ]
+        return "\n".join(sections)
+
     def _resolve_strategy_context(
         self, cycle_id: str
     ) -> Tuple[str, List[Dict[str, str]], Optional[str]]:
+        medical_context = self.build_patient_medical_context(cycle_id)
+
         try:
             ctx = self.weekly_service.get_active_athena_context(cycle_id)
-            return ctx.system_prompt, ctx.chat_history, ctx.sprint_id
+            full_curator_context = "\n\n".join(
+                [
+                    medical_context,
+                    "=== GUIDELINES AND CLINICAL ROUTE FROM CHIEF PHYSICIAN (PRO) ===",
+                    ctx.active_strategy_text,
+                    "=== DEEP CLINICAL ANALYSIS AND SYNDROMES (PRO TRAINING) ===",
+                    ctx.clinical_background_text,
+                    "=== PRIMARY SYNTHESIS (FLASH) ===",
+                    ctx.deputy_synthesis_text,
+                    ctx.athena_logs_summary,
+                ]
+            )
+            system_prompt = build_athena_system_prompt(full_curator_context)
+            return system_prompt, ctx.chat_history, ctx.sprint_id
         except ConsiliumContextMissingError:
             # Fallback for newly paired patient prior to Primary Consilium execution
             onboarding_route = (
                 "=== GUIDELINES AND CLINICAL ROUTE ===\n"
-                "Patient is in initial onboarding. Welcome the user warmly to Aegis Health, "
-                "encourage them to complete the initial anamnesis questionnaire, track daily vitals, "
-                "and provide empathetic wellness companionship."
+                "Patient is in initial onboarding (Primary Consilium not yet executed). "
+                "Welcome the user warmly to Aegis Health, encourage them to complete the initial anamnesis questionnaire, "
+                "upload laboratory studies or ECG if available, track daily vitals, "
+                "and provide empathetic wellness companionship based on the available data."
             )
-            system_prompt = build_athena_system_prompt(onboarding_route)
+            full_curator_context = "\n\n".join(
+                [
+                    medical_context,
+                    onboarding_route,
+                ]
+            )
+            system_prompt = build_athena_system_prompt(full_curator_context)
             chat_history = self.weekly_service.get_athena_chat_history(cycle_id)
             return system_prompt, chat_history, None
 
@@ -497,6 +716,17 @@ YOUR INSTRUCTION:
 
             # Completely strip [CLINICAL_REPORT] from client text
             working_text = CLINICAL_REPORT_REGEX.sub("", working_text).strip()
+
+        # Extra defense-in-depth: strip unclosed clinical report blocks, emergency trigger tags, or internal headers
+        working_text = re.sub(r"\[CLINICAL_REPORT\][\s\S]*$", "", working_text, flags=re.IGNORECASE).strip()
+        working_text = re.sub(r"\[/?CLINICAL_REPORT\]", "", working_text, flags=re.IGNORECASE).strip()
+        working_text = EMERGENCY_TRIGGER_REGEX.sub("", working_text).strip()
+        working_text = re.sub(
+            r"=== (?:AUTHORITATIVE PATIENT MEDICAL CONTEXT|GUIDELINES AND CLINICAL ROUTE|DEEP CLINICAL ANALYSIS|PRIMARY SYNTHESIS|INSTRUCTIONS AND ROUTE)[\s\S]*?===\n?",
+            "",
+            working_text,
+            flags=re.IGNORECASE,
+        ).strip()
 
         clean_reply = working_text.strip()
 
