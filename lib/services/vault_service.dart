@@ -450,6 +450,7 @@ class VaultService extends ChangeNotifier {
     _anamnesisSyncedAt = null;
     _anamnesisSyncError = null;
     _isAnamnesisSyncing = false;
+    _cachedLabLedgerState = null;
   }
 
   Future<void> _initVault() async {
@@ -629,6 +630,18 @@ class VaultService extends ChangeNotifier {
       _anamnesisIntakeVersion = null;
       _anamnesisSyncedAt = null;
       _anamnesisSyncStatus = AnamnesisSyncStatus.idle;
+    }
+
+    if (_systemFolders['global']?['lab_ledger_snapshot'] is Map) {
+      try {
+        _cachedLabLedgerState = LabLedgerStateResponse.fromJson(
+          Map<String, dynamic>.from(_systemFolders['global']!['lab_ledger_snapshot'] as Map),
+        );
+      } catch (_) {
+        _cachedLabLedgerState = null;
+      }
+    } else {
+      _cachedLabLedgerState = null;
     }
   }
 
@@ -2096,6 +2109,83 @@ class VaultService extends ChangeNotifier {
   }
 
 // LABORATORIES
+  LabLedgerStateResponse? _cachedLabLedgerState;
+
+  /// Authoritative laboratory ledger state snapshot retrieved from the server.
+  LabLedgerStateResponse? get cachedLabLedgerState => _cachedLabLedgerState;
+
+  /// Complete list of laboratory observations across all historical studies.
+  List<LabObservationEntry> get labObservationsHistory =>
+      _cachedLabLedgerState?.observationsHistory ?? const [];
+
+  /// Current active laboratory markers from the authoritative ledger.
+  Map<String, LabObservationEntry> get activeLabMarkers =>
+      _cachedLabLedgerState?.activeMarkers ?? const {};
+
+  /// Updates the local Vault cache of the server-authoritative laboratory ledger state.
+  /// Preserves patient isolation and applies session epoch fencing.
+  /// Updates shared_labs_shelf with active markers for backward compatibility with local consumers (BrainService).
+  void updateLabLedgerSnapshot(LabLedgerStateResponse ledgerState) {
+    _cachedLabLedgerState = ledgerState;
+
+    final sharedLabs = <String, dynamic>{};
+    for (final entry in ledgerState.activeMarkers.entries) {
+      sharedLabs[entry.key] = entry.value.toJson();
+    }
+    _systemFolders['global']!['shared_labs_shelf'] = sharedLabs;
+    _systemFolders['global']!['lab_ledger_snapshot'] = ledgerState.toJson();
+    _mirrorToNotesExport('shared_labs_shelf', sharedLabs);
+    _persist();
+    notifyListeners();
+  }
+
+  /// Safely updates the local Vault cache from a successful [LabVisionIntakeClientResponse]
+  /// when fetching the full ledger state fails or is deferred.
+  /// Preserves multi-study history by appending new confirmed markers to [labObservationsHistory].
+  void updateLabLedgerFromIntakeResponse(LabVisionIntakeClientResponse intake) {
+    final existingHistory = labObservationsHistory;
+    final activeMap = Map<String, LabObservationEntry>.from(_cachedLabLedgerState?.activeMarkers ?? {});
+
+    final newEntries = <LabObservationEntry>[];
+    final nowIso = DateTime.now().toUtc().toIso8601String();
+    for (final m in intake.confirmedMarkers) {
+      final entry = LabObservationEntry(
+        observationId: 'obs_ocr__',
+        markerKey: m.markerKey,
+        displayName: m.originalName,
+        value: m.rawValue,
+        numericValue: m.numericValue,
+        unit: m.unit,
+        sampleDate: m.sampleDate,
+        referenceRange: m.referenceRange,
+        eventType: 'initial',
+        isActive: true,
+        isCriticalFlag: m.isCriticalFlag,
+        isUncertain: m.isUncertain,
+        uncertaintyNote: m.uncertaintyNote,
+        isRecognitionAmbiguous: m.isRecognitionAmbiguous,
+        recordedAt: m.sampleDate ?? nowIso,
+      );
+      activeMap[m.markerKey] = entry;
+      newEntries.add(entry);
+    }
+
+    final fallbackState = LabLedgerStateResponse(
+      cycleId: intake.cycleId,
+      ledgerVersion: intake.ledgerVersion,
+      lastEvaluatedLedgerVersion: _cachedLabLedgerState?.lastEvaluatedLedgerVersion ?? 0,
+      hasUnreviewedLabChanges: intake.hasUnreviewedLabChanges,
+      evaluationStatus: 'pending',
+      evaluationNotice: 'Extracted from OCR intake confirmation',
+      hasCriticalFlags: intake.confirmedMarkers.any((m) => m.isCriticalFlag),
+      safetyNotice: 'All parameters extracted from intake confirmation',
+      activeMarkers: activeMap,
+      observationsHistory: [...existingHistory, ...newEntries],
+    );
+
+    updateLabLedgerSnapshot(fallbackState);
+  }
+
   void injectParsedLaboratories(Map<String, dynamic> parsedJson) {
     _systemFolders['global']!['shared_labs_shelf'] = parsedJson;
     _mirrorToNotesExport('shared_labs_shelf', parsedJson);

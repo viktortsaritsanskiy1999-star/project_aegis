@@ -1,5 +1,6 @@
 import 'dart:math';
 import 'package:flutter/foundation.dart';
+import 'package:image_picker/image_picker.dart';
 
 /// Raw answers submitted from the 17 Flutter anamnesis cards.
 /// Matches backend AnamnesisQuestionnaireAnswers schema.
@@ -952,5 +953,274 @@ class AthenaChatHistoryResponse {
   Map<String, dynamic> toJson() => {
     'cycle_id': cycleId,
     'messages': messages.map((m) => m.toJson()).toList(),
+  };
+}
+
+/// Represents a laboratory document page/file prepared for upload.
+@immutable
+class LabUploadFileItem {
+  final String filename;
+  final List<int> bytes;
+  final String mimeType;
+
+  LabUploadFileItem({
+    required this.filename,
+    required this.bytes,
+    String? mimeType,
+  }) : mimeType = mimeType ?? resolveMimeType(filename, bytes);
+
+  static String resolveMimeType(String filename, List<int> bytes) {
+    if (bytes.length >= 3 && bytes[0] == 0xFF && bytes[1] == 0xD8 && bytes[2] == 0xFF) {
+      return 'image/jpeg';
+    }
+    if (bytes.length >= 8 &&
+        bytes[0] == 0x89 && bytes[1] == 0x50 && bytes[2] == 0x4E && bytes[3] == 0x47 &&
+        bytes[4] == 0x0D && bytes[5] == 0x0A && bytes[6] == 0x1A && bytes[7] == 0x0A) {
+      return 'image/png';
+    }
+    if (bytes.length >= 12 &&
+        bytes[0] == 0x52 && bytes[1] == 0x49 && bytes[2] == 0x46 && bytes[3] == 0x46 &&
+        bytes[8] == 0x57 && bytes[9] == 0x45 && bytes[10] == 0x42 && bytes[11] == 0x50) {
+      return 'image/webp';
+    }
+    if (bytes.length >= 8 &&
+        bytes[4] == 0x66 && bytes[5] == 0x74 && bytes[6] == 0x79 && bytes[7] == 0x70) {
+      return 'image/heic';
+    }
+    final lower = filename.toLowerCase();
+    if (lower.endsWith('.png')) return 'image/png';
+    if (lower.endsWith('.webp')) return 'image/webp';
+    if (lower.endsWith('.heic') || lower.endsWith('.heif')) return 'image/heic';
+    return 'image/jpeg';
+  }
+
+  static bool isSupportedFormat(String filename, List<int> bytes) {
+    final lower = filename.toLowerCase();
+    final hasValidExt = lower.endsWith('.jpg') ||
+        lower.endsWith('.jpeg') ||
+        lower.endsWith('.png') ||
+        lower.endsWith('.webp') ||
+        lower.endsWith('.heic') ||
+        lower.endsWith('.heif');
+    if (!hasValidExt) return false;
+    if (bytes.isEmpty) return false;
+    final mime = resolveMimeType(filename, bytes);
+    return mime == 'image/jpeg' ||
+        mime == 'image/png' ||
+        mime == 'image/webp' ||
+        mime == 'image/heic';
+  }
+
+  static Future<LabUploadFileItem> fromXFile(XFile file) async {
+    final fileBytes = await file.readAsBytes();
+    return LabUploadFileItem(
+      filename: file.name.isNotEmpty ? file.name : (file.path.isNotEmpty ? file.path.split(RegExp(r'[\\/]')).last : 'page.jpg'),
+      bytes: fileBytes,
+    );
+  }
+}
+
+/// Metadata describing the recognized laboratory document.
+@immutable
+class VisionOcrDocumentMetadata {
+  final String? sampleDate;
+  final String? issueDate;
+  final String? laboratoryName;
+  final String? orderId;
+  final String? documentFingerprint;
+  final int pageCount;
+  final String? notes;
+
+  const VisionOcrDocumentMetadata({
+    this.sampleDate,
+    this.issueDate,
+    this.laboratoryName,
+    this.orderId,
+    this.documentFingerprint,
+    this.pageCount = 1,
+    this.notes,
+  });
+
+  factory VisionOcrDocumentMetadata.fromJson(Map<String, dynamic> json) {
+    return VisionOcrDocumentMetadata(
+      sampleDate: json['sample_date'] as String?,
+      issueDate: json['issue_date'] as String?,
+      laboratoryName: json['laboratory_name'] as String?,
+      orderId: json['order_id'] as String?,
+      documentFingerprint: json['document_fingerprint'] as String?,
+      pageCount: json['page_count'] as int? ?? 1,
+      notes: json['notes'] as String?,
+    );
+  }
+
+  Map<String, dynamic> toJson() => {
+    if (sampleDate != null) 'sample_date': sampleDate,
+    if (issueDate != null) 'issue_date': issueDate,
+    if (laboratoryName != null) 'laboratory_name': laboratoryName,
+    if (orderId != null) 'order_id': orderId,
+    if (documentFingerprint != null) 'document_fingerprint': documentFingerprint,
+    'page_count': pageCount,
+    if (notes != null) 'notes': notes,
+  };
+}
+
+/// Single recognized laboratory marker from Vision OCR.
+@immutable
+class VisionOcrMarkerItem {
+  final String originalName;
+  final String markerKey;
+  final String rawValue;
+  final double? numericValue;
+  final String? unit;
+  final LabReferenceRange? referenceRange;
+  final String? sampleDate;
+  final String? category;
+  final bool isUncertain;
+  final String? uncertaintyNote;
+  final bool isCriticalFlag;
+  final bool requiresUserVerification;
+  final bool isRecognitionAmbiguous;
+
+  const VisionOcrMarkerItem({
+    required this.originalName,
+    required this.markerKey,
+    required this.rawValue,
+    this.numericValue,
+    this.unit,
+    this.referenceRange,
+    this.sampleDate,
+    this.category,
+    this.isUncertain = false,
+    this.uncertaintyNote,
+    this.isCriticalFlag = false,
+    this.requiresUserVerification = false,
+    this.isRecognitionAmbiguous = false,
+  });
+
+  factory VisionOcrMarkerItem.fromJson(Map<String, dynamic> json) {
+    return VisionOcrMarkerItem(
+      originalName: json['original_name'] as String? ?? '',
+      markerKey: json['marker_key'] as String? ?? '',
+      rawValue: json['raw_value']?.toString() ?? '',
+      numericValue: (json['numeric_value'] as num?)?.toDouble(),
+      unit: json['unit'] as String?,
+      referenceRange: json['reference_range'] != null
+          ? LabReferenceRange.fromJson(
+              Map<String, dynamic>.from(json['reference_range'] as Map),
+            )
+          : null,
+      sampleDate: json['sample_date'] as String?,
+      category: json['category'] as String?,
+      isUncertain: json['is_uncertain'] == true,
+      uncertaintyNote: json['uncertainty_note'] as String?,
+      isCriticalFlag: json['is_critical_flag'] == true,
+      requiresUserVerification: json['requires_user_verification'] == true,
+      isRecognitionAmbiguous: json['is_recognition_ambiguous'] == true,
+    );
+  }
+
+  Map<String, dynamic> toJson() => {
+    'original_name': originalName,
+    'marker_key': markerKey,
+    'raw_value': rawValue,
+    if (numericValue != null) 'numeric_value': numericValue,
+    if (unit != null) 'unit': unit,
+    if (referenceRange != null) 'reference_range': referenceRange!.toJson(),
+    if (sampleDate != null) 'sample_date': sampleDate,
+    if (category != null) 'category': category,
+    'is_uncertain': isUncertain,
+    if (uncertaintyNote != null) 'uncertainty_note': uncertaintyNote,
+    'is_critical_flag': isCriticalFlag,
+    'requires_user_verification': requiresUserVerification,
+    'is_recognition_ambiguous': isRecognitionAmbiguous,
+  };
+}
+
+/// Safe client confirmation response after Vision OCR processing and ledger synchronization.
+@immutable
+class LabVisionIntakeClientResponse {
+  final String cycleId;
+  final String status;
+  final int ledgerVersion;
+  final int extractedCount;
+  final int requiresVerificationCount;
+  final VisionOcrDocumentMetadata? documentMetadata;
+  final List<VisionOcrMarkerItem> markers;
+  final List<VisionOcrMarkerItem> confirmedMarkers;
+  final List<VisionOcrMarkerItem> unconfirmedMarkers;
+  final bool hasUnreviewedLabChanges;
+  final String? privacyNotice;
+
+  const LabVisionIntakeClientResponse({
+    required this.cycleId,
+    this.status = 'processed',
+    required this.ledgerVersion,
+    required this.extractedCount,
+    this.requiresVerificationCount = 0,
+    this.documentMetadata,
+    this.markers = const [],
+    this.confirmedMarkers = const [],
+    this.unconfirmedMarkers = const [],
+    this.hasUnreviewedLabChanges = true,
+    this.privacyNotice,
+  });
+
+  factory LabVisionIntakeClientResponse.fromJson(Map<String, dynamic> json) {
+    final markersList = <VisionOcrMarkerItem>[];
+    if (json['markers'] is List) {
+      for (final item in json['markers'] as List) {
+        if (item is Map) {
+          markersList.add(VisionOcrMarkerItem.fromJson(Map<String, dynamic>.from(item)));
+        }
+      }
+    }
+
+    final confirmedList = <VisionOcrMarkerItem>[];
+    if (json['confirmed_markers'] is List) {
+      for (final item in json['confirmed_markers'] as List) {
+        if (item is Map) {
+          confirmedList.add(VisionOcrMarkerItem.fromJson(Map<String, dynamic>.from(item)));
+        }
+      }
+    }
+
+    final unconfirmedList = <VisionOcrMarkerItem>[];
+    if (json['unconfirmed_markers'] is List) {
+      for (final item in json['unconfirmed_markers'] as List) {
+        if (item is Map) {
+          unconfirmedList.add(VisionOcrMarkerItem.fromJson(Map<String, dynamic>.from(item)));
+        }
+      }
+    }
+
+    return LabVisionIntakeClientResponse(
+      cycleId: json['cycle_id'] as String? ?? '',
+      status: json['status'] as String? ?? 'processed',
+      ledgerVersion: json['ledger_version'] as int? ?? 0,
+      extractedCount: json['extracted_count'] as int? ?? markersList.length,
+      requiresVerificationCount: json['requires_verification_count'] as int? ?? unconfirmedList.length,
+      documentMetadata: json['document_metadata'] != null
+          ? VisionOcrDocumentMetadata.fromJson(Map<String, dynamic>.from(json['document_metadata'] as Map))
+          : null,
+      markers: markersList,
+      confirmedMarkers: confirmedList,
+      unconfirmedMarkers: unconfirmedList,
+      hasUnreviewedLabChanges: json['has_unreviewed_lab_changes'] != false,
+      privacyNotice: json['privacy_notice'] as String?,
+    );
+  }
+
+  Map<String, dynamic> toJson() => {
+    'cycle_id': cycleId,
+    'status': status,
+    'ledger_version': ledgerVersion,
+    'extracted_count': extractedCount,
+    'requires_verification_count': requiresVerificationCount,
+    if (documentMetadata != null) 'document_metadata': documentMetadata!.toJson(),
+    'markers': markers.map((m) => m.toJson()).toList(),
+    'confirmed_markers': confirmedMarkers.map((m) => m.toJson()).toList(),
+    'unconfirmed_markers': unconfirmedMarkers.map((m) => m.toJson()).toList(),
+    'has_unreviewed_lab_changes': hasUnreviewedLabChanges,
+    if (privacyNotice != null) 'privacy_notice': privacyNotice,
   };
 }

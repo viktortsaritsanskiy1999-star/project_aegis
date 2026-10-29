@@ -543,6 +543,101 @@ class AegisApiClient {
     }
   }
 
+  /// Uploads 1 to 15 laboratory document images for server-side Vision OCR and ledger integration.
+  /// (`POST /api/v1/client/cascade/intake/labs`).
+  /// Requires `cascade:intake` scope.
+  Future<LabVisionIntakeClientResponse> uploadLabDocuments({
+    required List<LabUploadFileItem> files,
+    bool isCorrection = false,
+    String? sampleDate,
+    String? accessToken,
+  }) async {
+    // 1. Client-side pre-validation
+    if (files.isEmpty) {
+      throw const AegisValidationException('At least one laboratory report image page must be uploaded.');
+    }
+    if (files.length > 15) {
+      throw AegisValidationException(
+        'Maximum 15 pages allowed per laboratory upload (provided ${files.length}).',
+      );
+    }
+
+    int totalBytes = 0;
+    for (final file in files) {
+      if (file.bytes.isEmpty) {
+        throw AegisValidationException('File "${file.filename}" is empty.');
+      }
+      if (file.bytes.length > 10 * 1024 * 1024) {
+        throw AegisValidationException(
+          'File "${file.filename}" exceeds the maximum allowed size of 10 MB.',
+        );
+      }
+      if (!LabUploadFileItem.isSupportedFormat(file.filename, file.bytes)) {
+        throw AegisValidationException(
+          'File "${file.filename}" has an unsupported format. Supported formats: JPEG, PNG, WEBP, HEIC.',
+        );
+      }
+      totalBytes += file.bytes.length;
+    }
+
+    if (totalBytes > 30 * 1024 * 1024) {
+      throw AegisValidationException(
+        'Total upload size (${(totalBytes / (1024 * 1024)).toStringAsFixed(1)} MB) exceeds the 30 MB cumulative limit.',
+      );
+    }
+
+    final uri = Uri.parse('$baseUrl/api/v1/client/cascade/intake/labs');
+
+    try {
+      final response = await _sendWithAuthRetry(
+        sendRequest: (token) async {
+          final request = http.MultipartRequest('POST', uri);
+          if (token != null && token.trim().isNotEmpty) {
+            request.headers['Authorization'] = 'Bearer ${token.trim()}';
+          }
+          request.headers['Accept'] = 'application/json';
+
+          if (isCorrection) {
+            request.fields['is_correction'] = 'true';
+          }
+          if (sampleDate != null && sampleDate.trim().isNotEmpty) {
+            request.fields['sample_date'] = sampleDate.trim();
+          }
+
+          for (final f in files) {
+            request.files.add(
+              http.MultipartFile.fromBytes(
+                'files',
+                f.bytes,
+                filename: f.filename,
+              ),
+            );
+          }
+
+          _log('POST (multipart) $uri with ${files.length} pages (${(totalBytes / 1024).toStringAsFixed(1)} KB)');
+          final streamed = await _client.send(request).timeout(timeout);
+          return await http.Response.fromStream(streamed);
+        },
+        explicitAccessToken: accessToken,
+      );
+
+      if (response.statusCode == 200) {
+        final data = json.decode(response.body) as Map<String, dynamic>;
+        return LabVisionIntakeClientResponse.fromJson(data);
+      }
+      _handleErrorResponse(response);
+    } on TimeoutException catch (e) {
+      _log('Timeout on $uri: $e');
+      throw AegisTimeoutException('Laboratory document upload timed out after ${timeout.inSeconds}s');
+    } on SocketException catch (e) {
+      _log('Socket error on $uri: $e');
+      throw AegisNetworkException('Network connection failed: ${e.message}');
+    } on http.ClientException catch (e) {
+      _log('Client error on $uri: $e');
+      throw AegisNetworkException('HTTP client error: ${e.message}');
+    }
+  }
+
   /// Query laboratory ledger state and unreviewed changes indicator (`GET /api/v1/client/labs/state`).
   /// Requires `cycle:read` scope.
   Future<LabLedgerStateResponse> getLabLedgerState({String? accessToken}) async {
