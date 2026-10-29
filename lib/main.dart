@@ -17,6 +17,7 @@ import 'widgets/emergency_medical_modal.dart';
 import 'services/health_data_provider.dart';
 import 'services/api/aegis_api_client.dart';
 import 'services/api/vitals_api_models.dart';
+import 'services/api/medical_ai_api_models.dart';
 import 'services/auth/auth_session_manager.dart';
 import 'services/sync/vitals_sync_queue.dart';
 import 'widgets/aegis_device_pairing_modal.dart';
@@ -228,6 +229,11 @@ class _AtlasScreenState extends State<AtlasScreen> {
   bool _isLoadingConsilium = false;
   String? _consiliumErrorMessage;
   int _consiliumFetchEpoch = 0;
+  bool _isExecutingConsilium = false;
+  bool _consiliumIsBusy = false;
+  ClientCascadeStatusResponse? _latestCascadeStatus;
+  String? _activeConsiliumCycleId;
+  String? _stableIdempotencyKey;
   bool _isActivityModalOpen = false;
   bool _isWorkoutModalOpen = false;
   bool _isCriticalModalOpen = false;
@@ -311,6 +317,7 @@ class _AtlasScreenState extends State<AtlasScreen> {
 
     try {
       final status = await apiClient.getCascadeStatus();
+      _latestCascadeStatus = status;
 
       // Epoch & attribution fence check after getCascadeStatus
       if (!mounted || _consiliumFetchEpoch != fetchEpoch || authManager.confirmedAttributionPatientId != patientId) {
@@ -318,6 +325,14 @@ class _AtlasScreenState extends State<AtlasScreen> {
       }
 
       if (status.hasActiveCycle && status.isPrimaryConsiliumCompleted && status.activeCycleId != null) {
+        if (!force && vaultService.isConsiliumCompleted && vaultService.consiliumCycleId == status.activeCycleId) {
+          setState(() {
+            _isLoadingConsilium = false;
+            _consiliumErrorMessage = null;
+          });
+          return;
+        }
+
         final reports = await apiClient.getClientReports(cycleId: status.activeCycleId!);
 
         // Epoch & attribution fence check after getClientReports
@@ -408,6 +423,270 @@ class _AtlasScreenState extends State<AtlasScreen> {
       if (mounted && _consiliumFetchEpoch == fetchEpoch && authManager.confirmedAttributionPatientId == patientId) {
         setState(() {
           _isLoadingConsilium = false;
+          _consiliumErrorMessage = 'Error: $e';
+        });
+      }
+    }
+  }
+
+  /// Explicitly runs Primary Consilium on user action.
+  /// Validates cycle readiness and preparatory context before invoking AI.
+  Future<void> _runPrimaryConsiliumExplicitly() async {
+    if (!mounted || _isExecutingConsilium) return;
+
+    final authManager = context.read<AuthSessionManager>();
+    if (!authManager.isAuthenticated) {
+      if (mounted) {
+        setState(() {
+          _consiliumErrorMessage = 'Device authentication required.';
+        });
+      }
+      return;
+    }
+
+    final String? patientId = authManager.confirmedAttributionPatientId;
+    if (patientId == null) {
+      if (mounted) {
+        setState(() {
+          _consiliumErrorMessage = 'Active patient attribution not found.';
+        });
+      }
+      return;
+    }
+
+    final int runEpoch = ++_consiliumFetchEpoch;
+
+    setState(() {
+      _isExecutingConsilium = true;
+      _consiliumIsBusy = false;
+      _consiliumErrorMessage = null;
+    });
+
+    final apiClient = context.read<AegisApiClient>();
+    final vaultService = context.read<VaultService>();
+
+    try {
+      // 1. Verify server readiness
+      final status = await apiClient.getCascadeStatus();
+
+      if (!mounted || _consiliumFetchEpoch != runEpoch || authManager.confirmedAttributionPatientId != patientId) {
+        return;
+      }
+
+      _latestCascadeStatus = status;
+
+      if (!status.hasActiveCycle) {
+        setState(() {
+          _isExecutingConsilium = false;
+          _consiliumErrorMessage = 'Active medical cycle not found.';
+        });
+        return;
+      }
+
+      if (!status.hasPreparatoryAnamnesis) {
+        setState(() {
+          _isExecutingConsilium = false;
+          _consiliumErrorMessage =
+              'Preparatory anamnesis is missing. Please complete and synchronize anamnesis first.';
+        });
+        return;
+      }
+
+      if (status.isPrimaryConsiliumCompleted) {
+        // Already completed: recover existing reports without re-running Gemini
+        final reports = await apiClient.getClientReports(cycleId: status.activeCycleId!);
+
+        if (!mounted || _consiliumFetchEpoch != runEpoch || authManager.confirmedAttributionPatientId != patientId) {
+          return;
+        }
+
+        final bool saved = await vaultService.recordClientReports(
+          cycleId: status.activeCycleId!,
+          reports: reports,
+          expectedPatientId: patientId,
+        );
+
+        if (!mounted || _consiliumFetchEpoch != runEpoch || authManager.confirmedAttributionPatientId != patientId) {
+          return;
+        }
+
+        if (!saved) {
+          setState(() {
+            _isExecutingConsilium = false;
+            _consiliumErrorMessage = 'Failed to securely persist consilium reports locally.';
+          });
+          return;
+        }
+
+        _stableIdempotencyKey = null;
+        _activeConsiliumCycleId = null;
+
+        if (mounted) {
+          setState(() {
+            _isExecutingConsilium = false;
+            _consiliumErrorMessage = null;
+          });
+        }
+        return;
+      }
+
+      // 2. Execute Primary Consilium with stable idempotency key
+      final String cycleId = status.activeCycleId!;
+      if (_activeConsiliumCycleId != cycleId || _stableIdempotencyKey == null) {
+        _activeConsiliumCycleId = cycleId;
+        _stableIdempotencyKey = 'atlas_primary_$cycleId';
+      }
+
+      final response = await apiClient.runPrimaryConsilium(
+        idempotencyKey: _stableIdempotencyKey,
+      );
+
+      if (!mounted || _consiliumFetchEpoch != runEpoch || authManager.confirmedAttributionPatientId != patientId) {
+        return;
+      }
+
+      final allReports = <ClientModelReportResponse>[
+        response.overallReport,
+        ...response.systemReports.values,
+      ];
+
+      final bool saved = await vaultService.recordClientReports(
+        cycleId: response.cycleId,
+        reports: allReports,
+        expectedPatientId: patientId,
+      );
+
+      if (!mounted || _consiliumFetchEpoch != runEpoch || authManager.confirmedAttributionPatientId != patientId) {
+        return;
+      }
+
+      if (!saved) {
+        setState(() {
+          _isExecutingConsilium = false;
+          _consiliumErrorMessage = 'Failed to securely persist consilium reports locally.';
+        });
+        return;
+      }
+
+      _stableIdempotencyKey = null;
+      _activeConsiliumCycleId = null;
+
+      setState(() {
+        _isExecutingConsilium = false;
+        _consiliumErrorMessage = null;
+      });
+    } on AegisConflictException catch (e) {
+      if (mounted && _consiliumFetchEpoch == runEpoch && authManager.confirmedAttributionPatientId == patientId) {
+        final lower = e.message.toLowerCase();
+        if (lower.contains('lease') ||
+            lower.contains('concurrency') ||
+            lower.contains('in-flight') ||
+            lower.contains('concurrent')) {
+          setState(() {
+            _isExecutingConsilium = false;
+            _consiliumIsBusy = true;
+            _consiliumErrorMessage = 'Consilium is temporarily busy: another analysis process holds the execution lock.';
+          });
+        } else if (lower.contains('anamnesis') || lower.contains('missing')) {
+          setState(() {
+            _isExecutingConsilium = false;
+            _consiliumErrorMessage = 'Preparatory context missing: ${e.message}';
+          });
+        } else {
+          setState(() {
+            _isExecutingConsilium = false;
+            _consiliumErrorMessage = e.message;
+          });
+        }
+      }
+    } on AegisInsufficientScopeException catch (e) {
+      if (mounted && _consiliumFetchEpoch == runEpoch && authManager.confirmedAttributionPatientId == patientId) {
+        setState(() {
+          _isExecutingConsilium = false;
+          _consiliumErrorMessage = 'Access denied: missing scope ${e.requiredScope ?? "cascade:run"}.';
+        });
+      }
+    } on AegisNetworkException catch (e) {
+      // In case of network drop / socket timeout after server accepted request, verify server status
+      try {
+        final recoveryStatus = await apiClient.getCascadeStatus();
+        if (mounted && _consiliumFetchEpoch == runEpoch && authManager.confirmedAttributionPatientId == patientId) {
+          if (recoveryStatus.isPrimaryConsiliumCompleted && recoveryStatus.activeCycleId != null) {
+            final reports = await apiClient.getClientReports(cycleId: recoveryStatus.activeCycleId!);
+            if (mounted && _consiliumFetchEpoch == runEpoch && authManager.confirmedAttributionPatientId == patientId) {
+              final bool saved = await vaultService.recordClientReports(
+                cycleId: recoveryStatus.activeCycleId!,
+                reports: reports,
+                expectedPatientId: patientId,
+              );
+              if (mounted && _consiliumFetchEpoch == runEpoch && authManager.confirmedAttributionPatientId == patientId) {
+                if (saved) {
+                  _stableIdempotencyKey = null;
+                  _activeConsiliumCycleId = null;
+                  setState(() {
+                    _isExecutingConsilium = false;
+                    _consiliumErrorMessage = null;
+                  });
+                  return;
+                }
+              }
+            }
+          }
+        }
+      } catch (_) {}
+
+      if (mounted && _consiliumFetchEpoch == runEpoch && authManager.confirmedAttributionPatientId == patientId) {
+        setState(() {
+          _isExecutingConsilium = false;
+          _consiliumErrorMessage = 'Network error: ${e.message}';
+        });
+      }
+    } on AegisTimeoutException catch (_) {
+      // In case of timeout after server accepted request, verify server status before erroring
+      try {
+        final recoveryStatus = await apiClient.getCascadeStatus();
+        if (mounted && _consiliumFetchEpoch == runEpoch && authManager.confirmedAttributionPatientId == patientId) {
+          if (recoveryStatus.isPrimaryConsiliumCompleted && recoveryStatus.activeCycleId != null) {
+            final reports = await apiClient.getClientReports(cycleId: recoveryStatus.activeCycleId!);
+            if (mounted && _consiliumFetchEpoch == runEpoch && authManager.confirmedAttributionPatientId == patientId) {
+              final bool saved = await vaultService.recordClientReports(
+                cycleId: recoveryStatus.activeCycleId!,
+                reports: reports,
+                expectedPatientId: patientId,
+              );
+              if (mounted && _consiliumFetchEpoch == runEpoch && authManager.confirmedAttributionPatientId == patientId) {
+                if (saved) {
+                  _stableIdempotencyKey = null;
+                  _activeConsiliumCycleId = null;
+                  setState(() {
+                    _isExecutingConsilium = false;
+                    _consiliumErrorMessage = null;
+                  });
+                  return;
+                }
+              }
+            }
+          }
+        }
+      } catch (_) {}
+
+      if (mounted && _consiliumFetchEpoch == runEpoch && authManager.confirmedAttributionPatientId == patientId) {
+        setState(() {
+          _isExecutingConsilium = false;
+          _consiliumErrorMessage = 'Consilium execution timed out';
+        });
+      }
+    } on AegisApiException catch (e) {
+      if (mounted && _consiliumFetchEpoch == runEpoch && authManager.confirmedAttributionPatientId == patientId) {
+        setState(() {
+          _isExecutingConsilium = false;
+          _consiliumErrorMessage = e.message;
+        });
+      }
+    } catch (e) {
+      if (mounted && _consiliumFetchEpoch == runEpoch && authManager.confirmedAttributionPatientId == patientId) {
+        setState(() {
+          _isExecutingConsilium = false;
           _consiliumErrorMessage = 'Error: $e';
         });
       }
@@ -652,6 +931,59 @@ class _AtlasScreenState extends State<AtlasScreen> {
   }
 
   Widget _buildConsiliumStatusBadge(VaultService vault) {
+    if (_isExecutingConsilium) {
+      return Container(
+        key: const Key('consilium_status_executing'),
+        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+        decoration: BoxDecoration(
+          color: const Color(0xFF0D1117).withOpacity(0.85),
+          borderRadius: BorderRadius.circular(12),
+          border: Border.all(color: Colors.purpleAccent.withOpacity(0.6), width: 1),
+        ),
+        child: const Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            SizedBox(
+              width: 10,
+              height: 10,
+              child: CircularProgressIndicator(strokeWidth: 1.5, color: Colors.purpleAccent),
+            ),
+            SizedBox(width: 6),
+            Text(
+              "Выполняется первичный консилиум...",
+              style: TextStyle(color: Colors.purpleAccent, fontSize: 10),
+            ),
+          ],
+        ),
+      );
+    }
+
+    if (_consiliumIsBusy) {
+      return GestureDetector(
+        key: const Key('consilium_status_busy'),
+        onTap: () => _runPrimaryConsiliumExplicitly(),
+        child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+          decoration: BoxDecoration(
+            color: const Color(0xFF0D1117).withOpacity(0.85),
+            borderRadius: BorderRadius.circular(12),
+            border: Border.all(color: Colors.amberAccent.withOpacity(0.6), width: 1),
+          ),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const Icon(Icons.hourglass_bottom_rounded, color: Colors.amberAccent, size: 12),
+              const SizedBox(width: 6),
+              Text(
+                "Временно занят (409) • Нажмите для повтора",
+                style: TextStyle(color: Colors.amberAccent.withOpacity(0.9), fontSize: 10),
+              ),
+            ],
+          ),
+        ),
+      );
+    }
+
     if (_isLoadingConsilium) {
       return Container(
         key: const Key('consilium_status_loading'),
@@ -731,22 +1063,36 @@ class _AtlasScreenState extends State<AtlasScreen> {
       );
     }
 
+    final bool isReadyToRun = _latestCascadeStatus?.hasPreparatoryAnamnesis == true;
     return GestureDetector(
       key: const Key('consilium_status_pending'),
-      onTap: () => _fetchPrimaryConsiliumReports(),
+      onTap: () {
+        if (isReadyToRun) {
+          _showCascadeCoreVault(context);
+        } else {
+          _fetchPrimaryConsiliumReports();
+        }
+      },
       child: Container(
         padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
         decoration: BoxDecoration(
           color: const Color(0xFF0D1117).withOpacity(0.85),
           borderRadius: BorderRadius.circular(12),
-          border: Border.all(color: Colors.white24, width: 1),
+          border: Border.all(
+            color: isReadyToRun ? Colors.cyanAccent.withOpacity(0.6) : Colors.white24,
+            width: 1,
+          ),
         ),
-        child: const Row(
+        child: Row(
           mainAxisSize: MainAxisSize.min,
           children: [
-            Icon(Icons.hourglass_empty_rounded, color: Colors.white54, size: 12),
-            SizedBox(width: 6),
-            Text(
+            Icon(
+              isReadyToRun ? Icons.play_circle_outline_rounded : Icons.hourglass_empty_rounded,
+              color: isReadyToRun ? Colors.cyanAccent : Colors.white54,
+              size: 12,
+            ),
+            const SizedBox(width: 6),
+            const Text(
               "Ожидание первичного консилиума",
               style: TextStyle(color: Colors.white70, fontSize: 10),
             ),
@@ -755,7 +1101,6 @@ class _AtlasScreenState extends State<AtlasScreen> {
       ),
     );
   }
-
   void _openCuratorVault(BuildContext context) {
     showModalBottomSheet(
       context: context,
@@ -1350,17 +1695,72 @@ class _AtlasScreenState extends State<AtlasScreen> {
                   const Text("STATUS: PENDING CONSILIUM",
                       style: TextStyle(color: Colors.amberAccent, fontSize: 11, fontWeight: FontWeight.bold)),
                   const Divider(color: Colors.white24),
-                  const Text(
-                    "Primary Consilium analysis has not been performed yet. Data is being prepared for clinical synthesis.",
-                    style: TextStyle(color: Colors.white70, fontSize: 12),
-                  ),
+                  if (_isExecutingConsilium) ...[
+                    const Row(
+                      children: [
+                        SizedBox(
+                          width: 14,
+                          height: 14,
+                          child: CircularProgressIndicator(strokeWidth: 2, color: Colors.purpleAccent),
+                        ),
+                        SizedBox(width: 8),
+                        Text("Выполняется первичный консилиум...",
+                            style: TextStyle(color: Colors.purpleAccent, fontSize: 11, fontWeight: FontWeight.bold)),
+                      ],
+                    ),
+                    const SizedBox(height: 8),
+                    const Text(
+                      "Primary Consilium is executing: synthesizing pathophysiological profile across 8 organ systems with Gemini Flash & Pro...",
+                      style: TextStyle(color: Colors.white70, fontSize: 12),
+                    ),
+                  ] else if (_consiliumIsBusy) ...[
+                    const Text(
+                      "Временно занят: другой процесс удерживает блокировку выполнения (409). Пожалуйста, повторите попытку.",
+                      style: TextStyle(color: Colors.amberAccent, fontSize: 12),
+                    ),
+                  ] else if (_latestCascadeStatus != null && !_latestCascadeStatus!.hasPreparatoryAnamnesis) ...[
+                    const Text(
+                      "Primary Consilium analysis has not been performed yet. Data is being prepared for clinical synthesis. Required preparatory anamnesis (M1) is missing on the server.",
+                      style: TextStyle(color: Colors.white70, fontSize: 12),
+                    ),
+                  ] else if (_latestCascadeStatus != null && _latestCascadeStatus!.hasPreparatoryAnamnesis) ...[
+                    const Text(
+                      "Primary Consilium analysis has not been performed yet. Data is being prepared for clinical synthesis. Context verified: ready to launch.",
+                      style: TextStyle(color: Colors.white70, fontSize: 12),
+                    ),
+                  ] else ...[
+                    const Text(
+                      "Primary Consilium analysis has not been performed yet. Data is being prepared for clinical synthesis.",
+                      style: TextStyle(color: Colors.white70, fontSize: 12),
+                    ),
+                  ],
                 ],
               ],
             ),
           ),
         ),
         actions: [
-          TextButton(onPressed: () => Navigator.pop(context), child: const Text("CLOSE", style: TextStyle(color: Colors.blueAccent)))
+          if (!isDone && !_isExecutingConsilium && _consiliumIsBusy)
+            ElevatedButton(
+              key: const Key('retry_primary_consilium_btn'),
+              style: ElevatedButton.styleFrom(backgroundColor: Colors.amberAccent),
+              onPressed: () {
+                Navigator.pop(context);
+                _runPrimaryConsiliumExplicitly();
+              },
+              child: const Text("ПОВТОРИТЬ", style: TextStyle(color: Colors.black, fontWeight: FontWeight.bold)),
+            ),
+          if (!isDone && !_isExecutingConsilium && (_latestCascadeStatus?.hasPreparatoryAnamnesis == true))
+            ElevatedButton(
+              key: const Key('run_primary_consilium_btn'),
+              style: ElevatedButton.styleFrom(backgroundColor: Colors.blueAccent),
+              onPressed: () {
+                Navigator.pop(context);
+                _runPrimaryConsiliumExplicitly();
+              },
+              child: const Text("ЗАПУСТИТЬ КОНСИЛИУМ", style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
+            ),
+          TextButton(onPressed: () => Navigator.pop(context), child: const Text("CLOSE", style: TextStyle(color: Colors.blueAccent))),
         ],
       ),
     );
