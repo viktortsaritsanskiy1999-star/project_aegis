@@ -1,7 +1,10 @@
 import asyncio
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import json
-from typing import Any, Dict, List, Optional
+from typing import Any, Awaitable, Callable, Dict, List, Optional
+import uuid
+from sqlalchemy import delete, update
+from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.orm import Session
 
 from app.models.model_report import ModelReport
@@ -37,6 +40,10 @@ RAW_USER_ANAMNESIS_REPORT_TYPE = "raw_user_anamnesis"
 PREPARATORY_ANAMNESIS_REPORT_TYPE = "preparatory_anamnesis_m1"
 PREPARATORY_OCR_REPORT_TYPE = "preparatory_vision_ocr"
 PREPARATORY_ECG_REPORT_TYPE = "preparatory_vision_ecg"
+PRIMARY_CONSILIUM_IN_FLIGHT_LOCK_REPORT_TYPE = "primary_consilium_in_flight_lock"
+PRIMARY_CONSILIUM_EXECUTION_LOG_REPORT_TYPE = "primary_consilium_execution_log"
+PRIMARY_CONSILIUM_LOCK_TTL_SECONDS = 300
+PRIMARY_CONSILIUM_LOCK_HEARTBEAT_SECONDS = 2.0
 
 
 class ConsiliumError(Exception):
@@ -87,25 +94,344 @@ class PrimaryConsiliumService:
     from server storage without re-running Anamnesis or Vision inside the consilium.
     """
 
+    _default_intake_locks: Dict[str, asyncio.Lock] = {}
+
     def __init__(
         self,
         db: Session,
         gateway: Optional[GeminiGateway] = None,
+        now_provider: Optional[Callable[[], datetime]] = None,
         lock_registry: Optional[Dict[str, asyncio.Lock]] = None,
+        lease_ttl_seconds: int = PRIMARY_CONSILIUM_LOCK_TTL_SECONDS,
+        lease_heartbeat_interval_seconds: float = PRIMARY_CONSILIUM_LOCK_HEARTBEAT_SECONDS,
     ):
         self.db = db
         self.gateway = gateway or GeminiGateway()
+        self.now_provider = now_provider or (lambda: datetime.now(timezone.utc))
         self.cycle_repo = MedicalCycleRepository(db)
         self.report_repo = ModelReportRepository(db)
         self.measurement_repo = HealthMeasurementRepository(db)
         self._intake_locks = lock_registry if lock_registry is not None else self._default_intake_locks
+        self.lease_ttl_seconds = max(1, int(lease_ttl_seconds))
+        self.lease_heartbeat_interval_seconds = max(0.001, float(lease_heartbeat_interval_seconds))
 
-    _default_intake_locks: Dict[str, asyncio.Lock] = {}
-
-    def _get_intake_lock(self, cycle_id: str) -> asyncio.Lock:
+    def _get_cycle_lock(self, cycle_id: str) -> asyncio.Lock:
         if cycle_id not in self._intake_locks:
             self._intake_locks[cycle_id] = asyncio.Lock()
         return self._intake_locks[cycle_id]
+
+    def _get_intake_lock(self, cycle_id: str) -> asyncio.Lock:
+        return self._get_cycle_lock(cycle_id)
+
+    def _now_utc(self) -> datetime:
+        dt = self.now_provider()
+        if dt.tzinfo is None:
+            return dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+
+    @staticmethod
+    def _parse_iso_utc(iso_str: Optional[str]) -> Optional[datetime]:
+        if not iso_str or not isinstance(iso_str, str):
+            return None
+        try:
+            dt = datetime.fromisoformat(iso_str)
+            if dt.tzinfo is None:
+                return dt.replace(tzinfo=timezone.utc)
+            return dt.astimezone(timezone.utc)
+        except (ValueError, TypeError):
+            return None
+
+    @staticmethod
+    def _lock_report_id(cycle_id: str) -> str:
+        return f"lock_primary_{cycle_id}"[:64]
+
+    def _fetch_fresh_lock_row(self, cycle_id: str) -> Optional[ModelReport]:
+        """
+        Queries the cross-process lock row directly from SQLite using `.populate_existing()`
+        so the current SQLAlchemy Session never relies on a stale cached identity-map copy.
+        """
+        lock_id = self._lock_report_id(cycle_id)
+        return (
+            self.db.query(ModelReport)
+            .filter(ModelReport.report_id == lock_id)
+            .populate_existing()
+            .first()
+        )
+
+    def _get_active_in_flight_lock(self, cycle_id: str) -> Optional[ModelReport]:
+        """
+        Checks for an active cross-process execution lease row in `model_reports`.
+        If an expired lease row exists from a crashed or hung worker (> TTL without renewal),
+        cleans it up atomically using a WHERE condition matching the exact stale owner and expiration,
+        ensuring that a concurrent worker's active or renewed lease is NEVER deleted.
+        """
+        lock_row = self._fetch_fresh_lock_row(cycle_id)
+        if lock_row is None:
+            return None
+        now_dt = self._now_utc()
+        lock_content = lock_row.content or {}
+        stale_owner_id = lock_content.get("lease_owner_id")
+        stale_expires_iso = lock_content.get("expires_at_utc")
+        expires_dt = self._parse_iso_utc(stale_expires_iso)
+
+        if expires_dt is not None and expires_dt <= now_dt and stale_owner_id and stale_expires_iso:
+            lock_id = self._lock_report_id(cycle_id)
+            stmt = (
+                delete(ModelReport)
+                .where(ModelReport.report_id == lock_id)
+                .where(ModelReport.content["lease_owner_id"].as_string() == stale_owner_id)
+                .where(ModelReport.content["expires_at_utc"].as_string() == stale_expires_iso)
+            )
+            res = self.db.execute(stmt)
+            self.db.commit()
+            if res.rowcount > 0:
+                return None
+            # If rowcount == 0, the lease was already deleted, renewed, or superseded in a race
+            fresh_row = self._fetch_fresh_lock_row(cycle_id)
+            if fresh_row is None:
+                return None
+            fresh_expires = self._parse_iso_utc((fresh_row.content or {}).get("expires_at_utc"))
+            if fresh_expires is not None and fresh_expires > now_dt:
+                return fresh_row
+            return None
+        return lock_row
+
+    def _acquire_cross_process_lease(
+        self, cycle_id: str, idempotency_key: Optional[str] = None
+    ) -> str:
+        """
+        Acquires an atomic database-level execution lease (`report_id = lock_primary_{cycle_id}`)
+        backed by the SQLite PRIMARY KEY constraint on `model_reports.report_id` and tagged
+        with a unique `lease_owner_id` fencing token.
+        """
+        active_lock = self._get_active_in_flight_lock(cycle_id)
+        if active_lock is not None:
+            lock_content = active_lock.content or {}
+            raise ConsiliumConcurrencyConflictError(
+                f"Primary Consilium for cycle '{cycle_id}' is currently in progress "
+                f"(lease active until {lock_content.get('expires_at_utc')})."
+            )
+
+        now_dt = self._now_utc()
+        expires_dt = now_dt + timedelta(seconds=self.lease_ttl_seconds)
+        lock_id = self._lock_report_id(cycle_id)
+        lease_owner_id = f"lease_primary_{uuid.uuid4().hex}"
+
+        try:
+            lock_report = ModelReport(
+                report_id=lock_id,
+                cycle_id=cycle_id,
+                sprint_id=None,
+                session_id=None,
+                model="aegis-concurrency-guard",
+                report_type=PRIMARY_CONSILIUM_IN_FLIGHT_LOCK_REPORT_TYPE,
+                privacy_level=PrivacyLevel.SERVER_ONLY.value,
+                version=1,
+                content={
+                    "lease_owner_id": lease_owner_id,
+                    "idempotency_key": idempotency_key,
+                    "acquired_at_utc": now_dt.isoformat(),
+                    "renewed_at_utc": now_dt.isoformat(),
+                    "expires_at_utc": expires_dt.isoformat(),
+                    "renewal_count": 0,
+                },
+                created_at=now_dt,
+            )
+            self.db.add(lock_report)
+            self.db.commit()
+            return lease_owner_id
+        except (IntegrityError, OperationalError):
+            self.db.rollback()
+            raise ConsiliumConcurrencyConflictError(
+                f"Primary Consilium for cycle '{cycle_id}' is currently in progress."
+            )
+
+    def _renew_cross_process_lease(
+        self, cycle_id: str, lease_owner_id: str, db: Optional[Session] = None
+    ) -> None:
+        """
+        Verifies that `lease_owner_id` still owns the SQLite execution lease and extends
+        `expires_at_utc` by `self.lease_ttl_seconds` using an atomic SQLite UPDATE.
+        If the lease was lost or replaced by another owner, res.rowcount is 0,
+        raising `ConsiliumConcurrencyConflictError` immediately (fencing guard).
+        """
+        target_db = db or self.db
+        lock_id = self._lock_report_id(cycle_id)
+        lock_row = (
+            target_db.query(ModelReport)
+            .filter(ModelReport.report_id == lock_id)
+            .populate_existing()
+            .first()
+        )
+        lock_content = dict(lock_row.content or {}) if lock_row is not None else {}
+        if lock_row is None or lock_content.get("lease_owner_id") != lease_owner_id:
+            raise ConsiliumConcurrencyConflictError(
+                f"Execution lease '{lease_owner_id}' for cycle '{cycle_id}' is no longer "
+                "owned by this worker; aborting stale consilium execution."
+            )
+
+        now_dt = self._now_utc()
+        new_expires_dt = now_dt + timedelta(seconds=self.lease_ttl_seconds)
+        updated_content = dict(lock_content)
+        updated_content["renewed_at_utc"] = now_dt.isoformat()
+        updated_content["expires_at_utc"] = new_expires_dt.isoformat()
+        updated_content["renewal_count"] = int(updated_content.get("renewal_count", 0)) + 1
+
+        stmt = (
+            update(ModelReport)
+            .where(ModelReport.report_id == lock_id)
+            .where(ModelReport.content["lease_owner_id"].as_string() == lease_owner_id)
+            .values(content=updated_content, version=ModelReport.version + 1)
+        )
+        res = target_db.execute(stmt)
+        target_db.commit()
+        if res.rowcount == 0:
+            raise ConsiliumConcurrencyConflictError(
+                f"Execution lease '{lease_owner_id}' for cycle '{cycle_id}' is no longer "
+                "owned by this worker; aborting stale consilium execution."
+            )
+
+    async def _execute_with_lease_renewal(
+        self,
+        cycle_id: str,
+        lease_owner_id: str,
+        coro_factory: Callable[[], Awaitable[Any]],
+    ) -> Any:
+        """
+        Executes an async Gemini gateway call while keeping the SQLite execution lease alive:
+        - Renews & verifies `lease_owner_id` before the call;
+        - Periodically renews `lease_owner_id` via a background heartbeat using an isolated DB session while awaiting I/O;
+        - If heartbeat fails to renew (lease lost or DB error), the error is immediately observed
+          by the main executor, cancelling long-running tasks and aborting publication;
+        - Renews & verifies `lease_owner_id` immediately after the call returns.
+        """
+        self._renew_cross_process_lease(cycle_id, lease_owner_id)
+        stop_event = asyncio.Event()
+        heartbeat_error: List[Exception] = []
+        engine = self.db.get_bind()
+
+        call_task = asyncio.create_task(coro_factory())
+
+        async def _heartbeat() -> None:
+            while not stop_event.is_set():
+                try:
+                    await asyncio.wait_for(
+                        stop_event.wait(),
+                        timeout=self.lease_heartbeat_interval_seconds,
+                    )
+                    break
+                except asyncio.TimeoutError:
+                    if not stop_event.is_set():
+                        try:
+                            with Session(bind=engine, autocommit=False, autoflush=False) as hb_session:
+                                self._renew_cross_process_lease(
+                                    cycle_id, lease_owner_id, db=hb_session
+                                )
+                        except Exception as exc:
+                            heartbeat_error.append(exc)
+                            call_task.cancel()
+                            break
+
+        hb_task = asyncio.create_task(_heartbeat())
+        try:
+            try:
+                result = await call_task
+            except asyncio.CancelledError:
+                if heartbeat_error:
+                    raise heartbeat_error[0]
+                raise
+        finally:
+            stop_event.set()
+            await hb_task
+
+        if heartbeat_error:
+            raise heartbeat_error[0]
+
+        self._renew_cross_process_lease(cycle_id, lease_owner_id)
+        return result
+
+    def _verify_and_delete_cross_process_lease_uncommitted(
+        self, cycle_id: str, lease_owner_id: str
+    ) -> None:
+        """
+        Fencing check before final atomic persistence: verifies and deletes the SQLite lease
+        in the uncommitted transaction using an atomic DELETE matching lease_owner_id.
+        If rowcount is 0, the lease was lost or superseded; raises ConsiliumConcurrencyConflictError,
+        which triggers a rollback and blocks publication of all client-facing reports.
+        Never deletes a lease owned by another worker.
+        """
+        lock_id = self._lock_report_id(cycle_id)
+        stmt = (
+            delete(ModelReport)
+            .where(ModelReport.report_id == lock_id)
+            .where(ModelReport.content["lease_owner_id"].as_string() == lease_owner_id)
+        )
+        res = self.db.execute(stmt)
+        if res.rowcount == 0:
+            raise ConsiliumConcurrencyConflictError(
+                f"Cannot commit Primary Consilium for cycle '{cycle_id}': "
+                f"execution lease '{lease_owner_id}' was lost or superseded by another owner."
+            )
+
+    def _release_cross_process_lease_safe(self, cycle_id: str, lease_owner_id: str) -> None:
+        """
+        Safely releases the cross-process execution lease on error ONLY if the lock row
+        is still owned by `lease_owner_id`. Never deletes a lock acquired by another worker.
+        Uses an isolated session with an atomic DELETE matching lease_owner_id.
+        """
+        try:
+            lock_id = self._lock_report_id(cycle_id)
+            stmt = (
+                delete(ModelReport)
+                .where(ModelReport.report_id == lock_id)
+                .where(ModelReport.content["lease_owner_id"].as_string() == lease_owner_id)
+            )
+            with Session(bind=self.db.get_bind(), autocommit=False, autoflush=False) as safe_session:
+                safe_session.execute(stmt)
+                safe_session.commit()
+        except Exception:
+            pass
+
+    def recover_completed_response(
+        self, cycle_id: str
+    ) -> Optional[PrimaryConsiliumClientResponse]:
+        """
+        Recovers existing client-facing Primary Consilium reports directly from storage.
+        Guarantees zero duplicate Gemini API calls on client retries or reconnections.
+        """
+        overall_reports = self.report_repo.list_client_facing(
+            cycle_id=cycle_id,
+            report_type="user_overall_report",
+        )
+        if not overall_reports:
+            return None
+
+        latest_overall = overall_reports[0]
+        overall_validated = ClientModelReportResponse.model_validate(latest_overall)
+        content = latest_overall.content or {}
+        report_date = str(content.get("report_date") or "")
+        metrics = content.get("metrics") or {}
+
+        system_reports: Dict[str, ClientModelReportResponse] = {}
+        for sys_key in SYSTEM_KEYS:
+            sys_reps = self.report_repo.list_client_facing(
+                cycle_id=cycle_id,
+                report_type=f"system_user_report_{sys_key}",
+            )
+            if sys_reps:
+                system_reports[sys_key] = ClientModelReportResponse.model_validate(sys_reps[0])
+
+        return PrimaryConsiliumClientResponse(
+            cycle_id=cycle_id,
+            report_date=report_date or self._now_utc().strftime("%Y-%m-%d"),
+            overall_report=overall_validated,
+            system_reports=system_reports,
+            vitals_thresholds=ClientVitalsThresholds(
+                min_pessimum_bpm=int(metrics.get("min_pessimum_bpm", 45)),
+                max_pessimum_bpm=int(metrics.get("max_pessimum_bpm", 115)),
+                max_spike_delta_bpm=int(metrics.get("max_spike_delta_bpm", 25)),
+            ),
+        )
 
     def is_primary_consilium_completed(self, cycle_id: str) -> bool:
         """
@@ -543,21 +869,28 @@ class PrimaryConsiliumService:
         self,
         cycle_id: str,
         report_date: Optional[str] = None,
+        idempotency_key: Optional[str] = None,
+        allow_version_bump: bool = False,
     ) -> PrimaryConsiliumClientResponse:
         """
         Executes the server-side Primary Consilium for `cycle_id`:
         1. Reads saved preparatory context (Anamnesis M1, Vision OCR labs, Vision ECG, Vitals).
            Never invokes Anamnesis M1 or Vision internally.
-        2. Sequentially runs the 8 Flash-Lite organ specialists.
-        3. Runs Deputy Chief Physician (Gemini Flash) for intersystem synthesis, audit,
+        2. Acquires in-process `asyncio.Lock` and cross-process SQLite execution lease with owner fencing.
+        3. Sequentially runs the 8 Flash-Lite organ specialists with background heartbeat lease renewal.
+        4. Runs Deputy Chief Physician (Gemini Flash) with lease renewal for intersystem synthesis, audit,
            and 8 draft user_system_reports.
-        4. Runs Chief Physician (Gemini Pro) for final clinical strategy (Athena handoff),
+        5. Runs Chief Physician (Gemini Pro) with lease renewal for final clinical strategy (Athena handoff),
            personal heart rate thresholds, user_overall_report, and quality control of Flash's
            8 user_system_reports.
-        5. Enforces Pro's quality gate: if approved_for_publication is False, aborts before
+        6. Enforces Pro's quality gate: if approved_for_publication is False, aborts before
            any client_facing report is created. Otherwise applies Pro's corrections over Flash's
-           draft user_system_reports and persists versioned server_only + client_facing reports
-           inside a single atomic database transaction.
+           draft user_system_reports.
+        7. Atomically inside a single database transaction:
+           - Verifies and deletes the cross-process execution lease;
+           - Persists versioned server_only reports (8 organ + deputy + chief);
+           - Persists server_only authoritative execution log;
+           - Persists client_facing reports (8 systems + overall).
         """
         cycle = self.cycle_repo.get(cycle_id)
         if not cycle:
@@ -574,218 +907,269 @@ class PrimaryConsiliumService:
                     f"markers (ledger v{ledger_state.ledger_version}) are pending review. "
                     "These markers cannot be evaluated via Primary Consilium; run Full Lab-Revision Consilium instead."
                 )
+            if not allow_version_bump:
+                recovered = self.recover_completed_response(cycle_id)
+                if recovered is not None:
+                    return recovered
 
         resolved_date = (
             report_date.strip()
             if isinstance(report_date, str) and report_date.strip()
-            else datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            else self._now_utc().strftime("%Y-%m-%d")
         )
 
-        # 1. Load already-saved preparatory results from DB (never re-run M1 or Vision here)
-        from app.services.lab_context_service import assemble_consilium_laboratory_context
-        from app.services.ecg_context_service import assemble_consilium_ecg_context
+        cycle_lock = self._get_cycle_lock(cycle_id)
+        async with cycle_lock:
+            # Re-check after acquiring in-process lock (handles intra-process concurrent callers)
+            if self.is_primary_consilium_completed(cycle_id) and not allow_version_bump:
+                recovered = self.recover_completed_response(cycle_id)
+                if recovered is not None:
+                    return recovered
 
-        anamnesis_m1 = self._load_preparatory_anamnesis(cycle_id)
-        lab_context = assemble_consilium_laboratory_context(self.db, cycle_id)
-        shared_labs_table = lab_context.shared_labs_table
-        laboratory_history = lab_context.laboratory_history
-        ecg_context = self._load_preparatory_ecg_context(cycle_id)
-        ecg_summary = ecg_context.ecg_summary
-        vitals_stream = self._load_latest_vitals_stream(
-            cycle_id, ecg_summary, ecg_context=ecg_context
-        )
-        ecg_context_dict = ecg_context.to_dict()
-
-        # 2. Execute 8 Organ Specialists (Gemini Flash-Lite)
-        system_outputs: Dict[str, SystemAgentOutput] = {}
-        for system_key in SYSTEM_KEYS:
-            organ_fact = getattr(anamnesis_m1.system_logic, system_key)
-            input_package = {
-                "system_key": system_key,
-                "facts": organ_fact.data,
-                "first_model_short_summary": organ_fact.internal_comment,
-                "shared_labs_table": shared_labs_table,
-                "laboratory_history": laboratory_history,
-                "vitals_stream": vitals_stream,
-                "ecg_context": ecg_context_dict,
-            }
-            system_prompt = build_system_agent_prompt(system_key, input_package)
-            organ_result: SystemAgentOutput = await self.gateway.generate_structured(
-                prompt=system_prompt,
-                response_schema=SystemAgentOutput,
-                model=GeminiModelRole.FLASH_LITE,
+            lease_owner_id = self._acquire_cross_process_lease(
+                cycle_id=cycle_id,
+                idempotency_key=idempotency_key,
             )
-            system_outputs[system_key] = organ_result
 
-        # 3. Execute Deputy Chief Physician (Gemini Flash)
-        initial_master_context = self._assemble_context_for_flash(
-            anamnesis=anamnesis_m1,
-            shared_labs_table=shared_labs_table,
-            vitals_stream=vitals_stream,
-            system_outputs=system_outputs,
-            laboratory_history=laboratory_history,
-            ecg_context=ecg_context,
-        )
-        flash_prompt = build_flash_master_prompt(initial_master_context)
-        flash_output: FlashMasterOutput = await self.gateway.generate_structured(
-            prompt=flash_prompt,
-            response_schema=FlashMasterOutput,
-            model=GeminiModelRole.FLASH,
-        )
+            try:
+                # 1. Load already-saved preparatory results from DB (never re-run M1 or Vision here)
+                from app.services.lab_context_service import assemble_consilium_laboratory_context
+                from app.services.ecg_context_service import assemble_consilium_ecg_context
 
-        # 4. Execute Chief Physician (Gemini Pro)
-        full_master_context = self._assemble_context_for_pro(
-            initial_master_context=initial_master_context,
-            flash_output=flash_output,
-        )
-        pro_prompt = build_pro_master_prompt(full_master_context)
-        pro_output: ProMasterOutput = await self.gateway.generate_structured(
-            prompt=pro_prompt,
-            response_schema=ProMasterOutput,
-            model=GeminiModelRole.PRO,
-        )
-
-        # 5. Chief Physician Quality Gate (BEFORE any client_facing report is created)
-        if not pro_output.flash_quality_review.approved_for_publication:
-            reason = (
-                pro_output.flash_quality_review.rejection_reason
-                or "Chief Physician (Pro) rejected publication of user-facing reports."
-            )
-            raise ConsiliumQualityRejectionError(reason)
-
-        # Deterministically apply Pro's corrections over Flash's 8 draft user system reports
-        final_user_system_texts: Dict[str, str] = flash_output.user_system_reports.to_dict()
-        for corrected_key, corrected_text in (
-            pro_output.flash_quality_review.corrected_user_system_reports.items()
-        ):
-            if corrected_key not in SYSTEM_KEYS:
-                raise ConsiliumQualityRejectionError(
-                    f"Invalid system key '{corrected_key}' in Pro quality review."
+                anamnesis_m1 = self._load_preparatory_anamnesis(cycle_id)
+                lab_context = assemble_consilium_laboratory_context(self.db, cycle_id)
+                shared_labs_table = lab_context.shared_labs_table
+                laboratory_history = lab_context.laboratory_history
+                ecg_context = self._load_preparatory_ecg_context(cycle_id)
+                ecg_summary = ecg_context.ecg_summary
+                vitals_stream = self._load_latest_vitals_stream(
+                    cycle_id, ecg_summary, ecg_context=ecg_context
                 )
-            if not isinstance(corrected_text, str) or not corrected_text.strip():
-                raise ConsiliumQualityRejectionError(
-                    f"Empty corrected report text for system '{corrected_key}'."
+                ecg_context_dict = ecg_context.to_dict()
+
+                # 2. Execute 8 Organ Specialists (Gemini Flash-Lite)
+                system_outputs: Dict[str, SystemAgentOutput] = {}
+                for system_key in SYSTEM_KEYS:
+                    organ_fact = getattr(anamnesis_m1.system_logic, system_key)
+                    input_package = {
+                        "system_key": system_key,
+                        "facts": organ_fact.data,
+                        "first_model_short_summary": organ_fact.internal_comment,
+                        "shared_labs_table": shared_labs_table,
+                        "laboratory_history": laboratory_history,
+                        "vitals_stream": vitals_stream,
+                        "ecg_context": ecg_context_dict,
+                    }
+                    system_prompt = build_system_agent_prompt(system_key, input_package)
+                    organ_result: SystemAgentOutput = await self._execute_with_lease_renewal(
+                        cycle_id,
+                        lease_owner_id,
+                        lambda p=system_prompt: self.gateway.generate_structured(
+                            prompt=p,
+                            response_schema=SystemAgentOutput,
+                            model=GeminiModelRole.FLASH_LITE,
+                        ),
+                    )
+                    system_outputs[system_key] = organ_result
+
+                # 3. Execute Deputy Chief Physician (Gemini Flash)
+                initial_master_context = self._assemble_context_for_flash(
+                    anamnesis=anamnesis_m1,
+                    shared_labs_table=shared_labs_table,
+                    vitals_stream=vitals_stream,
+                    system_outputs=system_outputs,
+                    laboratory_history=laboratory_history,
+                    ecg_context=ecg_context,
                 )
-            final_user_system_texts[corrected_key] = corrected_text.strip()
+                flash_prompt = build_flash_master_prompt(initial_master_context)
+                flash_output: FlashMasterOutput = await self._execute_with_lease_renewal(
+                    cycle_id,
+                    lease_owner_id,
+                    lambda: self.gateway.generate_structured(
+                        prompt=flash_prompt,
+                        response_schema=FlashMasterOutput,
+                        model=GeminiModelRole.FLASH,
+                    ),
+                )
 
-        # Verify completeness of all 8 user system reports before staging DB writes
-        if set(final_user_system_texts.keys()) != set(SYSTEM_KEYS) or any(
-            not isinstance(final_user_system_texts.get(k), str)
-            or not final_user_system_texts[k].strip()
-            for k in SYSTEM_KEYS
-        ):
-            raise ConsiliumQualityRejectionError(
-                "Incomplete 8-system user reports after quality review; aborting publication."
-            )
+                # 4. Execute Chief Physician (Gemini Pro)
+                full_master_context = self._assemble_context_for_pro(
+                    initial_master_context=initial_master_context,
+                    flash_output=flash_output,
+                )
+                pro_prompt = build_pro_master_prompt(full_master_context)
+                pro_output: ProMasterOutput = await self._execute_with_lease_renewal(
+                    cycle_id,
+                    lease_owner_id,
+                    lambda: self.gateway.generate_structured(
+                        prompt=pro_prompt,
+                        response_schema=ProMasterOutput,
+                        model=GeminiModelRole.PRO,
+                    ),
+                )
 
-        # 6. Atomic single-transaction persistence of all 10 server_only + 9 client_facing reports
-        try:
-            for system_key in SYSTEM_KEYS:
-                organ_out = system_outputs[system_key]
-                agent_role = AegisAgentRole.for_system_key(system_key)
+                # 5. Chief Physician Quality Gate (BEFORE any client_facing report is created)
+                if not pro_output.flash_quality_review.approved_for_publication:
+                    reason = (
+                        pro_output.flash_quality_review.rejection_reason
+                        or "Chief Physician (Pro) rejected publication of user-facing reports."
+                    )
+                    raise ConsiliumQualityRejectionError(reason)
+
+                # Deterministically apply Pro's corrections over Flash's 8 draft user system reports
+                final_user_system_texts: Dict[str, str] = flash_output.user_system_reports.to_dict()
+                for corrected_key, corrected_text in (
+                    pro_output.flash_quality_review.corrected_user_system_reports.items()
+                ):
+                    if corrected_key not in SYSTEM_KEYS:
+                        raise ConsiliumQualityRejectionError(
+                            f"Invalid system key '{corrected_key}' in Pro quality review."
+                        )
+                    if not isinstance(corrected_text, str) or not corrected_text.strip():
+                        raise ConsiliumQualityRejectionError(
+                            f"Empty corrected report text for system '{corrected_key}'."
+                        )
+                    final_user_system_texts[corrected_key] = corrected_text.strip()
+
+                # Verify completeness of all 8 user system reports before staging DB writes
+                if set(final_user_system_texts.keys()) != set(SYSTEM_KEYS) or any(
+                    not isinstance(final_user_system_texts.get(k), str)
+                    or not final_user_system_texts[k].strip()
+                    for k in SYSTEM_KEYS
+                ):
+                    raise ConsiliumQualityRejectionError(
+                        "Incomplete 8-system user reports after quality review; aborting publication."
+                    )
+
+                # 6. Atomic single-transaction persistence of all reports and lease cleanup:
+                # Fencing check & atomic removal of execution lease in uncommitted transaction
+                self._verify_and_delete_cross_process_lease_uncommitted(cycle_id, lease_owner_id)
+
+                for system_key in SYSTEM_KEYS:
+                    organ_out = system_outputs[system_key]
+                    agent_role = AegisAgentRole.for_system_key(system_key)
+                    self.report_repo.create_next_version(
+                        cycle_id=cycle_id,
+                        model=self.gateway.flash_lite_model,
+                        report_type=agent_role.value,
+                        privacy_level=PrivacyLevel.SERVER_ONLY,
+                        content={
+                            "agent_role": agent_role.value,
+                            "system_key": system_key,
+                            "system_view": organ_out.system_view.model_dump(),
+                            "system_logic": organ_out.system_logic.model_dump(),
+                            "training_sandbox": organ_out.training_sandbox.model_dump(),
+                        },
+                        commit=False,
+                    )
+
                 self.report_repo.create_next_version(
                     cycle_id=cycle_id,
-                    model=self.gateway.flash_lite_model,
-                    report_type=agent_role.value,
+                    model=self.gateway.flash_model,
+                    report_type="deputy_chief_physician_internal",
                     privacy_level=PrivacyLevel.SERVER_ONLY,
                     content={
-                        "agent_role": agent_role.value,
-                        "system_key": system_key,
-                        "system_view": organ_out.system_view.model_dump(),
-                        "system_logic": organ_out.system_logic.model_dump(),
-                        "training_sandbox": organ_out.training_sandbox.model_dump(),
+                        "agent_role": AegisAgentRole.DEPUTY_CHIEF_PHYSICIAN.value,
+                        "flash_general_shelf": flash_output.flash_general_shelf,
+                        "flash_training_shelf": flash_output.flash_training_shelf,
+                        "draft_user_system_reports": flash_output.user_system_reports.to_dict(),
                     },
                     commit=False,
                 )
 
-            self.report_repo.create_next_version(
-                cycle_id=cycle_id,
-                model=self.gateway.flash_model,
-                report_type="deputy_chief_physician_internal",
-                privacy_level=PrivacyLevel.SERVER_ONLY,
-                content={
-                    "agent_role": AegisAgentRole.DEPUTY_CHIEF_PHYSICIAN.value,
-                    "flash_general_shelf": flash_output.flash_general_shelf,
-                    "flash_training_shelf": flash_output.flash_training_shelf,
-                    "draft_user_system_reports": flash_output.user_system_reports.to_dict(),
-                },
-                commit=False,
-            )
+                evaluated_ledger_version = (
+                    lab_context.ledger_version if not lab_context.is_synthetic_fallback else 0
+                )
 
-            evaluated_ledger_version = (
-                lab_context.ledger_version if not lab_context.is_synthetic_fallback else 0
-            )
-
-            self.report_repo.create_next_version(
-                cycle_id=cycle_id,
-                model=self.gateway.pro_model,
-                report_type="chief_physician_internal",
-                privacy_level=PrivacyLevel.SERVER_ONLY,
-                content={
-                    "agent_role": AegisAgentRole.CHIEF_PHYSICIAN.value,
-                    "pro_general_shelf": pro_output.pro_general_shelf,
-                    "pro_training_shelf": pro_output.pro_training_shelf,
-                    "vitals_thresholds": pro_output.vitals_thresholds.model_dump(),
-                    "flash_quality_review": pro_output.flash_quality_review.model_dump(),
-                    "evaluated_ledger_version": evaluated_ledger_version,
-                    "is_synthetic_fallback": bool(lab_context.is_synthetic_fallback),
-                },
-                commit=False,
-            )
-
-            client_system_reports: Dict[str, ClientModelReportResponse] = {}
-            for system_key in SYSTEM_KEYS:
-                verified_summary = final_user_system_texts[system_key]
-                system_title = f"{SYSTEM_TITLES[system_key]} Overview"
-                saved_sys_report = self.report_repo.create_next_version(
+                self.report_repo.create_next_version(
                     cycle_id=cycle_id,
-                    model=self.gateway.flash_model,
-                    report_type=f"system_user_report_{system_key}",
+                    model=self.gateway.pro_model,
+                    report_type="chief_physician_internal",
+                    privacy_level=PrivacyLevel.SERVER_ONLY,
+                    content={
+                        "agent_role": AegisAgentRole.CHIEF_PHYSICIAN.value,
+                        "pro_general_shelf": pro_output.pro_general_shelf,
+                        "pro_training_shelf": pro_output.pro_training_shelf,
+                        "vitals_thresholds": pro_output.vitals_thresholds.model_dump(),
+                        "flash_quality_review": pro_output.flash_quality_review.model_dump(),
+                        "evaluated_ledger_version": evaluated_ledger_version,
+                        "is_synthetic_fallback": bool(lab_context.is_synthetic_fallback),
+                    },
+                    commit=False,
+                )
+
+                now_utc = self._now_utc()
+                # Authoritative execution log report
+                self.report_repo.create_next_version(
+                    cycle_id=cycle_id,
+                    model=self.gateway.pro_model,
+                    report_type=PRIMARY_CONSILIUM_EXECUTION_LOG_REPORT_TYPE,
+                    privacy_level=PrivacyLevel.SERVER_ONLY,
+                    content={
+                        "completed_at_utc": now_utc.isoformat(),
+                        "lease_owner_id": lease_owner_id,
+                        "idempotency_key": idempotency_key,
+                        "evaluated_ledger_version": evaluated_ledger_version,
+                        "report_date": resolved_date,
+                    },
+                    created_at=now_utc,
+                    commit=False,
+                )
+
+                client_system_reports: Dict[str, ClientModelReportResponse] = {}
+                for system_key in SYSTEM_KEYS:
+                    verified_summary = final_user_system_texts[system_key]
+                    system_title = f"{SYSTEM_TITLES[system_key]} Overview"
+                    saved_sys_report = self.report_repo.create_next_version(
+                        cycle_id=cycle_id,
+                        model=self.gateway.flash_model,
+                        report_type=f"system_user_report_{system_key}",
+                        privacy_level=PrivacyLevel.CLIENT_FACING,
+                        content={
+                            "title": system_title,
+                            "summary": verified_summary,
+                            "report_date": resolved_date,
+                            "system_key": system_key,
+                            "has_changes": True,
+                            "entries": [
+                                {
+                                    "date": resolved_date,
+                                    "summary": verified_summary,
+                                    "has_changes": True,
+                                }
+                            ],
+                        },
+                        commit=False,
+                    )
+                    client_system_reports[system_key] = ClientModelReportResponse.model_validate(
+                        saved_sys_report
+                    )
+
+                saved_overall_report = self.report_repo.create_next_version(
+                    cycle_id=cycle_id,
+                    model=self.gateway.pro_model,
+                    report_type="user_overall_report",
                     privacy_level=PrivacyLevel.CLIENT_FACING,
                     content={
-                        "title": system_title,
-                        "summary": verified_summary,
+                        "title": pro_output.user_overall_report.title,
+                        "summary": pro_output.user_overall_report.summary,
                         "report_date": resolved_date,
-                        "system_key": system_key,
-                        "has_changes": True,
-                        "entries": [
-                            {
-                                "date": resolved_date,
-                                "summary": verified_summary,
-                                "has_changes": True,
-                            }
-                        ],
+                        "highlights": list(pro_output.user_overall_report.highlights),
+                        "metrics": {
+                            "min_pessimum_bpm": pro_output.vitals_thresholds.min_pessimum_bpm,
+                            "max_pessimum_bpm": pro_output.vitals_thresholds.max_pessimum_bpm,
+                            "max_spike_delta_bpm": pro_output.vitals_thresholds.max_spike_delta_bpm,
+                        },
                     },
                     commit=False,
                 )
-                client_system_reports[system_key] = ClientModelReportResponse.model_validate(
-                    saved_sys_report
-                )
+                validated_overall = ClientModelReportResponse.model_validate(saved_overall_report)
 
-            saved_overall_report = self.report_repo.create_next_version(
-                cycle_id=cycle_id,
-                model=self.gateway.pro_model,
-                report_type="user_overall_report",
-                privacy_level=PrivacyLevel.CLIENT_FACING,
-                content={
-                    "title": pro_output.user_overall_report.title,
-                    "summary": pro_output.user_overall_report.summary,
-                    "report_date": resolved_date,
-                    "highlights": list(pro_output.user_overall_report.highlights),
-                    "metrics": {
-                        "min_pessimum_bpm": pro_output.vitals_thresholds.min_pessimum_bpm,
-                        "max_pessimum_bpm": pro_output.vitals_thresholds.max_pessimum_bpm,
-                        "max_spike_delta_bpm": pro_output.vitals_thresholds.max_spike_delta_bpm,
-                    },
-                },
-                commit=False,
-            )
-            validated_overall = ClientModelReportResponse.model_validate(saved_overall_report)
-
-            self.db.commit()
-        except Exception:
-            self.db.rollback()
-            raise
+                self.db.commit()
+            except Exception:
+                self.db.rollback()
+                self._release_cross_process_lease_safe(cycle_id, lease_owner_id)
+                raise
 
         return PrimaryConsiliumClientResponse(
             cycle_id=cycle_id,

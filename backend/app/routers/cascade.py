@@ -129,6 +129,7 @@ async def run_primary_consilium_endpoint(
         return await service.run_primary_consilium(
             cycle_id=payload.cycle_id,
             report_date=payload.report_date,
+            allow_version_bump=True,
         )
     except ConsiliumCycleNotFoundError as exc:
         raise HTTPException(

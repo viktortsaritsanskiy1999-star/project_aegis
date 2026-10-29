@@ -613,12 +613,11 @@ def test_concurrency_result_recovery_without_duplicate_ai(isolated_client_env):
     assert len(ai_calls) == initial_ai_call_count
 
 
-def test_fresh_run_primary_blocked_pending_distributed_lease(isolated_client_env):
+def test_fresh_run_primary_without_anamnesis_returns_409(isolated_client_env):
     """
     Verifies that calling `POST /api/v1/client/cascade/run-primary` when Primary Consilium
-    is NOT yet completed returns 503 Service Unavailable with a structured blocker detail,
-    enforcing Project Aegis Invariant: un-fenced multi-agent AI execution without atomic
-    lease, renewal heartbeat, and write fencing is prohibited.
+    is not completed and preparatory Anamnesis M1 is missing from server storage returns
+    409 Conflict (ConsiliumContextMissingError).
     """
     client, session, _ = isolated_client_env
     _, jwt_token = _get_device_jwt_with_scopes(
@@ -635,11 +634,8 @@ def test_fresh_run_primary_blocked_pending_distributed_lease(isolated_client_env
     cycle_repo.create(cycle_id="cycle-fresh-01", patient_id="pat-fresh-block-01", status="active")
 
     resp = client.post("/api/v1/client/cascade/run-primary", headers=headers)
-    assert resp.status_code == 503
-    detail = resp.json()["detail"]
-    assert detail["status"] == "BLOCKED_PENDING_DISTRIBUTED_LEASE"
-    assert detail["blocker_code"] == "PRIMARY_CONSILIUM_LEASE_GUARD_REQUIRED"
-    assert "atomic_lease_acquisition_with_lease_owner_id" in detail["missing_guarantees"]
+    assert resp.status_code == 409
+    assert "preparatory_anamnesis_m1" in resp.json()["detail"]
 
 
 # ==============================================================================

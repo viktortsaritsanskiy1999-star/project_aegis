@@ -44,6 +44,8 @@ from app.services.primary_consilium_service import (
     PrimaryConsiliumService,
     ConsiliumError,
     ConsiliumCycleNotFoundError,
+    ConsiliumContextMissingError,
+    ConsiliumQualityRejectionError,
     ConsiliumAnamnesisLockedError,
     ConsiliumConcurrencyConflictError,
     PREPARATORY_ANAMNESIS_REPORT_TYPE,
@@ -537,7 +539,7 @@ def get_client_latest_ecg(
     description=(
         "If Primary Consilium was already concluded, safely recovers completed "
         "client-facing reports without repeating Gemini calls (`X-Aegis-Idempotent-Replay: true`). "
-        "Fresh un-fenced execution is disabled with 503 pending Stage 5.4E distributed lease protocol."
+        "Fresh executions are protected by cross-process SQLite lease, heartbeat renewal, and fencing."
     ),
 )
 async def run_client_primary_consilium(
@@ -549,34 +551,58 @@ async def run_client_primary_consilium(
     now_provider: Callable[[], datetime] = Depends(get_server_now_provider),
     idempotency_key: Optional[str] = Header(None, alias="Idempotency-Key"),
 ) -> PrimaryConsiliumClientResponse:
-    service = PrimaryConsiliumService(db=db, gateway=gateway)
+    service = PrimaryConsiliumService(
+        db=db,
+        gateway=gateway,
+        now_provider=now_provider,
+    )
 
     # 1. Result Recovery Guard: If Primary Consilium is completed, recover existing reports immediately
     if service.is_primary_consilium_completed(cycle.cycle_id):
-        recovered = _recover_primary_consilium_client_response(db, cycle.cycle_id)
+        recovered = service.recover_completed_response(cycle.cycle_id)
         if recovered is not None:
             response.headers["X-Aegis-Idempotent-Replay"] = "true"
             return recovered
 
-    # 2. Concurrency & Idempotency Blocker Guard (Per Project Aegis Invariant):
-    # Un-fenced concurrent execution of expensive multi-agent cascades without
-    # atomic lease acquisition, heartbeat renewal, and write fencing is prohibited.
-    raise HTTPException(
-        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-        detail={
-            "error": "Primary Consilium fresh execution via client API is temporarily inactive pending Stage 5.4E distributed lease & fencing protocol.",
-            "status": "BLOCKED_PENDING_DISTRIBUTED_LEASE",
-            "cycle_id": cycle.cycle_id,
-            "blocker_code": "PRIMARY_CONSILIUM_LEASE_GUARD_REQUIRED",
-            "missing_guarantees": [
-                "atomic_lease_acquisition_with_lease_owner_id",
-                "background_heartbeat_lease_renewal",
-                "fencing_write_protection_against_stale_owners",
-                "persistent_idempotency_table_for_client_retry",
-            ],
-            "action_required": "Scheduled for implementation in Stage 5.4E with distributed lease protocol.",
-        },
-    )
+    # 2. Protected Execution under distributed SQLite lease and fencing
+    try:
+        return await service.run_primary_consilium(
+            cycle_id=cycle.cycle_id,
+            idempotency_key=idempotency_key,
+        )
+    except ConsiliumCycleNotFoundError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=str(exc),
+        ) from exc
+    except ConsiliumContextMissingError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=str(exc),
+        ) from exc
+    except (
+        ConsiliumConcurrencyConflictError,
+        ReportVersionConflictError,
+    ) as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=str(exc),
+        ) from exc
+    except ConsiliumQualityRejectionError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=str(exc),
+        ) from exc
+    except GeminiGatewayError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Gemini cascade execution failed: {exc}",
+        ) from exc
+    except ConsiliumError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=str(exc),
+        ) from exc
 
 
 @router.post(
