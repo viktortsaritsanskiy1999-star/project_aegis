@@ -171,9 +171,10 @@ async def run_weekly_consilium_endpoint(
     payload: WeeklyConsiliumRunRequest,
     db: Session = Depends(get_db),
     gateway: GeminiGateway = Depends(get_gemini_gateway),
+    now_provider: Callable[[], datetime] = Depends(get_server_now_provider),
     _token: ServiceAdminSession = Depends(require_service_admin_session),
 ) -> WeeklyConsiliumClientResponse:
-    service = WeeklyConsiliumService(db=db, gateway=gateway)
+    service = WeeklyConsiliumService(db=db, gateway=gateway, now_provider=now_provider)
     try:
         return await service.run_weekly_consilium(
             cycle_id=payload.cycle_id,

@@ -44,6 +44,7 @@ PRIMARY_CONSILIUM_IN_FLIGHT_LOCK_REPORT_TYPE = "primary_consilium_in_flight_lock
 PRIMARY_CONSILIUM_EXECUTION_LOG_REPORT_TYPE = "primary_consilium_execution_log"
 PRIMARY_CONSILIUM_LOCK_TTL_SECONDS = 300
 PRIMARY_CONSILIUM_LOCK_HEARTBEAT_SECONDS = 2.0
+CYCLE_CONSILIUM_COORDINATION_LOCK_REPORT_TYPE = "cycle_consilium_coordination_lock"
 
 
 class ConsiliumError(Exception):
@@ -142,6 +143,10 @@ class PrimaryConsiliumService:
             return None
 
     @staticmethod
+    def _coordination_lock_id(cycle_id: str) -> str:
+        return f"lock_consilium_coord_{cycle_id}"[:64]
+
+    @staticmethod
     def _lock_report_id(cycle_id: str) -> str:
         return f"lock_primary_{cycle_id}"[:64]
 
@@ -161,63 +166,134 @@ class PrimaryConsiliumService:
     def _get_active_in_flight_lock(self, cycle_id: str) -> Optional[ModelReport]:
         """
         Checks for an active cross-process execution lease row in `model_reports`.
+        Checks both the cycle coordination lock and primary-specific lock.
         If an expired lease row exists from a crashed or hung worker (> TTL without renewal),
         cleans it up atomically using a WHERE condition matching the exact stale owner and expiration,
         ensuring that a concurrent worker's active or renewed lease is NEVER deleted.
         """
-        lock_row = self._fetch_fresh_lock_row(cycle_id)
-        if lock_row is None:
-            return None
+        coord_id = self._coordination_lock_id(cycle_id)
+        lock_id = self._lock_report_id(cycle_id)
         now_dt = self._now_utc()
-        lock_content = lock_row.content or {}
-        stale_owner_id = lock_content.get("lease_owner_id")
-        stale_expires_iso = lock_content.get("expires_at_utc")
-        expires_dt = self._parse_iso_utc(stale_expires_iso)
 
-        if expires_dt is not None and expires_dt <= now_dt and stale_owner_id and stale_expires_iso:
-            lock_id = self._lock_report_id(cycle_id)
-            stmt = (
-                delete(ModelReport)
-                .where(ModelReport.report_id == lock_id)
-                .where(ModelReport.content["lease_owner_id"].as_string() == stale_owner_id)
-                .where(ModelReport.content["expires_at_utc"].as_string() == stale_expires_iso)
-            )
-            res = self.db.execute(stmt)
-            self.db.commit()
-            if res.rowcount > 0:
-                return None
-            # If rowcount == 0, the lease was already deleted, renewed, or superseded in a race
-            fresh_row = self._fetch_fresh_lock_row(cycle_id)
-            if fresh_row is None:
-                return None
-            fresh_expires = self._parse_iso_utc((fresh_row.content or {}).get("expires_at_utc"))
-            if fresh_expires is not None and fresh_expires > now_dt:
-                return fresh_row
-            return None
-        return lock_row
+        coord_row = (
+            self.db.query(ModelReport)
+            .filter(ModelReport.report_id == coord_id)
+            .populate_existing()
+            .first()
+        )
+        lock_row = (
+            self.db.query(ModelReport)
+            .filter(ModelReport.report_id == lock_id)
+            .populate_existing()
+            .first()
+        )
+
+        # Cleanup expired coordination lock if stale
+        if coord_row is not None:
+            coord_content = coord_row.content or {}
+            stale_owner_id = coord_content.get("lease_owner_id")
+            stale_expires_iso = coord_content.get("expires_at_utc")
+            expires_dt = self._parse_iso_utc(stale_expires_iso)
+            if expires_dt is not None and expires_dt <= now_dt and stale_owner_id and stale_expires_iso:
+                stmt = (
+                    delete(ModelReport)
+                    .where(ModelReport.report_id.in_([coord_id, lock_id]))
+                    .where(ModelReport.content["lease_owner_id"].as_string() == stale_owner_id)
+                    .where(ModelReport.content["expires_at_utc"].as_string() == stale_expires_iso)
+                )
+                self.db.execute(stmt)
+                self.db.commit()
+                coord_row = None
+
+        # Cleanup expired specific lock if stale
+        if lock_row is not None:
+            lock_content = lock_row.content or {}
+            stale_owner_id = lock_content.get("lease_owner_id")
+            stale_expires_iso = lock_content.get("expires_at_utc")
+            expires_dt = self._parse_iso_utc(stale_expires_iso)
+            if expires_dt is not None and expires_dt <= now_dt and stale_owner_id and stale_expires_iso:
+                stmt = (
+                    delete(ModelReport)
+                    .where(ModelReport.report_id == lock_id)
+                    .where(ModelReport.content["lease_owner_id"].as_string() == stale_owner_id)
+                    .where(ModelReport.content["expires_at_utc"].as_string() == stale_expires_iso)
+                )
+                self.db.execute(stmt)
+                self.db.commit()
+                lock_row = None
+
+        # Re-verify active rows
+        fresh_coord = (
+            self.db.query(ModelReport)
+            .filter(ModelReport.report_id == coord_id)
+            .populate_existing()
+            .first()
+        )
+        if fresh_coord is not None:
+            exp = self._parse_iso_utc((fresh_coord.content or {}).get("expires_at_utc"))
+            if exp is not None and exp > now_dt:
+                return fresh_coord
+
+        fresh_lock = (
+            self.db.query(ModelReport)
+            .filter(ModelReport.report_id == lock_id)
+            .populate_existing()
+            .first()
+        )
+        if fresh_lock is not None:
+            exp = self._parse_iso_utc((fresh_lock.content or {}).get("expires_at_utc"))
+            if exp is not None and exp > now_dt:
+                return fresh_lock
+
+        return None
 
     def _acquire_cross_process_lease(
         self, cycle_id: str, idempotency_key: Optional[str] = None
     ) -> str:
         """
-        Acquires an atomic database-level execution lease (`report_id = lock_primary_{cycle_id}`)
-        backed by the SQLite PRIMARY KEY constraint on `model_reports.report_id` and tagged
-        with a unique `lease_owner_id` fencing token.
+        Acquires an atomic database-level execution lease backed by the SQLite PRIMARY KEY
+        constraint on `model_reports.report_id` for both the master cycle coordination lock
+        (`report_id = lock_consilium_coord_{cycle_id}`) and primary-specific lock
+        (`report_id = lock_primary_{cycle_id}`).
+        Guarantees zero cross-consilium race conditions with Weekly Consilium.
         """
         active_lock = self._get_active_in_flight_lock(cycle_id)
         if active_lock is not None:
             lock_content = active_lock.content or {}
+            consilium_type = lock_content.get("consilium_type", "primary")
+            prefix = "Primary Consilium" if consilium_type == "primary" else "Weekly Consilium"
             raise ConsiliumConcurrencyConflictError(
-                f"Primary Consilium for cycle '{cycle_id}' is currently in progress "
+                f"{prefix} for cycle '{cycle_id}' is currently in progress "
                 f"(lease active until {lock_content.get('expires_at_utc')})."
             )
 
         now_dt = self._now_utc()
         expires_dt = now_dt + timedelta(seconds=self.lease_ttl_seconds)
+        coord_id = self._coordination_lock_id(cycle_id)
         lock_id = self._lock_report_id(cycle_id)
         lease_owner_id = f"lease_primary_{uuid.uuid4().hex}"
 
         try:
+            coord_report = ModelReport(
+                report_id=coord_id,
+                cycle_id=cycle_id,
+                sprint_id=None,
+                session_id=None,
+                model="aegis-concurrency-guard",
+                report_type=CYCLE_CONSILIUM_COORDINATION_LOCK_REPORT_TYPE,
+                privacy_level=PrivacyLevel.SERVER_ONLY.value,
+                version=1,
+                content={
+                    "lease_owner_id": lease_owner_id,
+                    "consilium_type": "primary",
+                    "idempotency_key": idempotency_key,
+                    "acquired_at_utc": now_dt.isoformat(),
+                    "renewed_at_utc": now_dt.isoformat(),
+                    "expires_at_utc": expires_dt.isoformat(),
+                    "renewal_count": 0,
+                },
+                created_at=now_dt,
+            )
             lock_report = ModelReport(
                 report_id=lock_id,
                 cycle_id=cycle_id,
@@ -229,6 +305,7 @@ class PrimaryConsiliumService:
                 version=1,
                 content={
                     "lease_owner_id": lease_owner_id,
+                    "consilium_type": "primary",
                     "idempotency_key": idempotency_key,
                     "acquired_at_utc": now_dt.isoformat(),
                     "renewed_at_utc": now_dt.isoformat(),
@@ -237,6 +314,7 @@ class PrimaryConsiliumService:
                 },
                 created_at=now_dt,
             )
+            self.db.add(coord_report)
             self.db.add(lock_report)
             self.db.commit()
             return lease_owner_id
@@ -256,6 +334,7 @@ class PrimaryConsiliumService:
         raising `ConsiliumConcurrencyConflictError` immediately (fencing guard).
         """
         target_db = db or self.db
+        coord_id = self._coordination_lock_id(cycle_id)
         lock_id = self._lock_report_id(cycle_id)
         lock_row = (
             target_db.query(ModelReport)
@@ -279,17 +358,18 @@ class PrimaryConsiliumService:
 
         stmt = (
             update(ModelReport)
-            .where(ModelReport.report_id == lock_id)
+            .where(ModelReport.report_id.in_([coord_id, lock_id]))
             .where(ModelReport.content["lease_owner_id"].as_string() == lease_owner_id)
             .values(content=updated_content, version=ModelReport.version + 1)
         )
         res = target_db.execute(stmt)
-        target_db.commit()
-        if res.rowcount == 0:
+        if res.rowcount != 2:
+            target_db.rollback()
             raise ConsiliumConcurrencyConflictError(
-                f"Execution lease '{lease_owner_id}' for cycle '{cycle_id}' is no longer "
-                "owned by this worker; aborting stale consilium execution."
+                f"Execution lease '{lease_owner_id}' for cycle '{cycle_id}' was partially or completely lost "
+                f"(expected 2 lock rows renewed, got {res.rowcount}); aborting stale consilium execution."
             )
+        target_db.commit()
 
     async def _execute_with_lease_renewal(
         self,
@@ -360,14 +440,15 @@ class PrimaryConsiliumService:
         which triggers a rollback and blocks publication of all client-facing reports.
         Never deletes a lease owned by another worker.
         """
+        coord_id = self._coordination_lock_id(cycle_id)
         lock_id = self._lock_report_id(cycle_id)
         stmt = (
             delete(ModelReport)
-            .where(ModelReport.report_id == lock_id)
+            .where(ModelReport.report_id.in_([coord_id, lock_id]))
             .where(ModelReport.content["lease_owner_id"].as_string() == lease_owner_id)
         )
         res = self.db.execute(stmt)
-        if res.rowcount == 0:
+        if res.rowcount < 2:
             raise ConsiliumConcurrencyConflictError(
                 f"Cannot commit Primary Consilium for cycle '{cycle_id}': "
                 f"execution lease '{lease_owner_id}' was lost or superseded by another owner."
@@ -380,10 +461,11 @@ class PrimaryConsiliumService:
         Uses an isolated session with an atomic DELETE matching lease_owner_id.
         """
         try:
+            coord_id = self._coordination_lock_id(cycle_id)
             lock_id = self._lock_report_id(cycle_id)
             stmt = (
                 delete(ModelReport)
-                .where(ModelReport.report_id == lock_id)
+                .where(ModelReport.report_id.in_([coord_id, lock_id]))
                 .where(ModelReport.content["lease_owner_id"].as_string() == lease_owner_id)
             )
             with Session(bind=self.db.get_bind(), autocommit=False, autoflush=False) as safe_session:

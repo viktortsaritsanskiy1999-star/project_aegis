@@ -26,6 +26,7 @@ from app.schemas.consilium import (
     LabLedgerStateResponse,
     LabVisionIntakeClientResponse,
     PrimaryConsiliumClientResponse,
+    WeeklyConsiliumClientResponse,
     SYSTEM_KEYS,
 )
 from app.schemas.reports import ClientModelReportResponse
@@ -54,6 +55,10 @@ from app.services.primary_consilium_service import (
 from app.services.lab_revision_consilium_service import (
     LabRevisionConsiliumService,
     LABORATORY_LEDGER_REPORT_TYPE,
+)
+from app.services.weekly_consilium_service import (
+    WeeklyConsiliumService,
+    WEEKLY_CONSILIUM_EXECUTION_LOG_REPORT_TYPE,
 )
 from app.services.lab_vision_ocr_service import (
     LabVisionOcrService,
@@ -128,6 +133,17 @@ class ClientCascadeStatusResponse(BaseModel):
     has_preparatory_ecg: bool = False
     is_primary_consilium_completed: bool = False
     has_unreviewed_lab_changes: bool = False
+
+
+class ClientWeeklyConsiliumRunRequest(BaseModel):
+    """
+    Client request payload for triggering or recovering Weekly Consilium.
+    `cycle_id` is optional and ignored: server authoritative session takes precedence.
+    """
+    model_config = ConfigDict(extra="forbid")
+    sprint_id: Optional[str] = Field(default=None, description="Optional sprint_id")
+    report_date: Optional[str] = Field(default=None, description="Optional report_date (YYYY-MM-DD)")
+    cycle_id: Optional[str] = Field(default=None, description="Optional; server authoritative session takes precedence")
 
 
 # ==============================================================================
@@ -607,19 +623,115 @@ async def run_client_primary_consilium(
 
 @router.post(
     "/cascade/run-weekly",
-    summary="Run Weekly Consilium for authenticated patient (Disabled pending Stage 5.4F)",
+    response_model=WeeklyConsiliumClientResponse,
+    summary="Run or recover Weekly Consilium for authenticated patient (Patient-Isolated)",
+    description=(
+        "Executes or recovers the Weekly Consilium for the authenticated patient's active cycle. "
+        "Strictly requires DeviceSession with cascade:run scope. "
+        "Protected by distributed SQLite lease, background heartbeat renewal, and fencing. "
+        "Idempotent: retries of a completed operation return results directly without re-running Gemini."
+    ),
 )
 async def run_client_weekly_consilium(
+    response: Response,
+    payload: Optional[ClientWeeklyConsiliumRunRequest] = None,
     cycle: MedicalCycle = Depends(resolve_active_cycle_for_patient),
+    db: Session = Depends(get_db),
     _scope: DeviceSession = Depends(require_scopes(SCOPE_CASCADE_RUN)),
-):
-    raise HTTPException(
-        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-        detail={
-            "error": "Weekly Consilium execution via client API is disabled pending Stage 5.4F distributed lease & sprint protocol.",
-            "status": "BLOCKED_PENDING_DISTRIBUTED_LEASE",
-            "cycle_id": cycle.cycle_id,
-            "blocker_code": "WEEKLY_CONSILIUM_LEASE_GUARD_REQUIRED",
-            "action_required": "Scheduled for implementation in Stage 5.4F.",
-        },
+    gateway: GeminiGateway = Depends(get_gemini_gateway),
+    now_provider: Callable[[], datetime] = Depends(get_server_now_provider),
+    idempotency_key: Optional[str] = Header(None, alias="Idempotency-Key"),
+) -> WeeklyConsiliumClientResponse:
+    primary_service = PrimaryConsiliumService(
+        db=db,
+        gateway=gateway,
+        now_provider=now_provider,
     )
+    if not primary_service.is_primary_consilium_completed(cycle.cycle_id):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                f"Cannot run Weekly Consilium for cycle '{cycle.cycle_id}': "
+                "Primary Consilium must be completed before running Weekly Consilium."
+            ),
+        )
+
+    service = WeeklyConsiliumService(
+        db=db,
+        gateway=gateway,
+        now_provider=now_provider,
+    )
+    sprint_id = payload.sprint_id if payload else None
+    report_date = payload.report_date if payload else None
+
+    # Idempotent replay check before running
+    if idempotency_key and idempotency_key.strip():
+        existing_logs = service.report_repo.list_server_only(
+            cycle_id=cycle.cycle_id,
+            report_type=WEEKLY_CONSILIUM_EXECUTION_LOG_REPORT_TYPE,
+        )
+        for log in existing_logs:
+            if (log.content or {}).get("idempotency_key") == idempotency_key.strip():
+                recovered = service.recover_completed_response(
+                    cycle.cycle_id, sprint_id=log.sprint_id
+                )
+                if recovered is not None:
+                    response.headers["X-Aegis-Idempotent-Replay"] = "true"
+                    return recovered
+
+    if sprint_id and sprint_id.strip():
+        existing_sprint = service.sprint_repo.get(sprint_id.strip())
+        if existing_sprint is not None:
+            if existing_sprint.cycle_id != cycle.cycle_id:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail=f"Sprint '{sprint_id.strip()}' belongs to a different clinical cycle.",
+                )
+            if existing_sprint.status == "completed":
+                recovered = service.recover_completed_response(
+                    cycle.cycle_id, sprint_id=sprint_id.strip()
+                )
+                if recovered is not None:
+                    response.headers["X-Aegis-Idempotent-Replay"] = "true"
+                    return recovered
+
+    try:
+        return await service.run_weekly_consilium(
+            cycle_id=cycle.cycle_id,
+            sprint_id=sprint_id,
+            report_date=report_date,
+            idempotency_key=idempotency_key,
+        )
+    except ConsiliumCycleNotFoundError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=str(exc),
+        ) from exc
+    except ConsiliumContextMissingError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=str(exc),
+        ) from exc
+    except (
+        ConsiliumConcurrencyConflictError,
+        ReportVersionConflictError,
+    ) as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=str(exc),
+        ) from exc
+    except ConsiliumQualityRejectionError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=str(exc),
+        ) from exc
+    except GeminiGatewayError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Gemini Weekly cascade execution failed: {exc}",
+        ) from exc
+    except ConsiliumError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=str(exc),
+        ) from exc
