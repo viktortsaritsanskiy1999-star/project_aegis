@@ -181,6 +181,25 @@ class VaultService extends ChangeNotifier {
   bool _isConsiliumCompleted = false;
   String? _consiliumCycleId;
   final Map<String, Map<String, dynamic>> _consiliumHistory = {};
+
+  // Client-facing Weekly Consilium reports
+  String? _activeWeeklySprintId;
+  int? _activeWeeklySprintNumber;
+  String? _activeWeeklyReportDate;
+  ClientModelReportResponse? _activeWeeklyOverallReport;
+  final Map<String, ClientModelReportResponse> _activeWeeklySystemReports = {};
+  final Map<String, Map<String, dynamic>> _weeklyConsiliumHistory = {};
+
+  String? get activeWeeklySprintId => _activeWeeklySprintId;
+  int? get activeWeeklySprintNumber => _activeWeeklySprintNumber;
+  String? get activeWeeklyReportDate => _activeWeeklyReportDate;
+  ClientModelReportResponse? get activeWeeklyOverallReport => _activeWeeklyOverallReport;
+  Map<String, ClientModelReportResponse> get activeWeeklySystemReports =>
+      Map.unmodifiable(_activeWeeklySystemReports);
+  Map<String, Map<String, dynamic>> get weeklyConsiliumHistory =>
+      Map.unmodifiable(_weeklyConsiliumHistory);
+  bool get isWeeklyConsiliumCompleted =>
+      _activeWeeklyOverallReport != null && _activeWeeklySystemReports.length == 8;
   LegacyVaultStatus get legacyVaultStatus => _legacyVaultStatus;
   bool get hasQuarantinedLegacyData => _legacyVaultStatus == LegacyVaultStatus.quarantined;
   bool get isInitialized => _isInitialized;
@@ -463,6 +482,12 @@ class VaultService extends ChangeNotifier {
     _isConsiliumCompleted = false;
     _consiliumCycleId = null;
     _consiliumHistory.clear();
+    _activeWeeklySprintId = null;
+    _activeWeeklySprintNumber = null;
+    _activeWeeklyReportDate = null;
+    _activeWeeklyOverallReport = null;
+    _activeWeeklySystemReports.clear();
+    _weeklyConsiliumHistory.clear();
   }
 
   Future<void> _initVault() async {
@@ -700,6 +725,56 @@ class VaultService extends ChangeNotifier {
       _clientSystemReports.clear();
       _consiliumHistory.clear();
     }
+
+    if (loadedData.containsKey('weekly_consilium') && loadedData['weekly_consilium'] is Map) {
+      final weeklyMap = loadedData['weekly_consilium'] as Map;
+      _activeWeeklySprintId = weeklyMap['active_sprint_id'] as String?;
+      _activeWeeklySprintNumber = weeklyMap['active_sprint_number'] as int?;
+      _activeWeeklyReportDate = weeklyMap['active_report_date'] as String?;
+
+      if (weeklyMap['overall_report'] is Map) {
+        try {
+          _activeWeeklyOverallReport = ClientModelReportResponse.fromJson(
+            Map<String, dynamic>.from(weeklyMap['overall_report'] as Map),
+          );
+        } catch (_) {
+          _activeWeeklyOverallReport = null;
+        }
+      } else {
+        _activeWeeklyOverallReport = null;
+      }
+
+      _activeWeeklySystemReports.clear();
+      if (weeklyMap['system_reports'] is Map) {
+        (weeklyMap['system_reports'] as Map).forEach((k, v) {
+          if (v is Map) {
+            try {
+              _activeWeeklySystemReports[k.toString()] =
+                  ClientModelReportResponse.fromJson(
+                Map<String, dynamic>.from(v),
+              );
+            } catch (_) {}
+          }
+        });
+      }
+
+      _weeklyConsiliumHistory.clear();
+      if (weeklyMap['history'] is Map) {
+        (weeklyMap['history'] as Map).forEach((k, v) {
+          if (v is Map) {
+            _weeklyConsiliumHistory[k.toString()] =
+                Map<String, dynamic>.from(v);
+          }
+        });
+      }
+    } else {
+      _activeWeeklySprintId = null;
+      _activeWeeklySprintNumber = null;
+      _activeWeeklyReportDate = null;
+      _activeWeeklyOverallReport = null;
+      _activeWeeklySystemReports.clear();
+      _weeklyConsiliumHistory.clear();
+    }
   }
 
   Map<String, dynamic> _createSnapshot() {
@@ -721,6 +796,14 @@ class VaultService extends ChangeNotifier {
         'overall_report': _clientOverallReport?.toJson(),
         'system_reports': _clientSystemReports.map((k, v) => MapEntry(k, v.toJson())),
         'history': _consiliumHistory,
+      },
+      'weekly_consilium': {
+        'active_sprint_id': _activeWeeklySprintId,
+        'active_sprint_number': _activeWeeklySprintNumber,
+        'active_report_date': _activeWeeklyReportDate,
+        'overall_report': _activeWeeklyOverallReport?.toJson(),
+        'system_reports': _activeWeeklySystemReports.map((k, v) => MapEntry(k, v.toJson())),
+        'history': _weeklyConsiliumHistory,
       },
     };
     // Deep clone to isolate snapshot from subsequent in-memory mutations (e.g. profile wipe)
@@ -1840,6 +1923,168 @@ class VaultService extends ChangeNotifier {
   /// Retrieves historical consilium snapshot for a past medical cycle if available.
   Map<String, dynamic>? getHistoricalConsilium(String cycleId) =>
       _consiliumHistory[cycleId];
+
+  /// Retrieves client-facing Weekly Consilium report for a specific organ system.
+  /// If [sprintId] is omitted or matches the active sprint, returns from active weekly reports.
+  /// If a specific [sprintId] is requested, looks up historical reports for that sprint.
+  /// Never falls back to a different sprint's data.
+  ClientModelReportResponse? getWeeklyReportForSystem(String systemKey, {String? sprintId}) {
+    if (sprintId == null || sprintId == _activeWeeklySprintId) {
+      return _activeWeeklySystemReports[systemKey];
+    }
+    final hist = _weeklyConsiliumHistory[sprintId];
+    if (hist != null && hist['system_reports'] is Map) {
+      final sysMap = hist['system_reports'] as Map;
+      final raw = sysMap[systemKey];
+      if (raw is Map) {
+        try {
+          return ClientModelReportResponse.fromJson(Map<String, dynamic>.from(raw));
+        } catch (_) {}
+      }
+    }
+    return null;
+  }
+
+  /// Retrieves historical weekly consilium snapshot for a past sprint if available.
+  Map<String, dynamic>? getHistoricalWeeklyConsilium(String sprintId) =>
+      _weeklyConsiliumHistory[sprintId];
+
+  /// Atomically records published client-facing Weekly Consilium reports in local vault.
+  /// Enforces epoch check and patient attribution fencing.
+  /// Strictly requires weekly overall report and all 8 system reports.
+  /// If weekly reports are incomplete, rejects persistence and NEVER substitutes data from prior weeks.
+  /// Isolates weekly sprints from Primary Consilium and from other weekly sprints.
+  /// Returns true only after local secure persistence is fully confirmed.
+  Future<bool> recordWeeklyClientReports({
+    required String cycleId,
+    required String sprintId,
+    required int sprintNumber,
+    required String reportDate,
+    required ClientModelReportResponse overallReport,
+    required Map<String, ClientModelReportResponse> systemReports,
+    String? expectedPatientId,
+  }) async {
+    if (_isDisposed) return false;
+
+    // 1. Patient fencing: verify attribution if provided or active
+    final activeId = _activePatientId;
+    if (expectedPatientId != null && expectedPatientId != activeId) {
+      debugPrint('[VaultService] Patient attribution mismatch when recording weekly reports. Discarding.');
+      return false;
+    }
+
+    final int capturedEpoch = _sessionEpoch;
+
+    // 2. Strict completeness validation:
+    // Requires overall client-facing report
+    if (overallReport.privacyLevel != 'client_facing') {
+      debugPrint('[VaultService] Security violation: non-client_facing weekly overall report.');
+      return false;
+    }
+
+    // Require strictly: overallReport.sprintId == sprintId (null sprintId rejected)
+    if (overallReport.sprintId != sprintId) {
+      debugPrint(
+        '[VaultService] Weekly overall report sprint mismatch: report has "${overallReport.sprintId}", expected "$sprintId". Null or mismatched sprintId rejected.',
+      );
+      return false;
+    }
+
+    // Must contain exactly all 8 system reports; do not accept partial or substitute previous week
+    const requiredSystems = [
+      'cvs',
+      'gi_tract',
+      'respiratory',
+      'nervous',
+      'musculoskeletal',
+      'kidneys',
+      'immune',
+      'endocrine',
+    ];
+
+    if (systemReports.length != 8) {
+      debugPrint(
+        '[VaultService] Incomplete weekly reports rejected: received ${systemReports.length} systems, expected 8.',
+      );
+      return false;
+    }
+
+    for (final sysKey in requiredSystems) {
+      final rep = systemReports[sysKey];
+      if (rep == null || rep.privacyLevel != 'client_facing') {
+        debugPrint(
+          '[VaultService] Missing or non-client_facing report for system "$sysKey". Weekly reports rejected.',
+        );
+        return false;
+      }
+      // Require strictly: rep.sprintId == sprintId for all 8 reports (null sprintId rejected)
+      if (rep.sprintId != sprintId) {
+        debugPrint(
+          '[VaultService] System report for "$sysKey" has sprintId "${rep.sprintId}", expected "$sprintId". Null or cross-sprint sprintId strictly forbidden.',
+        );
+        return false;
+      }
+    }
+
+    // 3. Preserve history: archive previous active sprint if different
+    if (_activeWeeklySprintId != null &&
+        _activeWeeklySprintId != sprintId &&
+        _activeWeeklyOverallReport != null) {
+      _weeklyConsiliumHistory[_activeWeeklySprintId!] = {
+        'cycle_id': cycleId,
+        'sprint_id': _activeWeeklySprintId,
+        'sprint_number': _activeWeeklySprintNumber,
+        'report_date': _activeWeeklyReportDate,
+        'overall_report': _activeWeeklyOverallReport!.toJson(),
+        'system_reports': _activeWeeklySystemReports.map((k, v) => MapEntry(k, v.toJson())),
+        'archived_at': DateTime.now().toUtc().toIso8601String(),
+      };
+    }
+
+    // 4. Update in-memory state: isolate new sprint
+    _activeWeeklySprintId = sprintId;
+    _activeWeeklySprintNumber = sprintNumber;
+    _activeWeeklyReportDate = reportDate;
+    _activeWeeklyOverallReport = overallReport;
+    _activeWeeklySystemReports.clear();
+    _activeWeeklySystemReports.addAll(systemReports);
+
+    // Record new sprint into history as well
+    _weeklyConsiliumHistory[sprintId] = {
+      'cycle_id': cycleId,
+      'sprint_id': sprintId,
+      'sprint_number': sprintNumber,
+      'report_date': reportDate,
+      'overall_report': overallReport.toJson(),
+      'system_reports': systemReports.map((k, v) => MapEntry(k, v.toJson())),
+      'recorded_at': DateTime.now().toUtc().toIso8601String(),
+    };
+
+    // 5. Epoch fencing check before persistence
+    if (_isDisposed || _sessionEpoch != capturedEpoch || _activePatientId != activeId) {
+      return false;
+    }
+
+    // 6. Persist to storage with post-persist fence
+    try {
+      await _persist();
+      if (_isDisposed || _sessionEpoch != capturedEpoch || _activePatientId != activeId) {
+        return false;
+      }
+      if (activeId != null) {
+        await flushPendingWrites(patientId: activeId);
+        if (_isDisposed || _sessionEpoch != capturedEpoch || _activePatientId != activeId) {
+          return false;
+        }
+      }
+      notifyListeners();
+      return true;
+    } catch (e) {
+      debugPrint('[VaultService] Failed to securely persist weekly client reports: $e');
+      notifyListeners();
+      return false;
+    }
+  }
 
   /// Atomically records published client-facing Primary Consilium reports in local vault.
   /// Enforces epoch check and patient attribution fencing.

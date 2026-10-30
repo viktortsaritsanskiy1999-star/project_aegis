@@ -216,10 +216,10 @@ class AtlasScreen extends StatefulWidget {
   const AtlasScreen({super.key});
 
   @override
-  State<AtlasScreen> createState() => _AtlasScreenState();
+  AtlasScreenState createState() => AtlasScreenState();
 }
 
-class _AtlasScreenState extends State<AtlasScreen> {
+class AtlasScreenState extends State<AtlasScreen> {
   final AthenaTriggerService _athenaTriggerService = AthenaTriggerService();
 
   // 1. Храним ссылку на сервис для отписки в dispose
@@ -234,6 +234,14 @@ class _AtlasScreenState extends State<AtlasScreen> {
   ClientCascadeStatusResponse? _latestCascadeStatus;
   String? _activeConsiliumCycleId;
   String? _stableIdempotencyKey;
+
+  // Weekly Consilium state
+  int _weeklyConsiliumFetchEpoch = 0;
+  bool _isExecutingWeeklyConsilium = false;
+  bool _weeklyConsiliumIsBusy = false;
+  String? _weeklyConsiliumErrorMessage;
+  String? _activeWeeklySprintKey;
+  String? _stableWeeklyIdempotencyKey;
   bool _isActivityModalOpen = false;
   bool _isWorkoutModalOpen = false;
   bool _isCriticalModalOpen = false;
@@ -464,6 +472,8 @@ class _AtlasScreenState extends State<AtlasScreen> {
 
     final apiClient = context.read<AegisApiClient>();
     final vaultService = context.read<VaultService>();
+    final int initialVaultEpoch = vaultService.sessionEpoch;
+    String? requestCycleId;
 
     try {
       // 1. Verify server readiness
@@ -532,6 +542,7 @@ class _AtlasScreenState extends State<AtlasScreen> {
 
       // 2. Execute Primary Consilium with stable idempotency key
       final String cycleId = status.activeCycleId!;
+      requestCycleId = cycleId;
       if (_activeConsiliumCycleId != cycleId || _stableIdempotencyKey == null) {
         _activeConsiliumCycleId = cycleId;
         _stableIdempotencyKey = 'atlas_primary_$cycleId';
@@ -609,17 +620,32 @@ class _AtlasScreenState extends State<AtlasScreen> {
     } on AegisNetworkException catch (e) {
       // In case of network drop / socket timeout after server accepted request, verify server status
       try {
-        final recoveryStatus = await apiClient.getCascadeStatus();
-        if (mounted && _consiliumFetchEpoch == runEpoch && authManager.confirmedAttributionPatientId == patientId) {
-          if (recoveryStatus.isPrimaryConsiliumCompleted && recoveryStatus.activeCycleId != null) {
-            final reports = await apiClient.getClientReports(cycleId: recoveryStatus.activeCycleId!);
-            if (mounted && _consiliumFetchEpoch == runEpoch && authManager.confirmedAttributionPatientId == patientId) {
+        if (mounted &&
+            _consiliumFetchEpoch == runEpoch &&
+            authManager.confirmedAttributionPatientId == patientId &&
+            vaultService.sessionEpoch == initialVaultEpoch &&
+            requestCycleId != null) {
+          final recoveryStatus = await apiClient.getCascadeStatus();
+          if (mounted &&
+              _consiliumFetchEpoch == runEpoch &&
+              authManager.confirmedAttributionPatientId == patientId &&
+              vaultService.sessionEpoch == initialVaultEpoch &&
+              recoveryStatus.isPrimaryConsiliumCompleted &&
+              recoveryStatus.activeCycleId == requestCycleId) {
+            final reports = await apiClient.getClientReports(cycleId: requestCycleId);
+            if (mounted &&
+                _consiliumFetchEpoch == runEpoch &&
+                authManager.confirmedAttributionPatientId == patientId &&
+                vaultService.sessionEpoch == initialVaultEpoch) {
               final bool saved = await vaultService.recordClientReports(
-                cycleId: recoveryStatus.activeCycleId!,
+                cycleId: requestCycleId,
                 reports: reports,
                 expectedPatientId: patientId,
               );
-              if (mounted && _consiliumFetchEpoch == runEpoch && authManager.confirmedAttributionPatientId == patientId) {
+              if (mounted &&
+                  _consiliumFetchEpoch == runEpoch &&
+                  authManager.confirmedAttributionPatientId == patientId &&
+                  vaultService.sessionEpoch == initialVaultEpoch) {
                 if (saved) {
                   _stableIdempotencyKey = null;
                   _activeConsiliumCycleId = null;
@@ -644,17 +670,32 @@ class _AtlasScreenState extends State<AtlasScreen> {
     } on AegisTimeoutException catch (_) {
       // In case of timeout after server accepted request, verify server status before erroring
       try {
-        final recoveryStatus = await apiClient.getCascadeStatus();
-        if (mounted && _consiliumFetchEpoch == runEpoch && authManager.confirmedAttributionPatientId == patientId) {
-          if (recoveryStatus.isPrimaryConsiliumCompleted && recoveryStatus.activeCycleId != null) {
-            final reports = await apiClient.getClientReports(cycleId: recoveryStatus.activeCycleId!);
-            if (mounted && _consiliumFetchEpoch == runEpoch && authManager.confirmedAttributionPatientId == patientId) {
+        if (mounted &&
+            _consiliumFetchEpoch == runEpoch &&
+            authManager.confirmedAttributionPatientId == patientId &&
+            vaultService.sessionEpoch == initialVaultEpoch &&
+            requestCycleId != null) {
+          final recoveryStatus = await apiClient.getCascadeStatus();
+          if (mounted &&
+              _consiliumFetchEpoch == runEpoch &&
+              authManager.confirmedAttributionPatientId == patientId &&
+              vaultService.sessionEpoch == initialVaultEpoch &&
+              recoveryStatus.isPrimaryConsiliumCompleted &&
+              recoveryStatus.activeCycleId == requestCycleId) {
+            final reports = await apiClient.getClientReports(cycleId: requestCycleId);
+            if (mounted &&
+                _consiliumFetchEpoch == runEpoch &&
+                authManager.confirmedAttributionPatientId == patientId &&
+                vaultService.sessionEpoch == initialVaultEpoch) {
               final bool saved = await vaultService.recordClientReports(
-                cycleId: recoveryStatus.activeCycleId!,
+                cycleId: requestCycleId,
                 reports: reports,
                 expectedPatientId: patientId,
               );
-              if (mounted && _consiliumFetchEpoch == runEpoch && authManager.confirmedAttributionPatientId == patientId) {
+              if (mounted &&
+                  _consiliumFetchEpoch == runEpoch &&
+                  authManager.confirmedAttributionPatientId == patientId &&
+                  vaultService.sessionEpoch == initialVaultEpoch) {
                 if (saved) {
                   _stableIdempotencyKey = null;
                   _activeConsiliumCycleId = null;
@@ -692,6 +733,399 @@ class _AtlasScreenState extends State<AtlasScreen> {
       }
     }
   }
+
+  /// Explicitly runs Weekly Consilium on user action.
+  /// 1. Verifies completed Primary Consilium (blocks launch if not completed).
+  /// 2. Resolves current weekly sprint from server state (reports).
+  /// 3. Distinguishes replay/retry of current sprint from transition to a new period.
+  ///    If transitioning to a new period without an explicit server contract, refuses to guess sprint_id.
+  /// 4. Protects against double-tapping, uses stable idempotency key, epoch and patient attribution fencing.
+  /// 5. On timeout, checks server reports first via GET before reporting failure or retrying POST.
+  Future<void> _runWeeklyConsiliumExplicitly({
+    String? targetSprintId,
+    bool isNewPeriod = false,
+  }) async {
+    if (!mounted || _isExecutingWeeklyConsilium) return;
+
+    final authManager = context.read<AuthSessionManager>();
+    if (!authManager.isAuthenticated) {
+      if (mounted) {
+        setState(() {
+          _weeklyConsiliumErrorMessage = 'Device authentication required.';
+        });
+      }
+      return;
+    }
+
+    final String? patientId = authManager.confirmedAttributionPatientId;
+    if (patientId == null) {
+      if (mounted) {
+        setState(() {
+          _weeklyConsiliumErrorMessage = 'Active patient attribution not found.';
+        });
+      }
+      return;
+    }
+
+    final int runEpoch = ++_weeklyConsiliumFetchEpoch;
+
+    setState(() {
+      _isExecutingWeeklyConsilium = true;
+      _weeklyConsiliumIsBusy = false;
+      _weeklyConsiliumErrorMessage = null;
+    });
+
+    final apiClient = context.read<AegisApiClient>();
+    final vaultService = context.read<VaultService>();
+    final int initialVaultEpoch = vaultService.sessionEpoch;
+    String? requestCycleId;
+    String? expectedSprintId;
+
+    try {
+      // 1. Verify server status and readiness
+      final status = await apiClient.getCascadeStatus();
+
+      if (!mounted ||
+          _weeklyConsiliumFetchEpoch != runEpoch ||
+          authManager.confirmedAttributionPatientId != patientId) {
+        return;
+      }
+
+      _latestCascadeStatus = status;
+
+      if (!status.hasActiveCycle || status.activeCycleId == null) {
+        setState(() {
+          _isExecutingWeeklyConsilium = false;
+          _weeklyConsiliumErrorMessage = 'Active medical cycle not found.';
+        });
+        return;
+      }
+
+      if (!status.isPrimaryConsiliumCompleted) {
+        setState(() {
+          _isExecutingWeeklyConsilium = false;
+          _weeklyConsiliumErrorMessage =
+              'Weekly Consilium requires server-confirmed Primary Consilium completion for the active cycle. Please complete Primary Consilium first.';
+        });
+        return;
+      }
+
+      final String cycleId = status.activeCycleId!;
+      requestCycleId = cycleId;
+
+      // 2. Query published server reports to determine current weekly sprint
+      final existingReports = await apiClient.getClientReports(cycleId: cycleId);
+
+      if (!mounted ||
+          _weeklyConsiliumFetchEpoch != runEpoch ||
+          authManager.confirmedAttributionPatientId != patientId) {
+        return;
+      }
+
+      final existingWeeklyOverall = existingReports
+          .where((r) => r.reportType == 'weekly_user_overall_report')
+          .toList();
+
+      String? sprintIdToRun;
+      if (isNewPeriod) {
+        // Contract safety requirement:
+        // "Если сервер не предоставляет достаточного контракта для определения следующего периода,
+        // остановись с PARTIAL. Не генерируй sprint_id по догадке клиента."
+        if (targetSprintId == null || targetSprintId.trim().isEmpty) {
+          setState(() {
+            _isExecutingWeeklyConsilium = false;
+            _weeklyConsiliumErrorMessage =
+                'Next weekly sprint contract unavailable: server status does not provide next period scheduling. Refusing to guess sprint_id.';
+          });
+          return;
+        }
+        sprintIdToRun = targetSprintId.trim();
+      } else {
+        if (targetSprintId != null && targetSprintId.trim().isNotEmpty) {
+          sprintIdToRun = targetSprintId.trim();
+        } else if (existingWeeklyOverall.isNotEmpty) {
+          // Retry / replay existing current sprint
+          sprintIdToRun = existingWeeklyOverall.last.sprintId;
+        } else {
+          // First launch: server will create sprint_{cycleId}_w1
+          sprintIdToRun = null;
+        }
+      }
+
+      expectedSprintId = sprintIdToRun ?? 'sprint_${cycleId}_w1';
+
+      // 3. Stable idempotency key across retries of the same operation
+      final keySprint = sprintIdToRun ?? 'w1';
+      if (_activeWeeklySprintKey != keySprint || _stableWeeklyIdempotencyKey == null) {
+        _activeWeeklySprintKey = keySprint;
+        _stableWeeklyIdempotencyKey = 'atlas_weekly_${cycleId}_$keySprint';
+      }
+
+      // 4. Execute Weekly Consilium on server
+      final response = await apiClient.runWeeklyConsilium(
+        cycleId: cycleId,
+        sprintId: sprintIdToRun,
+        idempotencyKey: _stableWeeklyIdempotencyKey,
+      );
+
+      if (!mounted ||
+          _weeklyConsiliumFetchEpoch != runEpoch ||
+          authManager.confirmedAttributionPatientId != patientId) {
+        return;
+      }
+
+      // 5. Securely persist to patient-scoped vault
+      final bool saved = await vaultService.recordWeeklyClientReports(
+        cycleId: response.cycleId,
+        sprintId: response.sprintId,
+        sprintNumber: response.sprintNumber,
+        reportDate: response.reportDate,
+        overallReport: response.overallReport,
+        systemReports: response.systemReports,
+        expectedPatientId: patientId,
+      );
+
+      if (!mounted ||
+          _weeklyConsiliumFetchEpoch != runEpoch ||
+          authManager.confirmedAttributionPatientId != patientId) {
+        return;
+      }
+
+      if (!saved) {
+        setState(() {
+          _isExecutingWeeklyConsilium = false;
+          _weeklyConsiliumErrorMessage =
+              'Failed to securely persist weekly consilium reports locally.';
+        });
+        return;
+      }
+
+      _stableWeeklyIdempotencyKey = null;
+      _activeWeeklySprintKey = null;
+
+      setState(() {
+        _isExecutingWeeklyConsilium = false;
+        _weeklyConsiliumErrorMessage = null;
+      });
+    } on AegisConflictException catch (e) {
+      if (mounted &&
+          _weeklyConsiliumFetchEpoch == runEpoch &&
+          authManager.confirmedAttributionPatientId == patientId) {
+        final lower = e.message.toLowerCase();
+        if (lower.contains('lease') ||
+            lower.contains('concurrency') ||
+            lower.contains('in-flight') ||
+            lower.contains('concurrent') ||
+            lower.contains('lock')) {
+          setState(() {
+            _isExecutingWeeklyConsilium = false;
+            _weeklyConsiliumIsBusy = true;
+            _weeklyConsiliumErrorMessage =
+                'Weekly Consilium is temporarily busy: another analysis process holds the execution lock.';
+          });
+        } else {
+          setState(() {
+            _isExecutingWeeklyConsilium = false;
+            _weeklyConsiliumErrorMessage = e.message;
+          });
+        }
+      }
+    } on AegisInsufficientScopeException catch (e) {
+      if (mounted &&
+          _weeklyConsiliumFetchEpoch == runEpoch &&
+          authManager.confirmedAttributionPatientId == patientId) {
+        setState(() {
+          _isExecutingWeeklyConsilium = false;
+          _weeklyConsiliumErrorMessage =
+              'Access denied: missing scope ${e.requiredScope ?? "cascade:run"}.';
+        });
+      }
+    } on AegisNetworkException catch (e) {
+      // In case of network drop, check server reports first via GET before failing
+      if (expectedSprintId != null && requestCycleId != null) {
+        try {
+          if (mounted &&
+              _weeklyConsiliumFetchEpoch == runEpoch &&
+              authManager.confirmedAttributionPatientId == patientId &&
+              vaultService.sessionEpoch == initialVaultEpoch) {
+            final status = await apiClient.getCascadeStatus();
+            if (mounted &&
+                _weeklyConsiliumFetchEpoch == runEpoch &&
+                authManager.confirmedAttributionPatientId == patientId &&
+                vaultService.sessionEpoch == initialVaultEpoch &&
+                status.hasActiveCycle &&
+                status.activeCycleId == requestCycleId) {
+              final reports = await apiClient.getClientReports(cycleId: requestCycleId);
+              if (mounted &&
+                  _weeklyConsiliumFetchEpoch == runEpoch &&
+                  authManager.confirmedAttributionPatientId == patientId &&
+                  vaultService.sessionEpoch == initialVaultEpoch) {
+                // STRICT: Recover only reports belonging to the exact expected sprint_id. Never fall back to another sprint.
+                final matchingOverall = reports
+                    .where((r) =>
+                        r.reportType == 'weekly_user_overall_report' &&
+                        r.sprintId == expectedSprintId)
+                    .firstOrNull;
+                if (matchingOverall != null) {
+                  final sysReports = <String, ClientModelReportResponse>{};
+                  for (final r in reports) {
+                    if (r.sprintId == expectedSprintId &&
+                        r.reportType.startsWith('system_user_report_')) {
+                      final k = r.reportType.substring('system_user_report_'.length);
+                      sysReports[k] = r;
+                    }
+                  }
+                  if (sysReports.length == 8) {
+                    final int sprintNum = matchingOverall.content.metrics['sprint_number'] is int
+                        ? matchingOverall.content.metrics['sprint_number'] as int
+                        : 1;
+                    final bool saved = await vaultService.recordWeeklyClientReports(
+                      cycleId: requestCycleId,
+                      sprintId: expectedSprintId,
+                      sprintNumber: sprintNum,
+                      reportDate: matchingOverall.content.reportDate ?? '',
+                      overallReport: matchingOverall,
+                      systemReports: sysReports,
+                      expectedPatientId: patientId,
+                    );
+                    if (saved &&
+                        mounted &&
+                        _weeklyConsiliumFetchEpoch == runEpoch &&
+                        authManager.confirmedAttributionPatientId == patientId &&
+                        vaultService.sessionEpoch == initialVaultEpoch) {
+                      _stableWeeklyIdempotencyKey = null;
+                      _activeWeeklySprintKey = null;
+                      setState(() {
+                        _isExecutingWeeklyConsilium = false;
+                        _weeklyConsiliumErrorMessage = null;
+                      });
+                      return;
+                    }
+                  }
+                }
+              }
+            }
+          }
+        } catch (_) {}
+      }
+
+      if (mounted &&
+          _weeklyConsiliumFetchEpoch == runEpoch &&
+          authManager.confirmedAttributionPatientId == patientId) {
+        setState(() {
+          _isExecutingWeeklyConsilium = false;
+          _weeklyConsiliumErrorMessage = 'Network error: ${e.message}';
+        });
+      }
+    } on AegisTimeoutException catch (_) {
+      // In case of timeout, check server reports first via GET before failing
+      if (expectedSprintId != null && requestCycleId != null) {
+        try {
+          if (mounted &&
+              _weeklyConsiliumFetchEpoch == runEpoch &&
+              authManager.confirmedAttributionPatientId == patientId &&
+              vaultService.sessionEpoch == initialVaultEpoch) {
+            final status = await apiClient.getCascadeStatus();
+            if (mounted &&
+                _weeklyConsiliumFetchEpoch == runEpoch &&
+                authManager.confirmedAttributionPatientId == patientId &&
+                vaultService.sessionEpoch == initialVaultEpoch &&
+                status.hasActiveCycle &&
+                status.activeCycleId == requestCycleId) {
+              final reports = await apiClient.getClientReports(cycleId: requestCycleId);
+              if (mounted &&
+                  _weeklyConsiliumFetchEpoch == runEpoch &&
+                  authManager.confirmedAttributionPatientId == patientId &&
+                  vaultService.sessionEpoch == initialVaultEpoch) {
+                // STRICT: Recover only reports belonging to the exact expected sprint_id. Never fall back to another sprint.
+                final matchingOverall = reports
+                    .where((r) =>
+                        r.reportType == 'weekly_user_overall_report' &&
+                        r.sprintId == expectedSprintId)
+                    .firstOrNull;
+                if (matchingOverall != null) {
+                  final sysReports = <String, ClientModelReportResponse>{};
+                  for (final r in reports) {
+                    if (r.sprintId == expectedSprintId &&
+                        r.reportType.startsWith('system_user_report_')) {
+                      final k = r.reportType.substring('system_user_report_'.length);
+                      sysReports[k] = r;
+                    }
+                  }
+                  if (sysReports.length == 8) {
+                    final int sprintNum = matchingOverall.content.metrics['sprint_number'] is int
+                        ? matchingOverall.content.metrics['sprint_number'] as int
+                        : 1;
+                    final bool saved = await vaultService.recordWeeklyClientReports(
+                      cycleId: requestCycleId,
+                      sprintId: expectedSprintId,
+                      sprintNumber: sprintNum,
+                      reportDate: matchingOverall.content.reportDate ?? '',
+                      overallReport: matchingOverall,
+                      systemReports: sysReports,
+                      expectedPatientId: patientId,
+                    );
+                    if (saved &&
+                        mounted &&
+                        _weeklyConsiliumFetchEpoch == runEpoch &&
+                        authManager.confirmedAttributionPatientId == patientId &&
+                        vaultService.sessionEpoch == initialVaultEpoch) {
+                      _stableWeeklyIdempotencyKey = null;
+                      _activeWeeklySprintKey = null;
+                      setState(() {
+                        _isExecutingWeeklyConsilium = false;
+                        _weeklyConsiliumErrorMessage = null;
+                      });
+                      return;
+                    }
+                  }
+                }
+              }
+            }
+          }
+        } catch (_) {}
+      }
+
+      if (mounted &&
+          _weeklyConsiliumFetchEpoch == runEpoch &&
+          authManager.confirmedAttributionPatientId == patientId) {
+        setState(() {
+          _isExecutingWeeklyConsilium = false;
+          _weeklyConsiliumErrorMessage = expectedSprintId != null
+              ? 'Weekly consilium execution timed out. Results for $expectedSprintId not confirmed on server.'
+              : 'Weekly consilium execution timed out';
+        });
+      }
+    } on AegisApiException catch (e) {
+      if (mounted &&
+          _weeklyConsiliumFetchEpoch == runEpoch &&
+          authManager.confirmedAttributionPatientId == patientId) {
+        setState(() {
+          _isExecutingWeeklyConsilium = false;
+          _weeklyConsiliumErrorMessage = e.message;
+        });
+      }
+    } catch (e) {
+      if (mounted &&
+          _weeklyConsiliumFetchEpoch == runEpoch &&
+          authManager.confirmedAttributionPatientId == patientId) {
+        setState(() {
+          _isExecutingWeeklyConsilium = false;
+          _weeklyConsiliumErrorMessage = 'Error: $e';
+        });
+      }
+    }
+  }
+
+  @visibleForTesting
+  Future<void> runWeeklyConsiliumForTesting({
+    String? targetSprintId,
+    bool isNewPeriod = false,
+  }) =>
+      _runWeeklyConsiliumExplicitly(
+        targetSprintId: targetSprintId,
+        isNewPeriod: isNewPeriod,
+      );
 
   void _onVitalsStateChanged() {
     if (!mounted) return;
@@ -1037,7 +1471,37 @@ class _AtlasScreenState extends State<AtlasScreen> {
       );
     }
 
+    if (_isExecutingWeeklyConsilium) {
+      return Container(
+        key: const Key('weekly_consilium_status_executing'),
+        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+        decoration: BoxDecoration(
+          color: const Color(0xFF0D1117).withOpacity(0.85),
+          borderRadius: BorderRadius.circular(12),
+          border: Border.all(color: Colors.greenAccent.withOpacity(0.6), width: 1),
+        ),
+        child: const Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            SizedBox(
+              width: 10,
+              height: 10,
+              child: CircularProgressIndicator(strokeWidth: 1.5, color: Colors.greenAccent),
+            ),
+            SizedBox(width: 6),
+            Text(
+              "Выполняется Weekly консилиум...",
+              style: TextStyle(color: Colors.greenAccent, fontSize: 10),
+            ),
+          ],
+        ),
+      );
+    }
+
     if (vault.isConsiliumCompleted) {
+      final String label = vault.isWeeklyConsiliumCompleted
+          ? "Weekly ${vault.activeWeeklySprintId ?? 'W1'} сформирован"
+          : "Консилиум сформирован";
       return GestureDetector(
         key: const Key('consilium_status_ready'),
         onTap: () => _showCascadeCoreVault(context),
@@ -1048,14 +1512,14 @@ class _AtlasScreenState extends State<AtlasScreen> {
             borderRadius: BorderRadius.circular(12),
             border: Border.all(color: Colors.greenAccent.withOpacity(0.6), width: 1),
           ),
-          child: const Row(
+          child: Row(
             mainAxisSize: MainAxisSize.min,
             children: [
-              Icon(Icons.verified_outlined, color: Colors.greenAccent, size: 12),
-              SizedBox(width: 6),
+              const Icon(Icons.verified_outlined, color: Colors.greenAccent, size: 12),
+              const SizedBox(width: 6),
               Text(
-                "Консилиум сформирован",
-                style: TextStyle(color: Colors.greenAccent, fontSize: 10, fontWeight: FontWeight.bold),
+                label,
+                style: const TextStyle(color: Colors.greenAccent, fontSize: 10, fontWeight: FontWeight.bold),
               ),
             ],
           ),
@@ -1607,6 +2071,7 @@ class _AtlasScreenState extends State<AtlasScreen> {
     final vault = Provider.of<VaultService>(context, listen: false);
     final overall = vault.cachedOverallReport;
     final isDone = vault.isConsiliumCompleted;
+    final bool isServerPrimaryDone = _latestCascadeStatus?.isPrimaryConsiliumCompleted == true;
 
     showDialog(
       context: context,
@@ -1683,6 +2148,82 @@ class _AtlasScreenState extends State<AtlasScreen> {
                           ],
                         ),
                       )),
+                  const SizedBox(height: 20),
+                  const Text("WEEKLY MONITORING CONSILIUM:",
+                      style: TextStyle(color: Colors.greenAccent, fontSize: 11, fontWeight: FontWeight.bold)),
+                  const Divider(color: Colors.white24),
+                  if (_isExecutingWeeklyConsilium) ...[
+                    const Row(
+                      children: [
+                        SizedBox(
+                          width: 14,
+                          height: 14,
+                          child: CircularProgressIndicator(strokeWidth: 2, color: Colors.greenAccent),
+                        ),
+                        SizedBox(width: 8),
+                        Text(
+                          "Выполняется Weekly консилиум...",
+                          style: TextStyle(color: Colors.greenAccent, fontSize: 11, fontWeight: FontWeight.bold),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 8),
+                    const Text(
+                      "Weekly Consilium is executing: evaluating 7-day diary, adherence dynamics, and updating strategy with Deputy Flash & Chief Physician Pro...",
+                      style: TextStyle(color: Colors.white70, fontSize: 12),
+                    ),
+                  ] else if (_weeklyConsiliumIsBusy) ...[
+                    const Text(
+                      "Weekly консилиум временно занят: удерживается блокировка (409). Пожалуйста, повторите попытку.",
+                      style: TextStyle(color: Colors.amberAccent, fontSize: 12),
+                    ),
+                  ] else if (_weeklyConsiliumErrorMessage != null) ...[
+                    Text(
+                      _weeklyConsiliumErrorMessage!,
+                      style: const TextStyle(color: Colors.amberAccent, fontSize: 12),
+                    ),
+                  ] else if (vault.activeWeeklyOverallReport != null) ...[
+                    Text(
+                      vault.activeWeeklyOverallReport!.content.title.isNotEmpty
+                          ? vault.activeWeeklyOverallReport!.content.title
+                          : "Weekly Monitoring Synthesis",
+                      style: const TextStyle(color: Colors.greenAccent, fontSize: 12, fontWeight: FontWeight.bold),
+                    ),
+                    const SizedBox(height: 6),
+                    Text(
+                      vault.activeWeeklyOverallReport!.content.summary,
+                      style: const TextStyle(color: Colors.white, fontSize: 12),
+                    ),
+                    if (vault.activeWeeklyOverallReport!.content.highlights.isNotEmpty) ...[
+                      const SizedBox(height: 8),
+                      ...vault.activeWeeklyOverallReport!.content.highlights.map(
+                        (h) => Padding(
+                          padding: const EdgeInsets.symmetric(vertical: 2.0),
+                          child: Row(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              const Text("• ", style: TextStyle(color: Colors.greenAccent, fontSize: 12)),
+                              Expanded(
+                                child: Text(h, style: const TextStyle(color: Colors.white70, fontSize: 11)),
+                              ),
+                            ],
+                          ),
+                        ),
+                      ),
+                    ],
+                    if (vault.activeWeeklyReportDate != null) ...[
+                      const SizedBox(height: 8),
+                      Text(
+                        "Sprint: ${vault.activeWeeklySprintId ?? 'W1'} • Date: ${vault.activeWeeklyReportDate}",
+                        style: const TextStyle(fontSize: 10, fontFamily: 'Courier', color: Colors.white38),
+                      ),
+                    ],
+                  ] else ...[
+                    const Text(
+                      "Primary Consilium completed. Weekly monitoring consilium is ready to launch.",
+                      style: TextStyle(color: Colors.white70, fontSize: 12),
+                    ),
+                  ],
                 ] else if (isDone) ...[
                   const Text("OVERALL CLINICAL SUMMARY:",
                       style: TextStyle(color: Colors.purpleAccent, fontSize: 11, fontWeight: FontWeight.bold)),
@@ -1718,6 +2259,11 @@ class _AtlasScreenState extends State<AtlasScreen> {
                       "Временно занят: другой процесс удерживает блокировку выполнения (409). Пожалуйста, повторите попытку.",
                       style: TextStyle(color: Colors.amberAccent, fontSize: 12),
                     ),
+                  ] else if (_weeklyConsiliumErrorMessage != null) ...[
+                    Text(
+                      _weeklyConsiliumErrorMessage!,
+                      style: const TextStyle(color: Colors.amberAccent, fontSize: 12),
+                    ),
                   ] else if (_latestCascadeStatus != null && !_latestCascadeStatus!.hasPreparatoryAnamnesis) ...[
                     const Text(
                       "Primary Consilium analysis has not been performed yet. Data is being prepared for clinical synthesis. Required preparatory anamnesis (M1) is missing on the server.",
@@ -1740,7 +2286,42 @@ class _AtlasScreenState extends State<AtlasScreen> {
           ),
         ),
         actions: [
-          if (!isDone && !_isExecutingConsilium && _consiliumIsBusy)
+          if (isServerPrimaryDone && !_isExecutingWeeklyConsilium) ...[
+            if (vault.activeWeeklyOverallReport == null)
+              ElevatedButton(
+                key: const Key('run_weekly_consilium_btn'),
+                style: ElevatedButton.styleFrom(backgroundColor: Colors.greenAccent),
+                onPressed: () {
+                  Navigator.pop(context);
+                  _runWeeklyConsiliumExplicitly();
+                },
+                child: const Text("ЗАПУСТИТЬ WEEKLY",
+                    style: TextStyle(color: Colors.black, fontWeight: FontWeight.bold)),
+              )
+            else ...[
+              ElevatedButton(
+                key: const Key('retry_weekly_consilium_btn'),
+                style: ElevatedButton.styleFrom(backgroundColor: Colors.amberAccent),
+                onPressed: () {
+                  Navigator.pop(context);
+                  _runWeeklyConsiliumExplicitly();
+                },
+                child: const Text("ПОВТОРИТЬ WEEKLY",
+                    style: TextStyle(color: Colors.black, fontWeight: FontWeight.bold)),
+              ),
+              ElevatedButton(
+                key: const Key('next_weekly_consilium_btn'),
+                style: ElevatedButton.styleFrom(backgroundColor: Colors.blueAccent),
+                onPressed: () {
+                  Navigator.pop(context);
+                  _runWeeklyConsiliumExplicitly(isNewPeriod: true);
+                },
+                child: const Text("СЛЕДУЮЩИЙ СПРИНТ",
+                    style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
+              ),
+            ],
+          ],
+          if (!isServerPrimaryDone && !_isExecutingConsilium && _consiliumIsBusy)
             ElevatedButton(
               key: const Key('retry_primary_consilium_btn'),
               style: ElevatedButton.styleFrom(backgroundColor: Colors.amberAccent),
@@ -1750,7 +2331,7 @@ class _AtlasScreenState extends State<AtlasScreen> {
               },
               child: const Text("ПОВТОРИТЬ", style: TextStyle(color: Colors.black, fontWeight: FontWeight.bold)),
             ),
-          if (!isDone && !_isExecutingConsilium && (_latestCascadeStatus?.hasPreparatoryAnamnesis == true))
+          if (!isServerPrimaryDone && !_isExecutingConsilium && (_latestCascadeStatus?.hasPreparatoryAnamnesis == true))
             ElevatedButton(
               key: const Key('run_primary_consilium_btn'),
               style: ElevatedButton.styleFrom(backgroundColor: Colors.blueAccent),
@@ -1770,6 +2351,7 @@ class _AtlasScreenState extends State<AtlasScreen> {
     final vault = Provider.of<VaultService>(context, listen: false);
     final folder = vault.getSystemContext(systemKey);
     final clientReport = vault.getClientReportForSystem(systemKey);
+    final weeklyReport = vault.getWeeklyReportForSystem(systemKey);
 
     final dynamic m1Facts = folder['data'] ?? folder['facts'] ?? folder['system_facts'] ?? "No anamnesis facts recorded";
 
@@ -1917,6 +2499,67 @@ class _AtlasScreenState extends State<AtlasScreen> {
                         : "Primary consilium analysis pending",
                     style: const TextStyle(fontSize: 12, color: Colors.white60),
                   ),
+                ],
+
+                if (weeklyReport != null) ...[
+                  const SizedBox(height: 20),
+                  Text(
+                    "WEEKLY SPRINT CONCLUSION (${weeklyReport.sprintId ?? 'WEEKLY'}):",
+                    style: const TextStyle(
+                        color: Colors.greenAccent,
+                        fontSize: 10,
+                        fontWeight: FontWeight.bold),
+                  ),
+                  const Divider(color: Colors.white10),
+                  if (weeklyReport.content.title.isNotEmpty)
+                    Padding(
+                      padding: const EdgeInsets.only(bottom: 6.0),
+                      child: Text(
+                        weeklyReport.content.title,
+                        style: const TextStyle(
+                            fontSize: 12,
+                            fontWeight: FontWeight.bold,
+                            color: Colors.greenAccent),
+                      ),
+                    ),
+                  Text(
+                    weeklyReport.content.summary.isNotEmpty
+                        ? weeklyReport.content.summary
+                        : "Weekly sprint analysis completed. No specific findings.",
+                    style: const TextStyle(fontSize: 12, color: Colors.white),
+                  ),
+                  if (weeklyReport.content.highlights.isNotEmpty) ...[
+                    const SizedBox(height: 8),
+                    ...weeklyReport.content.highlights.map(
+                      (h) => Padding(
+                        padding: const EdgeInsets.symmetric(vertical: 2.0),
+                        child: Row(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            const Text("• ",
+                                style: TextStyle(
+                                    color: Colors.greenAccent, fontSize: 12)),
+                            Expanded(
+                              child: Text(h,
+                                  style: const TextStyle(
+                                      color: Colors.white70, fontSize: 11)),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
+                  ],
+                  if (weeklyReport.content.reportDate != null)
+                    Padding(
+                      padding: const EdgeInsets.only(top: 8.0),
+                      child: Text(
+                        "Date: ${weeklyReport.content.reportDate}",
+                        style: const TextStyle(
+                            fontSize: 10,
+                            fontFamily: 'Courier',
+                            color: Colors.white38),
+                      ),
+                    ),
                 ],
               ],
             ),

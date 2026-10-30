@@ -702,6 +702,58 @@ class PrimaryConsiliumClientResponse {
   };
 }
 
+/// Matches backend WeeklyConsiliumClientResponse schema.
+@immutable
+class WeeklyConsiliumClientResponse {
+  final String cycleId;
+  final String sprintId;
+  final int sprintNumber;
+  final String reportDate;
+  final ClientModelReportResponse overallReport;
+  final Map<String, ClientModelReportResponse> systemReports;
+
+  const WeeklyConsiliumClientResponse({
+    required this.cycleId,
+    required this.sprintId,
+    required this.sprintNumber,
+    required this.reportDate,
+    required this.overallReport,
+    this.systemReports = const {},
+  });
+
+  factory WeeklyConsiliumClientResponse.fromJson(Map<String, dynamic> json) {
+    final sysReports = <String, ClientModelReportResponse>{};
+    if (json['system_reports'] is Map) {
+      (json['system_reports'] as Map).forEach((k, v) {
+        if (v is Map) {
+          sysReports[k.toString()] =
+              ClientModelReportResponse.fromJson(Map<String, dynamic>.from(v));
+        }
+      });
+    }
+
+    return WeeklyConsiliumClientResponse(
+      cycleId: json['cycle_id'] as String? ?? '',
+      sprintId: json['sprint_id'] as String? ?? '',
+      sprintNumber: json['sprint_number'] as int? ?? 1,
+      reportDate: json['report_date'] as String? ?? '',
+      overallReport: ClientModelReportResponse.fromJson(
+        Map<String, dynamic>.from(json['overall_report'] as Map? ?? {}),
+      ),
+      systemReports: sysReports,
+    );
+  }
+
+  Map<String, dynamic> toJson() => {
+    'cycle_id': cycleId,
+    'sprint_id': sprintId,
+    'sprint_number': sprintNumber,
+    'report_date': reportDate,
+    'overall_report': overallReport.toJson(),
+    'system_reports': systemReports.map((k, v) => MapEntry(k, v.toJson())),
+  };
+}
+
 /// Pulse spike context for Athena curator Mode 2 intervention.
 /// Matches backend AthenaVitalsAlertContext schema.
 @immutable

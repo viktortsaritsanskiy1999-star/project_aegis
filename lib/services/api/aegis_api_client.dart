@@ -811,26 +811,53 @@ class AegisApiClient {
 
   /// Run Weekly Consilium for authenticated patient (`POST /api/v1/client/cascade/run-weekly`).
   /// Requires `cascade:run` scope.
-  /// Blocked on the server with HTTP 503 pending Stage 5.4F.
-  Future<void> runWeeklyConsilium({String? accessToken}) async {
+  Future<WeeklyConsiliumClientResponse> runWeeklyConsilium({
+    String? cycleId,
+    String? sprintId,
+    String? reportDate,
+    String? idempotencyKey,
+    String? accessToken,
+  }) async {
     final uri = Uri.parse('$baseUrl/api/v1/client/cascade/run-weekly');
+    final Map<String, dynamic> bodyMap = {};
+    if (cycleId != null && cycleId.trim().isNotEmpty) {
+      bodyMap['cycle_id'] = cycleId.trim();
+    }
+    if (sprintId != null && sprintId.trim().isNotEmpty) {
+      bodyMap['sprint_id'] = sprintId.trim();
+    }
+    if (reportDate != null && reportDate.trim().isNotEmpty) {
+      bodyMap['report_date'] = reportDate.trim();
+    }
+    final bodyJson = bodyMap.isNotEmpty ? json.encode(bodyMap) : null;
+
     try {
       final response = await _sendWithAuthRetry(
         sendRequest: (token) async {
           final headers = await _buildHeaders(accessToken: token);
-          _log('POST $uri');
-          return await _client.post(uri, headers: headers).timeout(timeout);
+          if (idempotencyKey != null && idempotencyKey.trim().isNotEmpty) {
+            headers['Idempotency-Key'] = idempotencyKey.trim();
+          }
+          if (bodyJson != null) {
+            headers['Content-Type'] = 'application/json';
+          }
+          _log('POST $uri (sprintId: $sprintId, idempotencyKey: $idempotencyKey)');
+          return await _client
+              .post(uri, headers: headers, body: bodyJson)
+              .timeout(timeout);
         },
         explicitAccessToken: accessToken,
       );
 
       if (response.statusCode == 200) {
-        return;
+        final data = json.decode(response.body) as Map<String, dynamic>;
+        return WeeklyConsiliumClientResponse.fromJson(data);
       }
       _handleErrorResponse(response);
     } on TimeoutException catch (e) {
       _log('Timeout on $uri: $e');
-      throw AegisTimeoutException('Weekly consilium request timed out after ${timeout.inSeconds}s');
+      throw AegisTimeoutException(
+          'Weekly consilium request timed out after ${timeout.inSeconds}s');
     } on SocketException catch (e) {
       _log('Socket error on $uri: $e');
       throw AegisNetworkException('Network connection failed: ${e.message}');
