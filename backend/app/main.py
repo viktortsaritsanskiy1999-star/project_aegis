@@ -1,6 +1,7 @@
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 from app.config import settings
 from app.database import engine, init_db
@@ -14,6 +15,7 @@ from app.routers import (
     client_cascade_router,
     client_chat_router,
 )
+from app.services.clinical_automation_service import ClinicalAutomationWorker
 
 
 @asynccontextmanager
@@ -32,7 +34,26 @@ async def lifespan(app: FastAPI):
 
     backup_dir = getattr(app.state, "backup_dir", None)
     init_db(db_engine, backup_dir=backup_dir)
-    yield
+
+    worker = None
+    enable_worker = getattr(
+        app.state,
+        "enable_automation_worker",
+        settings.env != "testing" and getattr(app.state, "engine", None) is None,
+    )
+    if enable_worker:
+        worker_session_factory = sessionmaker(
+            autocommit=False, autoflush=False, bind=db_engine
+        )
+        worker = ClinicalAutomationWorker(session_factory=worker_session_factory)
+        app.state.automation_worker = worker
+        await worker.start()
+    try:
+        yield
+    finally:
+        if worker is not None:
+            await worker.stop()
+            app.state.automation_worker = None
 
 
 app = FastAPI(

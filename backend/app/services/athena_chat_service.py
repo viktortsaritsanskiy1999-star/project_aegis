@@ -46,6 +46,7 @@ from app.services.weekly_consilium_service import (
 logger = logging.getLogger("aegis.athena_chat")
 
 ATHENA_CHAT_TURN_REPORT_TYPE = "athena_chat_turn"
+POST_PRIMARY_INIT_IDEMPOTENCY_PREFIX = "athena_init_greeting_"
 
 # Regex for stripping [CLINICAL_REPORT] JSON block
 CLINICAL_REPORT_REGEX = re.compile(r"\[CLINICAL_REPORT\]([\s\S]*?)\[/CLINICAL_REPORT\]", re.IGNORECASE)
@@ -162,6 +163,11 @@ class AthenaChatService:
                 if existing_turn is not None:
                     return existing_turn
 
+            if request.event_type == "initial_greeting":
+                existing_greeting = self.find_existing_post_primary_initial_greeting(resolved_cycle_id)
+                if existing_greeting is not None:
+                    return existing_greeting
+
             turn_dt = self.weekly_service._now_utc()
             turn_now_iso = turn_dt.isoformat()
 
@@ -268,6 +274,12 @@ class AthenaChatService:
                             self.db.rollback()
                             return existing_turn
 
+                    if request.event_type == "initial_greeting":
+                        existing_greeting = self.find_existing_post_primary_initial_greeting(resolved_cycle_id)
+                        if existing_greeting is not None:
+                            self.db.rollback()
+                            return existing_greeting
+
                     active_sprint_id = self.weekly_service.resolve_active_sprint_id(
                         resolved_cycle_id,
                         as_of=turn_dt,
@@ -325,11 +337,19 @@ class AthenaChatService:
                             )
 
                     # 10. Flush Idempotency Turn Record
-                    if clean_idem:
+                    effective_idem = clean_idem
+                    if (
+                        effective_idem is None
+                        and request.event_type == "initial_greeting"
+                        and primary_service.is_primary_consilium_completed(resolved_cycle_id)
+                    ):
+                        effective_idem = f"{POST_PRIMARY_INIT_IDEMPOTENCY_PREFIX}{resolved_cycle_id}"
+
+                    if effective_idem:
                         self._save_idempotency_turn(
                             cycle_id=resolved_cycle_id,
                             sprint_id=active_sprint_id,
-                            idempotency_key=clean_idem,
+                            idempotency_key=effective_idem,
                             message_id=message_id,
                             reply=clean_reply,
                             emergency_trigger=emergency_triggered,
@@ -337,6 +357,7 @@ class AthenaChatService:
                             created_at=turn_now_iso,
                             sprint_day=effective_sprint_day,
                             sprint_number=effective_sprint_number,
+                            event_type=request.event_type,
                             expected_version=base_turn_ver + 1,
                             commit=False,
                         )
@@ -409,6 +430,77 @@ class AthenaChatService:
     # INTERNAL HELPERS
     # ==========================================================================
 
+    def find_existing_post_primary_initial_greeting(
+        self, cycle_id: str
+    ) -> Optional[AthenaChatResponse]:
+        """
+        Checks if a valid post-Primary Consilium `initial_greeting` turn and schedule
+        anchor T0 already exist for `cycle_id`. If so, returns the existing response
+        so neither the automation worker nor client retries ever duplicate the initial
+        greeting or shift T0.
+        """
+        from app.services.primary_consilium_service import PrimaryConsiliumService
+
+        primary_service = PrimaryConsiliumService(
+            db=self.db, gateway=self.gateway, now_provider=self.now_provider
+        )
+        if not primary_service.is_primary_consilium_completed(cycle_id):
+            return None
+
+        anchor_dt = self.weekly_service.find_schedule_anchor_timestamp(cycle_id)
+        if anchor_dt is None:
+            return None
+
+        anchor_iso = anchor_dt.isoformat()
+        turn_reports = self.report_repo.list_server_only(
+            cycle_id=cycle_id,
+            report_type=ATHENA_CHAT_TURN_REPORT_TYPE,
+        )
+        for r in reversed(turn_reports):
+            content = r.content or {}
+            ev_type = content.get("event_type")
+            idem_key = str(content.get("idempotency_key") or "")
+            created_at_str = str(content.get("created_at") or "")
+            if (
+                ev_type == "initial_greeting"
+                or idem_key.startswith(POST_PRIMARY_INIT_IDEMPOTENCY_PREFIX)
+                or created_at_str == anchor_iso
+            ):
+                return AthenaChatResponse(
+                    reply=str(content.get("reply", "")),
+                    emergency_trigger=bool(content.get("emergency_trigger", False)),
+                    emergency_notice=content.get("emergency_notice"),
+                    cycle_id=cycle_id,
+                    sprint_day=content.get("sprint_day"),
+                    sprint_number=content.get("sprint_number"),
+                    message_id=str(content.get("message_id", r.report_id)),
+                    created_at=created_at_str or r.created_at.isoformat(),
+                )
+
+        # Fallback if an initial_greeting after Primary was saved in chat history without a turn report
+        history = self.weekly_service.get_athena_chat_history(cycle_id)
+        for idx, msg in enumerate(history):
+            if (
+                isinstance(msg, dict)
+                and msg.get("sender") == "user"
+                and msg.get("text") == "[Initialization]: First introduction"
+                and idx + 1 < len(history)
+            ):
+                reply_msg = history[idx + 1]
+                if isinstance(reply_msg, dict) and reply_msg.get("sender") == "curator":
+                    ts = str(reply_msg.get("timestamp") or anchor_iso)
+                    return AthenaChatResponse(
+                        reply=str(reply_msg.get("text", "")),
+                        emergency_trigger=False,
+                        emergency_notice=None,
+                        cycle_id=cycle_id,
+                        sprint_day=1,
+                        sprint_number=1,
+                        message_id=f"msg_reused_{cycle_id[:16]}",
+                        created_at=ts,
+                    )
+        return None
+
     def _find_idempotent_turn(self, cycle_id: str, idempotency_key: str) -> Optional[AthenaChatResponse]:
         reports = self.report_repo.list_server_only(
             cycle_id=cycle_id,
@@ -442,6 +534,7 @@ class AthenaChatService:
         created_at: str,
         sprint_day: Optional[int],
         sprint_number: Optional[int] = None,
+        event_type: Optional[str] = None,
         expected_version: Optional[int] = None,
         commit: bool = True,
     ) -> ModelReport:
@@ -463,6 +556,7 @@ class AthenaChatService:
             content={
                 "agent_role": AegisAgentRole.ATHENA_CURATOR.value,
                 "idempotency_key": idempotency_key,
+                "event_type": event_type,
                 "message_id": message_id,
                 "reply": reply,
                 "emergency_trigger": emergency_trigger,

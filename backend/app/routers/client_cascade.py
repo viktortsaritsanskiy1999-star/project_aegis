@@ -7,6 +7,7 @@ from fastapi import (
     Form,
     Header,
     HTTPException,
+    Request,
     Response,
     UploadFile,
     status,
@@ -68,6 +69,7 @@ from app.services.ecg_vision_service import (
     EcgVisionService,
     EcgVisionValidationError,
 )
+from app.services.clinical_automation_service import ClinicalAutomationService
 
 router = APIRouter(prefix="/api/v1/client", tags=["Client Medical Operations"])
 
@@ -584,6 +586,7 @@ def get_client_latest_ecg(
     ),
 )
 async def run_client_primary_consilium(
+    request: Request,
     response: Response,
     cycle: MedicalCycle = Depends(resolve_active_cycle_for_patient),
     db: Session = Depends(get_db),
@@ -597,20 +600,40 @@ async def run_client_primary_consilium(
         gateway=gateway,
         now_provider=now_provider,
     )
+    automation_service = ClinicalAutomationService(
+        db=db,
+        gateway=gateway,
+        now_provider=now_provider,
+    )
+
+    def _enqueue_and_notify_post_primary() -> None:
+        try:
+            automation_service.enqueue_post_primary_init(
+                cycle_id=cycle.cycle_id,
+                patient_id=cycle.patient_id,
+            )
+            worker = getattr(request.app.state, "automation_worker", None)
+            if worker is not None and hasattr(worker, "notify"):
+                worker.notify()
+        except Exception:
+            pass
 
     # 1. Result Recovery Guard: If Primary Consilium is completed, recover existing reports immediately
     if service.is_primary_consilium_completed(cycle.cycle_id):
         recovered = service.recover_completed_response(cycle.cycle_id)
         if recovered is not None:
+            _enqueue_and_notify_post_primary()
             response.headers["X-Aegis-Idempotent-Replay"] = "true"
             return recovered
 
     # 2. Protected Execution under distributed SQLite lease and fencing
     try:
-        return await service.run_primary_consilium(
+        result = await service.run_primary_consilium(
             cycle_id=cycle.cycle_id,
             idempotency_key=idempotency_key,
         )
+        _enqueue_and_notify_post_primary()
+        return result
     except ConsiliumCycleNotFoundError as exc:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
