@@ -232,6 +232,11 @@ class ClientCascadeStatusResponse {
   final String? nextSprintId;
   final int? currentCalendarWeek;
   final int? currentCalendarDay;
+  final bool hasUnansweredRoutineQuestion;
+  final String? activeRoutineQuestionId;
+  final String? activeRoutineQuestionText;
+  final int routineQuestionRemindersCount;
+  final bool canSendRoutineReminder;
 
   const ClientCascadeStatusResponse({
     required this.patientId,
@@ -250,6 +255,11 @@ class ClientCascadeStatusResponse {
     this.nextSprintId,
     this.currentCalendarWeek,
     this.currentCalendarDay,
+    this.hasUnansweredRoutineQuestion = false,
+    this.activeRoutineQuestionId,
+    this.activeRoutineQuestionText,
+    this.routineQuestionRemindersCount = 0,
+    this.canSendRoutineReminder = false,
   });
 
   factory ClientCascadeStatusResponse.fromJson(Map<String, dynamic> json) {
@@ -270,6 +280,11 @@ class ClientCascadeStatusResponse {
       nextSprintId: json['next_sprint_id'] as String?,
       currentCalendarWeek: (json['current_calendar_week'] as num?)?.toInt(),
       currentCalendarDay: (json['current_calendar_day'] as num?)?.toInt(),
+      hasUnansweredRoutineQuestion: json['has_unanswered_routine_question'] == true,
+      activeRoutineQuestionId: json['active_routine_question_id'] as String?,
+      activeRoutineQuestionText: json['active_routine_question_text'] as String?,
+      routineQuestionRemindersCount: (json['routine_question_reminders_count'] as num?)?.toInt() ?? 0,
+      canSendRoutineReminder: json['can_send_routine_reminder'] == true,
     );
   }
 
@@ -290,6 +305,11 @@ class ClientCascadeStatusResponse {
     if (nextSprintId != null) 'next_sprint_id': nextSprintId,
     if (currentCalendarWeek != null) 'current_calendar_week': currentCalendarWeek,
     if (currentCalendarDay != null) 'current_calendar_day': currentCalendarDay,
+    'has_unanswered_routine_question': hasUnansweredRoutineQuestion,
+    if (activeRoutineQuestionId != null) 'active_routine_question_id': activeRoutineQuestionId,
+    if (activeRoutineQuestionText != null) 'active_routine_question_text': activeRoutineQuestionText,
+    'routine_question_reminders_count': routineQuestionRemindersCount,
+    'can_send_routine_reminder': canSendRoutineReminder,
   };
 }
 
@@ -948,6 +968,9 @@ class AthenaChatResponse {
   final int? sprintNumber;
   final String messageId;
   final String createdAt;
+  final String? questionId;
+  final String? routineQuestionStatus;
+  final int? remindersCount;
 
   const AthenaChatResponse({
     required this.reply,
@@ -958,6 +981,9 @@ class AthenaChatResponse {
     this.sprintNumber,
     required this.messageId,
     required this.createdAt,
+    this.questionId,
+    this.routineQuestionStatus,
+    this.remindersCount,
   });
 
   factory AthenaChatResponse.fromJson(Map<String, dynamic> json) {
@@ -970,6 +996,9 @@ class AthenaChatResponse {
       sprintNumber: (json['sprint_number'] as num?)?.toInt(),
       messageId: json['message_id'] as String? ?? '',
       createdAt: json['created_at'] as String? ?? '',
+      questionId: json['question_id'] as String?,
+      routineQuestionStatus: json['routine_question_status'] as String?,
+      remindersCount: (json['reminders_count'] as num?)?.toInt(),
     );
   }
 
@@ -982,6 +1011,9 @@ class AthenaChatResponse {
     if (sprintNumber != null) 'sprint_number': sprintNumber,
     'message_id': messageId,
     'created_at': createdAt,
+    if (questionId != null) 'question_id': questionId,
+    if (routineQuestionStatus != null) 'routine_question_status': routineQuestionStatus,
+    if (remindersCount != null) 'reminders_count': remindersCount,
   };
 }
 

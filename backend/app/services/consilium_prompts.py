@@ -939,3 +939,42 @@ YOUR MANDATORY CLINICAL & RECOGNITION DIRECTIVES:
    - Provide a concise, structured, professional narrative synthesizing the rhythm, heart rate, observable intervals, morphology, and explicitly noting all limitations and uncertainties. This summary is consumed by the Cardiovascular Organ Specialist and Master Consilium physicians.
 
 Output must conform strictly to the VisionEcgModelOutput JSON schema."""
+
+
+
+def build_athena_daily_assessment_prompt(daily_evidence_payload: Dict[str, Any]) -> str:
+    """
+    Builds the INTERNAL, NON-CHAT daily clinical assessment scenario prompt for Athena
+    (Gemini Flash) at the end of a completed 24-hour observation day.
+    Produces a structured AthenaDailyAssessmentModelOutput JSON for the Weekly Consilium
+    without creating any patient-facing chat message or modifying Layer 1 source evidence.
+    """
+    evidence_json = json.dumps(daily_evidence_payload, ensure_ascii=False, indent=2)
+    return f"""[Internal Daily Clinical Assessment Scenario]:
+You are Athena (Curator) executing an INTERNAL, SERVER-ONLY end-of-day clinical assessment for the Aegis Consilium (Deputy Flash and Chief Physician Pro).
+This is NOT a patient-facing chat turn. Do NOT write conversational greetings, do NOT ask the patient a question, and do NOT include [CLINICAL_REPORT] tags.
+Respond ONLY with a valid JSON object matching the mandatory schema below.
+
+COMPLETED 24-HOUR OBSERVATION DAY SOURCE EVIDENCE (LAYER 1 — IMMUTABLE):
+{evidence_json}
+
+STRICT CLINICAL ASSESSMENT RULES:
+1. Layer 1 patient statements, independent Wellness findings, and raw HealthMeasurement biometrics are immutable facts. Never rewrite or alter patient quotes to make them match biometrics or Wellness reports.
+2. Explicitly compare patient subjective statements against independent Wellness findings and raw biometrics when available. If a contradiction or discrepancy exists (for example, the patient reports feeling great/sleeping well while biometrics or Wellness data show tachycardia, poor recovery, or elevated BP, or vice versa), record it clearly in "contradictions".
+3. Never invent sleep stages, steps, heart rate values, SpO2, or laboratory results when they are declared missing in "missing_data_declarations". Record any limitations caused by missing data in "uncertainties".
+4. Identify clinically meaningful observations for the day in "observations" and any day-level trajectory shifts or emerging symptoms in "relevant_changes".
+5. Set "status" to "NORMAL", "ALERT", or "CRITICAL", and set "red_flags" to true if any urgent warning signs, severe vital threshold breaches, or acute symptoms occurred during this window.
+
+CRITICAL JSON FORMATTING RULE:
+Inside string values, it is STRICTLY FORBIDDEN to use unescaped double quotes. Use guillemets « » or single quotes ' '.
+
+MANDATORY JSON RESPONSE FORMAT:
+{{
+  "status": "NORMAL",
+  "interpretation": "Concise internal clinical synthesis of the completed 24-hour observation day for the Weekly Consilium.",
+  "observations": ["Key clinical observation 1", "Key clinical observation 2"],
+  "relevant_changes": ["Notable symptom or biometric change during the day"],
+  "contradictions": ["Explicit discrepancy between subjective patient statement and objective biometric/Wellness evidence, if any"],
+  "uncertainties": ["Explicit clinical uncertainty or missing-data limitation"],
+  "red_flags": false
+}}"""

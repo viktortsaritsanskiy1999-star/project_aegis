@@ -163,6 +163,13 @@ class AthenaTriggerService {
         return false;
       }
 
+      // One Outstanding Routine Question (Stage A2.1):
+      // Do not generate another scheduled routine question while previous routine question is unanswered
+      if (status.hasUnansweredRoutineQuestion) {
+        debugPrint("⏳ [AthenaTriggerService]: Server has unanswered routine question '${status.activeRoutineQuestionId}'. Skipping daily pulse.");
+        return false;
+      }
+
       final int currentSprintDay = vault.getAthenaSprintDay();
 
       // Continuous Accompaniment:

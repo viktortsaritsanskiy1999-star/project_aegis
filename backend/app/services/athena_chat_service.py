@@ -46,7 +46,10 @@ from app.services.weekly_consilium_service import (
 logger = logging.getLogger("aegis.athena_chat")
 
 ATHENA_CHAT_TURN_REPORT_TYPE = "athena_chat_turn"
+ATHENA_ROUTINE_QUESTION_REPORT_TYPE = "athena_routine_question"
 POST_PRIMARY_INIT_IDEMPOTENCY_PREFIX = "athena_init_greeting_"
+DEFAULT_MAX_ROUTINE_REMINDERS = 2
+DEFAULT_REMINDER_COOLDOWN_SECONDS = 0
 
 # Regex for stripping [CLINICAL_REPORT] JSON block
 CLINICAL_REPORT_REGEX = re.compile(r"\[CLINICAL_REPORT\]([\s\S]*?)\[/CLINICAL_REPORT\]", re.IGNORECASE)
@@ -118,16 +121,42 @@ class AthenaChatService:
         gateway: Optional[GeminiGateway] = None,
         now_provider: Optional[Callable[[], datetime]] = None,
         lock_registry: Optional[Dict[str, asyncio.Lock]] = None,
+        reminder_cooldown_seconds: int = DEFAULT_REMINDER_COOLDOWN_SECONDS,
     ):
         self.db = db
         self.gateway = gateway or GeminiGateway()
         self.now_provider = now_provider
         self._lock_registry = lock_registry
+        self.reminder_cooldown_seconds = reminder_cooldown_seconds
         self.cycle_repo = MedicalCycleRepository(db)
         self.report_repo = ModelReportRepository(db)
         self.weekly_service = WeeklyConsiliumService(
             db, gateway=self.gateway, now_provider=now_provider
         )
+
+    def get_latest_routine_question_record(self, cycle_id: str) -> Optional[Dict[str, Any]]:
+        """Retrieves the latest version of the routine question record for the cycle."""
+        reports = self.report_repo.list_server_only(
+            cycle_id=cycle_id,
+            report_type=ATHENA_ROUTINE_QUESTION_REPORT_TYPE,
+        )
+        if not reports:
+            return None
+        return reports[0].content or {}
+
+    def get_active_routine_question(self, cycle_id: str) -> Optional[Dict[str, Any]]:
+        """
+        Returns the active routine question dict if there is currently an unanswered
+        routine question awaiting patient response; otherwise None.
+        """
+        rec = self.get_latest_routine_question_record(cycle_id)
+        if rec and rec.get("status") == "unanswered":
+            return rec
+        return None
+
+    def has_unanswered_routine_question(self, cycle_id: str) -> bool:
+        """Returns True if there is an outstanding unanswered routine question for cycle_id."""
+        return self.get_active_routine_question(cycle_id) is not None
 
     async def handle_turn(
         self,
@@ -170,6 +199,179 @@ class AthenaChatService:
 
             turn_dt = self.weekly_service._now_utc()
             turn_now_iso = turn_dt.isoformat()
+
+            # Handle routine question reminder (Zero Gemini API calls, non-spam bounded)
+            if request.event_type in ("routine_reminder", "reminder"):
+                active_q = self.get_active_routine_question(resolved_cycle_id)
+                if active_q is None:
+                    raise HTTPException(
+                        status_code=status.HTTP_409_CONFLICT,
+                        detail="No unanswered routine question pending reminder.",
+                    )
+                reminders_cnt = int(active_q.get("reminders_count", 0))
+                max_reminders = int(active_q.get("max_reminders", DEFAULT_MAX_ROUTINE_REMINDERS))
+                if reminders_cnt >= max_reminders:
+                    raise HTTPException(
+                        status_code=status.HTTP_409_CONFLICT,
+                        detail=f"Maximum routine question reminders ({max_reminders}) already reached.",
+                    )
+                if self.reminder_cooldown_seconds > 0 and active_q.get("last_reminded_at_utc"):
+                    try:
+                        last_dt = datetime.fromisoformat(str(active_q["last_reminded_at_utc"]))
+                        if (turn_dt - last_dt).total_seconds() < self.reminder_cooldown_seconds:
+                            raise HTTPException(
+                                status_code=status.HTTP_409_CONFLICT,
+                                detail="Routine reminder cooldown in effect. Please try again later.",
+                            )
+                    except (ValueError, TypeError):
+                        pass
+
+                q_text = str(active_q.get("question_text", "")).strip()
+                preview = q_text
+                if len(preview) > 120:
+                    preview = preview[:117] + "..."
+                reminder_reply = (
+                    f"Напоминание от Афины: когда у вас появится свободная минута, пожалуйста, ответьте на предыдущий вопрос"
+                    + (f": «{preview}»" if preview else "")
+                    + ". Это важно для непрерывного медицинского сопровождения и корректировки программы."
+                )
+
+                message_id = f"msg_{uuid.uuid4().hex[:16]}"
+                max_persist_retries = 8
+                new_reminders_count = reminders_cnt + 1
+
+                for persist_attempt in range(max_persist_retries + 1):
+                    if persist_attempt > 0:
+                        self.db.rollback()
+                        self.db.expire_all()
+                        time.sleep(0.015 * persist_attempt)
+                        bind = self.db.get_bind()
+                        if bind is not None and bind.dialect.name == "sqlite":
+                            self.db.execute(sql_text("BEGIN IMMEDIATE"))
+                    elif not self.db.new and not self.db.dirty and not self.db.deleted:
+                        self.db.expire_all()
+
+                    try:
+                        if clean_idem:
+                            existing_turn = self._find_idempotent_turn(resolved_cycle_id, clean_idem)
+                            if existing_turn is not None:
+                                self.db.rollback()
+                                return existing_turn
+
+                        active_sprint_id = self.weekly_service.resolve_active_sprint_id(
+                            resolved_cycle_id,
+                            as_of=turn_dt,
+                            commit=False,
+                        )
+
+                        # Re-verify latest active routine question inside transaction attempt
+                        curr_active_q = self.get_active_routine_question(resolved_cycle_id)
+                        if curr_active_q is None:
+                            self.db.rollback()
+                            raise HTTPException(
+                                status_code=status.HTTP_409_CONFLICT,
+                                detail="No unanswered routine question pending reminder.",
+                            )
+                        curr_cnt = int(curr_active_q.get("reminders_count", 0))
+                        if curr_cnt >= max_reminders:
+                            self.db.rollback()
+                            raise HTTPException(
+                                status_code=status.HTTP_409_CONFLICT,
+                                detail=f"Maximum routine question reminders ({max_reminders}) already reached.",
+                            )
+
+                        new_reminders_count = curr_cnt + 1
+                        updated_q = dict(curr_active_q)
+                        updated_q["reminders_count"] = new_reminders_count
+                        updated_q["last_reminded_at_utc"] = turn_now_iso
+
+                        self.report_repo.create_next_version(
+                            cycle_id=resolved_cycle_id,
+                            sprint_id=active_sprint_id,
+                            model=self.gateway.flash_model,
+                            report_type=ATHENA_ROUTINE_QUESTION_REPORT_TYPE,
+                            privacy_level=PrivacyLevel.SERVER_ONLY,
+                            content=updated_q,
+                            commit=False,
+                        )
+
+                        self.weekly_service.save_athena_chat_message(
+                            cycle_id=resolved_cycle_id,
+                            sender="curator",
+                            text=reminder_reply,
+                            sprint_id=active_sprint_id,
+                            timestamp=turn_now_iso,
+                            commit=False,
+                        )
+
+                        base_turn_ver = self.report_repo.get_latest_version_number(
+                            cycle_id=resolved_cycle_id,
+                            report_type=ATHENA_CHAT_TURN_REPORT_TYPE,
+                            privacy_level=PrivacyLevel.SERVER_ONLY,
+                        )
+
+                        if clean_idem:
+                            self._save_idempotency_turn(
+                                cycle_id=resolved_cycle_id,
+                                sprint_id=active_sprint_id,
+                                idempotency_key=clean_idem,
+                                message_id=message_id,
+                                reply=reminder_reply,
+                                emergency_trigger=False,
+                                emergency_notice=None,
+                                created_at=turn_now_iso,
+                                sprint_day=curr_active_q.get("sprint_day"),
+                                sprint_number=curr_active_q.get("sprint_number"),
+                                event_type=request.event_type,
+                                question_id=curr_active_q.get("question_id"),
+                                routine_question_status="unanswered",
+                                reminders_count=new_reminders_count,
+                                expected_version=base_turn_ver + 1,
+                                commit=False,
+                            )
+
+                        self.db.commit()
+                        break
+                    except (ReportVersionConflictError, IntegrityError, OperationalError) as exc:
+                        self.db.rollback()
+                        if persist_attempt < max_persist_retries:
+                            continue
+                        raise ReportVersionConflictError(
+                            f"Concurrent persistence conflict during Athena reminder for cycle '{resolved_cycle_id}': {exc}"
+                        ) from exc
+                    except BaseException:
+                        self.db.rollback()
+                        raise
+
+                return AthenaChatResponse(
+                    reply=reminder_reply,
+                    emergency_trigger=False,
+                    emergency_notice=None,
+                    cycle_id=resolved_cycle_id,
+                    sprint_day=active_q.get("sprint_day"),
+                    sprint_number=active_q.get("sprint_number"),
+                    message_id=message_id,
+                    created_at=turn_now_iso,
+                    question_id=active_q.get("question_id"),
+                    routine_question_status="unanswered",
+                    reminders_count=new_reminders_count,
+                )
+
+            # Enforce One Outstanding Routine Question:
+            # Cannot trigger a new daily_pulse without a patient reply while previous routine question is unanswered
+            if request.event_type == "daily_pulse":
+                has_patient_reply = bool(request.message and request.message.strip())
+                active_q = self.get_active_routine_question(resolved_cycle_id)
+                if active_q is not None and active_q.get("status") == "unanswered":
+                    if not has_patient_reply:
+                        raise HTTPException(
+                            status_code=status.HTTP_409_CONFLICT,
+                            detail=(
+                                f"Cannot generate new routine question: outstanding routine question "
+                                f"'{active_q.get('question_id')}' for sprint {active_q.get('sprint_number')} "
+                                f"day {active_q.get('sprint_day')} is unanswered."
+                            ),
+                        )
 
             # Server-authoritative calendar schedule resolution & validation
             auth_week, auth_day, _ = self.weekly_service.get_authoritative_calendar_schedule(
@@ -247,6 +449,9 @@ class AthenaChatService:
             clean_reply: str = ""
             emergency_triggered: bool = False
             emergency_notice: Optional[str] = None
+            final_question_id: Optional[str] = None
+            final_routine_status: Optional[str] = None
+            final_reminders_count: Optional[int] = None
 
             for persist_attempt in range(max_persist_retries + 1):
                 if persist_attempt > 0:
@@ -317,6 +522,81 @@ class AthenaChatService:
                         commit=False,
                     )
 
+                    # 10. Update / Record routine question state
+                    turn_question_id: Optional[str] = None
+                    turn_routine_status: Optional[str] = None
+                    turn_reminders_count: Optional[int] = None
+
+                    # 10. Update / Record routine question state
+                    turn_question_id: Optional[str] = None
+                    turn_routine_status: Optional[str] = None
+                    turn_reminders_count: Optional[int] = None
+
+                    has_patient_reply = bool(request.message and request.message.strip())
+
+                    # If this turn contains a patient reply, mark previous outstanding question as answered
+                    if request.event_type in ("routine_answer", "user_message") or (
+                        request.event_type == "daily_pulse" and has_patient_reply
+                    ):
+                        prev_active_q = self.get_active_routine_question(resolved_cycle_id)
+                        if prev_active_q is not None and prev_active_q.get("status") == "unanswered":
+                            turn_question_id = prev_active_q.get("question_id")
+                            turn_routine_status = "answered"
+                            turn_reminders_count = prev_active_q.get("reminders_count", 0)
+                            updated_q = dict(prev_active_q)
+                            updated_q["status"] = "answered"
+                            updated_q["answered_at_utc"] = turn_now_iso
+                            updated_q["answer_text"] = user_record_text
+                            updated_q["answer_message_id"] = message_id
+                            self.report_repo.create_next_version(
+                                cycle_id=resolved_cycle_id,
+                                sprint_id=active_sprint_id,
+                                model=self.gateway.flash_model,
+                                report_type=ATHENA_ROUTINE_QUESTION_REPORT_TYPE,
+                                privacy_level=PrivacyLevel.SERVER_ONLY,
+                                content=updated_q,
+                                commit=False,
+                            )
+
+                    # If this turn formulates a new routine question, record it as unanswered
+                    if request.event_type in ("initial_greeting", "daily_pulse"):
+                        turn_question_id = f"rq_{resolved_cycle_id}_s{effective_sprint_number or 1}_d{effective_sprint_day or 1}_{uuid.uuid4().hex[:8]}"
+                        turn_routine_status = "unanswered"
+                        turn_reminders_count = 0
+                        new_routine_q = {
+                            "question_id": turn_question_id,
+                            "cycle_id": resolved_cycle_id,
+                            "patient_id": clean_patient_id,
+                            "sprint_number": effective_sprint_number or 1,
+                            "sprint_day": effective_sprint_day or 1,
+                            "status": "unanswered",
+                            "question_text": clean_reply,
+                            "message_id": message_id,
+                            "asked_at_utc": turn_now_iso,
+                            "reminders_count": 0,
+                            "max_reminders": DEFAULT_MAX_ROUTINE_REMINDERS,
+                            "last_reminded_at_utc": None,
+                            "answered_at_utc": None,
+                            "answer_text": None,
+                            "answer_message_id": None,
+                        }
+                        self.report_repo.create_next_version(
+                            cycle_id=resolved_cycle_id,
+                            sprint_id=active_sprint_id,
+                            model=self.gateway.flash_model,
+                            report_type=ATHENA_ROUTINE_QUESTION_REPORT_TYPE,
+                            privacy_level=PrivacyLevel.SERVER_ONLY,
+                            content=new_routine_q,
+                            commit=False,
+                        )
+                    elif request.event_type not in ("routine_answer", "user_message"):
+                        # vitals_alert, wearable_event, out_of_turn_message
+                        active_q = self.get_active_routine_question(resolved_cycle_id)
+                        if active_q is not None and active_q.get("status") == "unanswered":
+                            turn_question_id = active_q.get("question_id")
+                            turn_routine_status = "unanswered"
+                            turn_reminders_count = active_q.get("reminders_count", 0)
+
                     # Record schedule anchor if this turn is the first confirmed clinical message/question AFTER Primary Consilium
                     from app.services.primary_consilium_service import PrimaryConsiliumService
 
@@ -336,7 +616,7 @@ class AthenaChatService:
                                 commit=False,
                             )
 
-                    # 10. Flush Idempotency Turn Record
+                    # 11. Flush Idempotency Turn Record
                     effective_idem = clean_idem
                     if (
                         effective_idem is None
@@ -358,9 +638,16 @@ class AthenaChatService:
                             sprint_day=effective_sprint_day,
                             sprint_number=effective_sprint_number,
                             event_type=request.event_type,
+                            question_id=turn_question_id,
+                            routine_question_status=turn_routine_status,
+                            reminders_count=turn_reminders_count,
                             expected_version=base_turn_ver + 1,
                             commit=False,
                         )
+
+                    final_question_id = turn_question_id
+                    final_routine_status = turn_routine_status
+                    final_reminders_count = turn_reminders_count
 
                     # Single atomic commit for all artifacts of the turn
                     self.db.commit()
@@ -387,6 +674,9 @@ class AthenaChatService:
                 sprint_number=effective_sprint_number,
                 message_id=message_id,
                 created_at=turn_now_iso,
+                question_id=final_question_id,
+                routine_question_status=final_routine_status,
+                reminders_count=final_reminders_count,
             )
 
     def get_sanitized_history(
@@ -475,6 +765,9 @@ class AthenaChatService:
                     sprint_number=content.get("sprint_number"),
                     message_id=str(content.get("message_id", r.report_id)),
                     created_at=created_at_str or r.created_at.isoformat(),
+                    question_id=content.get("question_id"),
+                    routine_question_status=content.get("routine_question_status", "unanswered"),
+                    reminders_count=content.get("reminders_count", 0),
                 )
 
         # Fallback if an initial_greeting after Primary was saved in chat history without a turn report
@@ -518,6 +811,9 @@ class AthenaChatService:
                     sprint_number=content.get("sprint_number"),
                     message_id=str(content.get("message_id", r.report_id)),
                     created_at=str(content.get("created_at", r.created_at.isoformat())),
+                    question_id=content.get("question_id"),
+                    routine_question_status=content.get("routine_question_status"),
+                    reminders_count=content.get("reminders_count"),
                 )
         return None
 
@@ -535,6 +831,9 @@ class AthenaChatService:
         sprint_day: Optional[int],
         sprint_number: Optional[int] = None,
         event_type: Optional[str] = None,
+        question_id: Optional[str] = None,
+        routine_question_status: Optional[str] = None,
+        reminders_count: Optional[int] = None,
         expected_version: Optional[int] = None,
         commit: bool = True,
     ) -> ModelReport:
@@ -564,6 +863,9 @@ class AthenaChatService:
                 "created_at": created_at,
                 "sprint_day": sprint_day,
                 "sprint_number": sprint_number,
+                "question_id": question_id,
+                "routine_question_status": routine_question_status,
+                "reminders_count": reminders_count,
             },
             expected_version=resolved_expected_ver,
             commit=commit,
@@ -576,7 +878,7 @@ class AthenaChatService:
         - Critical pulse spike (>= 150 bpm or <= 40 bpm at rest)
         - Explicit acute medical symptoms in message text
         """
-        if request.event_type == "vitals_alert" and request.vitals_alert is not None:
+        if request.event_type in ("vitals_alert", "wearable_event") and request.vitals_alert is not None:
             va = request.vitals_alert
             # Heart rate spike >= 150 bpm or severe bradycardia <= 40 bpm
             if va.current_pulse >= 150 or va.current_pulse <= 40:
@@ -829,6 +1131,86 @@ YOUR INSTRUCTION (MODE 2: ATTENTION AND SUPPORT):
 """
             user_record = f"[Vitals Alert]: Heart rate peak {va.current_pulse} bpm (baseline {va.baseline_pulse} bpm)"
             return prompt, user_record
+
+        if event_type == "wearable_event":
+            if request.vitals_alert is not None:
+                va = request.vitals_alert
+                prompt = f"""Service pulse: Wearable biometric alert (peak pulse {va.current_pulse} bpm, baseline {va.baseline_pulse} bpm).{f' Additional notes: {va.notes}' if va.notes else ''}
+
+YOUR INSTRUCTION (MODE 2: WEARABLE ALERT EVALUATION):
+1. THE "GOODBYE UNTIL TOMORROW" RULE IS STRICTLY CANCELED!
+2. Speak warmly and calmly. Ask what happened, ask them to sit down, unbutton their collar, and breathe.
+3. Filter out "red flags" (chest pain, shortness of breath, lack of air, darkening in the eyes).
+4. Formulate [CLINICAL_REPORT] with "ALERT" (or "CRITICAL") status, specifying "red_flags" and a summary for the Chief Physician.
+5. If the condition is critical, add strictly at the very end on a new line: [EMERGENCY_TRIGGER].
+"""
+                user_record = f"[Wearable Event]: Heart rate peak {va.current_pulse} bpm (baseline {va.baseline_pulse} bpm)"
+                return prompt, user_record
+            else:
+                msg = (request.message or "Smartwatch biometric event").strip()
+                prompt = f"""Service pulse: Wearable biometric event recorded: "{msg}"
+
+YOUR INSTRUCTION (MODE 2: WEARABLE EVENT EVALUATION):
+1. Speak calmly and empathetically.
+2. Evaluate reported biometric indicators and ask about current symptoms.
+3. Formulate [CLINICAL_REPORT] with "ALERT" or "NORMAL" status.
+4. If acute danger or critical symptoms are reported, add strictly at the very end on a new line: [EMERGENCY_TRIGGER].
+"""
+                user_record = f"[Wearable Event]: {msg}"
+                return prompt, user_record
+
+        if event_type == "out_of_turn_message":
+            msg = (request.message or "").strip()
+            if not msg:
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail="message must be provided and non-empty when event_type is 'out_of_turn_message'.",
+                )
+            prompt = f"""User sent an out-of-turn inquiry / note: "{msg}"
+
+YOUR INSTRUCTION:
+1. Address the patient's specific question or statement directly, warmly, and empathetically.
+2. Note that this is an out-of-turn inquiry, separate from routine daily check-in questions.
+3. If the user reported POOR WELL-BEING (pain, weakness, nausea, anxiety):
+   - DO NOT SAY GOODBYE! Activate Mode 2 (Force Majeure).
+   - Ask about symptoms, reassure, help ground.
+   - Fill in [CLINICAL_REPORT] with "ALERT" or "CRITICAL" status and detail "symptoms_mentioned" and "red_flags".
+   - In case of a real life-threatening situation, add strictly at the very end on a new line: [EMERGENCY_TRIGGER].
+4. Otherwise, fill in [CLINICAL_REPORT] with "NORMAL" status and answer the patient's inquiry supportively.
+"""
+            user_record = f"[Out-of-turn]: {msg}"
+            return prompt, user_record
+
+        if event_type == "routine_answer":
+            msg = (request.message or "").strip()
+            if not msg:
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail="message must be provided and non-empty when event_type is 'routine_answer'.",
+                )
+            s_day = effective_sprint_day or request.sprint_day or 1
+            is_sprint_end = (s_day == 7)
+            teaser_phrase = (
+                '- SINCE TODAY IS DAY 7 OF THE SPRINT: At the very end of the response on a new line, '
+                'add a natural teaser phrase: "By the way, wait a minute, let me show you how you spent this week!"\n'
+                if is_sprint_end else ''
+            )
+            prompt = f"""User replied to routine question: "{msg}"
+
+YOUR INSTRUCTION:
+1. If the response is ordinary and routine:
+   - Briefly comment on the response with empathy.
+   - Confirm data recording.
+   - Say goodbye until tomorrow.
+   {teaser_phrase}   - Fill in [CLINICAL_REPORT] with "NORMAL" or "ALERT" status (depending on plan adherence).
+
+2. If the user reported POOR WELL-BEING (pain, weakness, nausea, anxiety):
+   - DO NOT SAY GOODBYE! Activate Mode 2 (Force Majeure).
+   - Ask about symptoms, reassure, help ground.
+   - Fill in [CLINICAL_REPORT] with "ALERT" or "CRITICAL" status and detail "symptoms_mentioned" and "red_flags".
+   - In case of a real life-threatening situation, add strictly at the very end on a new line: [EMERGENCY_TRIGGER].
+"""
+            return prompt, msg
 
         if event_type == "daily_pulse":
             s_day = effective_sprint_day or request.sprint_day or 1

@@ -3,6 +3,7 @@ from datetime import datetime, timedelta, timezone
 from enum import Enum
 import hashlib
 import logging
+import re
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 import uuid
 
@@ -25,6 +26,7 @@ from app.services.athena_chat_service import (
     AthenaChatService,
     POST_PRIMARY_INIT_IDEMPOTENCY_PREFIX,
 )
+from app.services.athena_daily_journal_service import AthenaDailyJournalService
 from app.services.gemini_gateway import GeminiGateway, GeminiGatewayError
 from app.services.primary_consilium_service import (
     PrimaryConsiliumService,
@@ -50,14 +52,16 @@ DEFAULT_WORKER_POLL_INTERVAL_SECONDS: float = 30.0
 
 class AutomationJobType(str, Enum):
     """
-    Stage A1 durable automation job types.
+    Stage A1/A2 durable automation job types.
     NOTE:
     - First Primary Consilium is strictly MANUAL (triggered by the patient via Flutter)
       and is NEVER scheduled as an automatic intake job.
     - Athena does NOT generate 24-hour timer questions without patient replies.
-    - Stage A1 implements only `post_primary_init` (post-Primary Athena initial greeting & T0 anchor).
+    - `post_primary_init`: post-Primary Athena initial greeting & T0 anchor.
+    - `daily_journal_closure`: evidence-preserving daily journal closure + internal Gemini Flash assessment (Stage A2.2).
     """
     POST_PRIMARY_INIT = "post_primary_init"
+    DAILY_JOURNAL_CLOSURE = "daily_journal_closure"
 
 
 class AutomationJobStatus(str, Enum):
@@ -95,7 +99,7 @@ class AutomationJobRecord(BaseModel):
 
 class ClinicalAutomationService:
     """
-    Durable SQLite-backed automation coordinator (Stage A1).
+    Durable SQLite-backed automation coordinator (Stage A1/A2).
     Invariants:
     1. First Primary Consilium is NEVER auto-started after intake; it remains strictly manual.
     2. Athena NEVER generates unconditional 24-hour daily questions without a patient reply.
@@ -116,6 +120,7 @@ class ClinicalAutomationService:
         lease_heartbeat_interval_seconds: float = DEFAULT_JOB_HEARTBEAT_SECONDS,
         base_backoff_seconds: int = DEFAULT_BASE_BACKOFF_SECONDS,
         max_backoff_seconds: int = DEFAULT_MAX_BACKOFF_SECONDS,
+        enable_daily_journal: bool = False,
     ):
         self.db = db
         self.gateway = gateway or GeminiGateway()
@@ -124,6 +129,7 @@ class ClinicalAutomationService:
         self.lease_heartbeat_interval_seconds = max(0.001, float(lease_heartbeat_interval_seconds))
         self.base_backoff_seconds = max(1, int(base_backoff_seconds))
         self.max_backoff_seconds = max(self.base_backoff_seconds, int(max_backoff_seconds))
+        self.enable_daily_journal = enable_daily_journal
 
         self.cycle_repo = MedicalCycleRepository(db)
         self.report_repo = ModelReportRepository(db)
@@ -135,6 +141,9 @@ class ClinicalAutomationService:
         )
         self.athena_service = AthenaChatService(
             db=db, gateway=self.gateway, now_provider=self.now_provider
+        )
+        self.journal_service = AthenaDailyJournalService(
+            db=db, now_provider=self.now_provider, gateway=self.gateway
         )
 
     def _now_utc(self) -> datetime:
@@ -181,6 +190,8 @@ class ClinicalAutomationService:
         )
         if resolved_type == AutomationJobType.POST_PRIMARY_INIT:
             return f"{POST_PRIMARY_INIT_IDEMPOTENCY_PREFIX}{clean_cycle}"
+        if resolved_type == AutomationJobType.DAILY_JOURNAL_CLOSURE:
+            return f"athena_daily_journal_{clean_cycle}_w1_d1"
         return f"auto_{resolved_type.value}_{clean_cycle}"
 
     @staticmethod
@@ -221,8 +232,8 @@ class ClinicalAutomationService:
             )
         except ValueError as exc:
             raise ValueError(
-                f"Unsupported Stage A1 automation job_type '{job_type}'. "
-                "First Primary Consilium is manual; only 'post_primary_init' is allowed in A1."
+                f"Unsupported automation job_type '{job_type}'. "
+                "First Primary Consilium is manual; only 'post_primary_init' and 'daily_journal_closure' are allowed."
             ) from exc
 
         cycle = self.cycle_repo.get(clean_cycle)
@@ -238,6 +249,17 @@ class ClinicalAutomationService:
                 raise ConsiliumContextMissingError(
                     f"Cannot enqueue post-Primary initialization for cycle '{clean_cycle}': "
                     "manual Primary Consilium has not been completed yet."
+                )
+        elif resolved_type == AutomationJobType.DAILY_JOURNAL_CLOSURE:
+            if not self.primary_service.is_primary_consilium_completed(clean_cycle):
+                raise ConsiliumContextMissingError(
+                    f"Cannot enqueue daily journal closure for cycle '{clean_cycle}': "
+                    "manual Primary Consilium has not been completed yet."
+                )
+            if self.weekly_service.find_schedule_anchor_timestamp(clean_cycle) is None:
+                raise ConsiliumContextMissingError(
+                    f"Cannot enqueue daily journal closure for cycle '{clean_cycle}': "
+                    "schedule anchor T0 has not been established yet."
                 )
 
         clean_idem = (
@@ -347,6 +369,42 @@ class ClinicalAutomationService:
             max_attempts=max_attempts,
         )
 
+    def enqueue_daily_journal_closure(
+        self,
+        *,
+        cycle_id: str,
+        patient_id: Optional[str] = None,
+        calendar_week: int,
+        calendar_day: int,
+        max_attempts: int = DEFAULT_JOB_MAX_ATTEMPTS,
+    ) -> Optional[AutomationJobRecord]:
+        """
+        Enqueues daily journal closure for a completed observation day.
+        Requires manual Primary Consilium completed and anchor T0 established.
+        """
+        clean_cycle = (cycle_id or "").strip()
+        if not clean_cycle:
+            return None
+        cycle = self.cycle_repo.get(clean_cycle)
+        if cycle is None:
+            return None
+        effective_patient_id = (patient_id or cycle.patient_id or "").strip()
+        if not effective_patient_id:
+            return None
+        if not self.primary_service.is_primary_consilium_completed(clean_cycle):
+            return None
+        if self.weekly_service.find_schedule_anchor_timestamp(clean_cycle) is None:
+            return None
+
+        idempotency_key = f"athena_daily_journal_{clean_cycle}_w{calendar_week}_d{calendar_day}"
+        return self.enqueue_or_get_job(
+            patient_id=effective_patient_id,
+            cycle_id=clean_cycle,
+            job_type=AutomationJobType.DAILY_JOURNAL_CLOSURE,
+            idempotency_key=idempotency_key,
+            max_attempts=max_attempts,
+        )
+
     def get_job_by_id(self, job_id: str) -> Optional[AutomationJobRecord]:
         row = (
             self.db.query(ModelReport)
@@ -416,14 +474,23 @@ class ClinicalAutomationService:
         records.sort(key=lambda r: (r.created_at_utc, r.job_id))
         return records
 
-    def discover_and_enqueue_jobs(self) -> List[AutomationJobRecord]:
+    def discover_and_enqueue_jobs(
+        self, *, discover_daily_journals: Optional[bool] = None
+    ) -> List[AutomationJobRecord]:
         """
         Durable job discovery across server restarts:
         Scans active medical cycles associated with a patient.
         - NEVER enqueues or runs first Primary Consilium (which is strictly manual).
         - If manual Primary Consilium has completed for an active cycle, ensures the
           `post_primary_init` job is durably registered in SQLite.
+        - If daily journals are enabled, discovers completed daily observation windows
+          and enqueues `daily_journal_closure` jobs.
         """
+        should_discover_dj = (
+            discover_daily_journals
+            if discover_daily_journals is not None
+            else self.enable_daily_journal
+        )
         active_cycles = (
             self.db.query(MedicalCycle)
             .filter(MedicalCycle.status == "active")
@@ -444,6 +511,33 @@ class ClinicalAutomationService:
             )
             if job is not None:
                 discovered.append(job)
+
+            # Discover completed observation days requiring daily journal closure
+            if should_discover_dj:
+                anchor_dt = self.weekly_service.find_schedule_anchor_timestamp(cycle.cycle_id)
+                if anchor_dt is not None:
+                    completed_windows = self.journal_service.get_completed_daily_windows(
+                        cycle.cycle_id, as_of=self._now_utc()
+                    )
+                    for w, d, _, _ in completed_windows:
+                        existing_journal = self.journal_service.get_daily_journal(
+                            cycle.cycle_id, w, d
+                        )
+                        needs_closure = existing_journal is None or (
+                            not existing_journal.athena_clinical_assessment.is_available
+                            and self.journal_service.has_substantive_daily_evidence(
+                                existing_journal
+                            )
+                        )
+                        if needs_closure:
+                            dj_job = self.enqueue_daily_journal_closure(
+                                cycle_id=cycle.cycle_id,
+                                patient_id=cycle.patient_id,
+                                calendar_week=w,
+                                calendar_day=d,
+                            )
+                            if dj_job is not None:
+                                discovered.append(dj_job)
         return discovered
 
     # ==========================================================================
@@ -846,7 +940,7 @@ class ClinicalAutomationService:
         return result
 
     # ==========================================================================
-    # STAGE A1 WORKFLOW EXECUTION: POST-PRIMARY INITIALIZATION
+    # STAGE A1/A2 WORKFLOW EXECUTION
     # ==========================================================================
 
     @staticmethod
@@ -930,6 +1024,60 @@ class ClinicalAutomationService:
             ),
         }
 
+    async def _execute_daily_journal_closure(
+        self, job: AutomationJobRecord
+    ) -> Dict[str, Any]:
+        """
+        Executes Stage A2.2 daily journal closure (`daily_journal_closure`):
+        1. Verifies patient/cycle ownership, Primary completion, and anchor T0 existence.
+        2. Parses calendar_week and calendar_day from idempotency_key.
+        3. Persists Layer 1 evidence independently of AI assessment.
+        4. When substantive evidence exists, executes one internal non-chat Gemini Flash
+           clinical assessment scenario and attaches it as Section D.
+        5. When no substantive evidence exists, persists a missing-data journal with
+           ZERO Gemini calls.
+        """
+        cycle = self.cycle_repo.get(job.cycle_id)
+        if cycle is None or cycle.patient_id != job.patient_id:
+            raise ConsiliumCycleNotFoundError(
+                f"Active cycle '{job.cycle_id}' not found for patient '{job.patient_id}'."
+            )
+
+        if not self.primary_service.is_primary_consilium_completed(job.cycle_id):
+            raise ConsiliumContextMissingError(
+                f"Cannot execute daily journal closure for cycle '{job.cycle_id}': "
+                "manual Primary Consilium is not completed."
+            )
+
+        if self.weekly_service.find_schedule_anchor_timestamp(job.cycle_id) is None:
+            raise ConsiliumContextMissingError(
+                f"Cannot execute daily journal closure for cycle '{job.cycle_id}': "
+                "schedule anchor T0 has not been established yet."
+            )
+
+        m = re.search(r'_w(\d+)_d(\d+)$', job.idempotency_key)
+        if not m:
+            raise ValueError(
+                f"Invalid daily journal idempotency key format '{job.idempotency_key}'."
+            )
+        cal_week = int(m.group(1))
+        cal_day = int(m.group(2))
+
+        journal_rec, saved_row, reused = await self.journal_service.close_daily_journal(
+            cycle_id=job.cycle_id,
+            calendar_week=cal_week,
+            calendar_day=cal_day,
+            as_of=self._now_utc(),
+        )
+        return {
+            "reused_existing": reused,
+            "journal_id": journal_rec.journal_id,
+            "calendar_week": cal_week,
+            "calendar_day": cal_day,
+            "report_id": saved_row.report_id,
+            "assessment_available": journal_rec.athena_clinical_assessment.is_available,
+        }
+
     async def execute_claimed_job(self, claimed: AutomationJobRecord) -> AutomationJobRecord:
         if not claimed.lease_owner_id:
             raise ConsiliumConcurrencyConflictError(
@@ -943,6 +1091,12 @@ class ClinicalAutomationService:
                     claimed.job_id,
                     lease_owner_id,
                     lambda: self._execute_post_primary_init(claimed),
+                )
+            elif claimed.job_type == AutomationJobType.DAILY_JOURNAL_CLOSURE:
+                result_meta = await self._execute_with_job_lease_renewal(
+                    claimed.job_id,
+                    lease_owner_id,
+                    lambda: self._execute_daily_journal_closure(claimed),
                 )
             else:
                 raise ValueError(f"Unsupported automation job_type '{claimed.job_type}'.")
@@ -968,6 +1122,7 @@ class ClinicalAutomationService:
         self,
         *,
         discover: bool = True,
+        discover_daily_journals: Optional[bool] = None,
         limit: int = 20,
     ) -> List[AutomationJobRecord]:
         """
@@ -975,7 +1130,7 @@ class ClinicalAutomationService:
         claims due jobs atomically, and executes them.
         """
         if discover:
-            self.discover_and_enqueue_jobs()
+            self.discover_and_enqueue_jobs(discover_daily_journals=discover_daily_journals)
 
         now_dt = self._now_utc()
         candidates = [
@@ -1010,6 +1165,7 @@ class ClinicalAutomationWorker:
         lease_heartbeat_interval_seconds: float = DEFAULT_JOB_HEARTBEAT_SECONDS,
         base_backoff_seconds: int = DEFAULT_BASE_BACKOFF_SECONDS,
         max_backoff_seconds: int = DEFAULT_MAX_BACKOFF_SECONDS,
+        enable_daily_journal: bool = False,
     ):
         self.session_factory = session_factory
         self.gateway_factory = gateway_factory or GeminiGateway
@@ -1019,6 +1175,7 @@ class ClinicalAutomationWorker:
         self.lease_heartbeat_interval_seconds = lease_heartbeat_interval_seconds
         self.base_backoff_seconds = base_backoff_seconds
         self.max_backoff_seconds = max_backoff_seconds
+        self.enable_daily_journal = enable_daily_journal
 
         self._wake_event: Optional[asyncio.Event] = None
         self._stop_event: Optional[asyncio.Event] = None
@@ -1033,7 +1190,13 @@ class ClinicalAutomationWorker:
         if self._wake_event is not None:
             self._wake_event.set()
 
-    async def run_once(self, *, discover: bool = True, limit: int = 20) -> List[AutomationJobRecord]:
+    async def run_once(
+        self,
+        *,
+        discover: bool = True,
+        discover_daily_journals: Optional[bool] = None,
+        limit: int = 20,
+    ) -> List[AutomationJobRecord]:
         """Executes a single deterministic polling and execution tick."""
         with self.session_factory() as db:
             service = ClinicalAutomationService(
@@ -1044,8 +1207,13 @@ class ClinicalAutomationWorker:
                 lease_heartbeat_interval_seconds=self.lease_heartbeat_interval_seconds,
                 base_backoff_seconds=self.base_backoff_seconds,
                 max_backoff_seconds=self.max_backoff_seconds,
+                enable_daily_journal=self.enable_daily_journal,
             )
-            return await service.process_due_jobs(discover=discover, limit=limit)
+            return await service.process_due_jobs(
+                discover=discover,
+                discover_daily_journals=discover_daily_journals,
+                limit=limit,
+            )
 
     async def _run_loop(self) -> None:
         assert self._wake_event is not None

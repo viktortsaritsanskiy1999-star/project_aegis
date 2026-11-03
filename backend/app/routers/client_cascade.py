@@ -70,6 +70,7 @@ from app.services.ecg_vision_service import (
     EcgVisionValidationError,
 )
 from app.services.clinical_automation_service import ClinicalAutomationService
+from app.services.athena_chat_service import AthenaChatService
 
 router = APIRouter(prefix="/api/v1/client", tags=["Client Medical Operations"])
 
@@ -142,6 +143,11 @@ class ClientCascadeStatusResponse(BaseModel):
     next_sprint_id: Optional[str] = None
     current_calendar_week: Optional[int] = None
     current_calendar_day: Optional[int] = None
+    has_unanswered_routine_question: bool = False
+    active_routine_question_id: Optional[str] = None
+    active_routine_question_text: Optional[str] = None
+    routine_question_reminders_count: int = 0
+    can_send_routine_reminder: bool = False
 
 
 class ClientWeeklyConsiliumRunRequest(BaseModel):
@@ -310,6 +316,15 @@ def get_client_cascade_status(
 
     weekly_state = weekly_service.get_weekly_sprint_lifecycle_state(cycle_id)
 
+    athena_service = AthenaChatService(db=db, gateway=gateway, now_provider=now_provider)
+    active_q = athena_service.get_active_routine_question(cycle_id)
+    has_unanswered_q = active_q is not None and active_q.get("status") == "unanswered"
+    active_q_id = active_q.get("question_id") if has_unanswered_q else None
+    active_q_text = active_q.get("question_text") if has_unanswered_q else None
+    reminders_cnt = int(active_q.get("reminders_count", 0)) if has_unanswered_q else 0
+    max_reminders = int(active_q.get("max_reminders", 2)) if has_unanswered_q else 2
+    can_remind = has_unanswered_q and (reminders_cnt < max_reminders)
+
     return ClientCascadeStatusResponse(
         patient_id=session.patient_id,
         device_id=session.device_id,
@@ -327,6 +342,11 @@ def get_client_cascade_status(
         next_sprint_id=weekly_state.next_sprint_id,
         current_calendar_week=weekly_state.current_calendar_week,
         current_calendar_day=weekly_state.current_calendar_day,
+        has_unanswered_routine_question=has_unanswered_q,
+        active_routine_question_id=active_q_id,
+        active_routine_question_text=active_q_text,
+        routine_question_reminders_count=reminders_cnt,
+        can_send_routine_reminder=can_remind,
     )
 
 
