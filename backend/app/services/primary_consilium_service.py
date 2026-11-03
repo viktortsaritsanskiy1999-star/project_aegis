@@ -195,9 +195,15 @@ class PrimaryConsiliumService:
             stale_expires_iso = coord_content.get("expires_at_utc")
             expires_dt = self._parse_iso_utc(stale_expires_iso)
             if expires_dt is not None and expires_dt <= now_dt and stale_owner_id and stale_expires_iso:
+                all_cycle_lock_ids = [
+                    coord_id,
+                    lock_id,
+                    f"lock_weekly_{cycle_id}"[:64],
+                    f"lock_lab_rev_{cycle_id}"[:64],
+                ]
                 stmt = (
                     delete(ModelReport)
-                    .where(ModelReport.report_id.in_([coord_id, lock_id]))
+                    .where(ModelReport.report_id.in_(all_cycle_lock_ids))
                     .where(ModelReport.content["lease_owner_id"].as_string() == stale_owner_id)
                     .where(ModelReport.content["expires_at_utc"].as_string() == stale_expires_iso)
                 )
@@ -261,7 +267,12 @@ class PrimaryConsiliumService:
         if active_lock is not None:
             lock_content = active_lock.content or {}
             consilium_type = lock_content.get("consilium_type", "primary")
-            prefix = "Primary Consilium" if consilium_type == "primary" else "Weekly Consilium"
+            if consilium_type == "primary":
+                prefix = "Primary Consilium"
+            elif consilium_type == "lab_revision":
+                prefix = "Lab-Revision Consilium"
+            else:
+                prefix = "Weekly Consilium"
             raise ConsiliumConcurrencyConflictError(
                 f"{prefix} for cycle '{cycle_id}' is currently in progress "
                 f"(lease active until {lock_content.get('expires_at_utc')})."

@@ -1,17 +1,24 @@
 from datetime import datetime, timezone
 import asyncio
 import threading
+import time
 import json
 import logging
 import re
 from typing import Any, Callable, Dict, List, Optional, Tuple
 import uuid
+import weakref
 from fastapi import HTTPException, status
+from sqlalchemy import text as sql_text
+from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.orm import Session
 
 from app.models.model_report import ModelReport
 from app.repositories.cycle_repository import MedicalCycleRepository
-from app.repositories.report_repository import ModelReportRepository
+from app.repositories.report_repository import (
+    ModelReportRepository,
+    ReportVersionConflictError,
+)
 from app.schemas.chat import (
     AthenaChatRequest,
     AthenaChatResponse,
@@ -79,24 +86,42 @@ class AthenaChatService:
     6. Guarantees idempotent message submission with zero duplicate AI calls or messages on retry.
     """
     _cycle_locks: Dict[str, asyncio.Lock] = {}
+    _loop_cycle_locks: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, Dict[str, asyncio.Lock]]" = (
+        weakref.WeakKeyDictionary()
+    )
     _locks_guard: threading.Lock = threading.Lock()
 
-    @classmethod
-    def _get_cycle_lock(cls, cycle_id: str) -> asyncio.Lock:
-        with cls._locks_guard:
-            if cycle_id not in cls._cycle_locks:
-                cls._cycle_locks[cycle_id] = asyncio.Lock()
-            return cls._cycle_locks[cycle_id]
+    def _get_cycle_lock(self, cycle_id: str) -> asyncio.Lock:
+        with self._locks_guard:
+            if self._lock_registry is not None:
+                if cycle_id not in self._lock_registry:
+                    self._lock_registry[cycle_id] = asyncio.Lock()
+                return self._lock_registry[cycle_id]
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                if cycle_id not in self._cycle_locks:
+                    self._cycle_locks[cycle_id] = asyncio.Lock()
+                return self._cycle_locks[cycle_id]
+            loop_locks = self._loop_cycle_locks.get(loop)
+            if loop_locks is None:
+                loop_locks = {}
+                self._loop_cycle_locks[loop] = loop_locks
+            if cycle_id not in loop_locks:
+                loop_locks[cycle_id] = asyncio.Lock()
+            return loop_locks[cycle_id]
 
     def __init__(
         self,
         db: Session,
         gateway: Optional[GeminiGateway] = None,
         now_provider: Optional[Callable[[], datetime]] = None,
+        lock_registry: Optional[Dict[str, asyncio.Lock]] = None,
     ):
         self.db = db
         self.gateway = gateway or GeminiGateway()
         self.now_provider = now_provider
+        self._lock_registry = lock_registry
         self.cycle_repo = MedicalCycleRepository(db)
         self.report_repo = ModelReportRepository(db)
         self.weekly_service = WeeklyConsiliumService(
@@ -127,8 +152,12 @@ class AthenaChatService:
 
         async with self._get_cycle_lock(resolved_cycle_id):
             # 2. Idempotency Check: if client submitted an idempotency_key, check for existing turn
-            if request.idempotency_key and request.idempotency_key.strip():
-                clean_idem = request.idempotency_key.strip()
+            clean_idem: Optional[str] = (
+                request.idempotency_key.strip()
+                if (request.idempotency_key and request.idempotency_key.strip())
+                else None
+            )
+            if clean_idem:
                 existing_turn = self._find_idempotent_turn(resolved_cycle_id, clean_idem)
                 if existing_turn is not None:
                     return existing_turn
@@ -190,10 +219,6 @@ class AthenaChatService:
                 resolved_cycle_id, as_of=turn_dt
             )
 
-            active_sprint_id = self.weekly_service.resolve_active_sprint_id(
-                resolved_cycle_id, as_of=turn_dt
-            )
-
             # 5. Formulate Prompt & Clean Record Text based on event_type
             prompt_text, user_record_text = self._build_turn_prompt_and_record(
                 request,
@@ -210,66 +235,127 @@ class AthenaChatService:
                 pre_emergency=pre_emergency,
             )
 
-            # 8. Post-Processing: Extract Structured Signals & Sanitize Reply
-            clean_reply, emergency_triggered, emergency_notice = self._process_and_persist_reports(
-                cycle_id=resolved_cycle_id,
-                sprint_id=active_sprint_id,
-                raw_response=raw_response,
-                pre_emergency=pre_emergency,
-                pre_emergency_notice=pre_emergency_notice,
-                used_emergency_fallback=used_emergency_fallback,
-                event_type=request.event_type,
-            )
+            # 8-10. Atomic Turn Persistence with Cross-Process Optimistic Retry
+            message_id = f"msg_{uuid.uuid4().hex[:16]}"
+            max_persist_retries = 8
+            clean_reply: str = ""
+            emergency_triggered: bool = False
+            emergency_notice: Optional[str] = None
 
-            # 9. Persist Dialogue Turn to Server Chat History
-            self.weekly_service.save_athena_chat_message(
-                cycle_id=resolved_cycle_id,
-                sender="user",
-                text=user_record_text,
-                sprint_id=active_sprint_id,
-                timestamp=turn_now_iso,
-            )
-            self.weekly_service.save_athena_chat_message(
-                cycle_id=resolved_cycle_id,
-                sender="curator",
-                text=clean_reply,
-                sprint_id=active_sprint_id,
-                timestamp=turn_now_iso,
-            )
+            for persist_attempt in range(max_persist_retries + 1):
+                if persist_attempt > 0:
+                    self.db.rollback()
+                    self.db.expire_all()
+                    time.sleep(0.015 * persist_attempt)
+                    bind = self.db.get_bind()
+                    if bind is not None and bind.dialect.name == "sqlite":
+                        self.db.execute(sql_text("BEGIN IMMEDIATE"))
+                elif not self.db.new and not self.db.dirty and not self.db.deleted:
+                    self.db.expire_all()
 
-            # Record schedule anchor if this turn is the first confirmed clinical message/question AFTER Primary Consilium
-            from app.services.primary_consilium_service import PrimaryConsiliumService
-
-            primary_service = PrimaryConsiliumService(
-                db=self.db, gateway=self.gateway, now_provider=self.now_provider
-            )
-            if (
-                request.event_type in ("initial_greeting", "daily_pulse")
-                and primary_service.is_primary_consilium_completed(resolved_cycle_id)
-            ):
-                if self.weekly_service.find_schedule_anchor_timestamp(resolved_cycle_id) is None:
-                    self.weekly_service.record_schedule_anchor(
+                try:
+                    base_turn_ver = self.report_repo.get_latest_version_number(
                         cycle_id=resolved_cycle_id,
-                        anchor_dt=turn_dt,
-                        source=f"{request.event_type}_turn",
-                        sprint_id=active_sprint_id,
+                        report_type=ATHENA_CHAT_TURN_REPORT_TYPE,
+                        privacy_level=PrivacyLevel.SERVER_ONLY,
                     )
 
-            # 10. Persist Idempotency Turn Record
-            message_id = f"msg_{uuid.uuid4().hex[:16]}"
-            if request.idempotency_key and request.idempotency_key.strip():
-                self._save_idempotency_turn(
-                    cycle_id=resolved_cycle_id,
-                    sprint_id=active_sprint_id,
-                    idempotency_key=request.idempotency_key.strip(),
-                    message_id=message_id,
-                    reply=clean_reply,
-                    emergency_trigger=emergency_triggered,
-                    emergency_notice=emergency_notice,
-                    created_at=turn_now_iso,
-                    sprint_day=effective_sprint_day,
-                    sprint_number=effective_sprint_number,
-                )
+                    # Re-check idempotency inside transaction attempt in case a concurrent
+                    # worker with the same idempotency_key committed while Gemini was running.
+                    if clean_idem:
+                        existing_turn = self._find_idempotent_turn(resolved_cycle_id, clean_idem)
+                        if existing_turn is not None:
+                            self.db.rollback()
+                            return existing_turn
+
+                    active_sprint_id = self.weekly_service.resolve_active_sprint_id(
+                        resolved_cycle_id,
+                        as_of=turn_dt,
+                        commit=False,
+                    )
+
+                    # 8. Post-Processing: Extract Structured Signals, Sanitize Reply & Flush Clinical Log
+                    clean_reply, emergency_triggered, emergency_notice = self._process_and_persist_reports(
+                        cycle_id=resolved_cycle_id,
+                        sprint_id=active_sprint_id,
+                        raw_response=raw_response,
+                        pre_emergency=pre_emergency,
+                        pre_emergency_notice=pre_emergency_notice,
+                        used_emergency_fallback=used_emergency_fallback,
+                        event_type=request.event_type,
+                        as_of=turn_dt,
+                        commit=False,
+                    )
+
+                    # 9. Flush Dialogue Turn to Server Chat History on top of latest messages
+                    self.weekly_service.save_athena_chat_message(
+                        cycle_id=resolved_cycle_id,
+                        sender="user",
+                        text=user_record_text,
+                        sprint_id=active_sprint_id,
+                        timestamp=turn_now_iso,
+                        commit=False,
+                    )
+                    self.weekly_service.save_athena_chat_message(
+                        cycle_id=resolved_cycle_id,
+                        sender="curator",
+                        text=clean_reply,
+                        sprint_id=active_sprint_id,
+                        timestamp=turn_now_iso,
+                        commit=False,
+                    )
+
+                    # Record schedule anchor if this turn is the first confirmed clinical message/question AFTER Primary Consilium
+                    from app.services.primary_consilium_service import PrimaryConsiliumService
+
+                    primary_service = PrimaryConsiliumService(
+                        db=self.db, gateway=self.gateway, now_provider=self.now_provider
+                    )
+                    if (
+                        request.event_type in ("initial_greeting", "daily_pulse")
+                        and primary_service.is_primary_consilium_completed(resolved_cycle_id)
+                    ):
+                        if self.weekly_service.find_schedule_anchor_timestamp(resolved_cycle_id) is None:
+                            self.weekly_service.record_schedule_anchor(
+                                cycle_id=resolved_cycle_id,
+                                anchor_dt=turn_dt,
+                                source=f"{request.event_type}_turn",
+                                sprint_id=active_sprint_id,
+                                commit=False,
+                            )
+
+                    # 10. Flush Idempotency Turn Record
+                    if clean_idem:
+                        self._save_idempotency_turn(
+                            cycle_id=resolved_cycle_id,
+                            sprint_id=active_sprint_id,
+                            idempotency_key=clean_idem,
+                            message_id=message_id,
+                            reply=clean_reply,
+                            emergency_trigger=emergency_triggered,
+                            emergency_notice=emergency_notice,
+                            created_at=turn_now_iso,
+                            sprint_day=effective_sprint_day,
+                            sprint_number=effective_sprint_number,
+                            expected_version=base_turn_ver + 1,
+                            commit=False,
+                        )
+
+                    # Single atomic commit for all artifacts of the turn
+                    self.db.commit()
+                    break
+                except (ReportVersionConflictError, IntegrityError, OperationalError) as exc:
+                    self.db.rollback()
+                    if persist_attempt < max_persist_retries:
+                        continue
+                    if isinstance(exc, ReportVersionConflictError):
+                        raise
+                    raise ReportVersionConflictError(
+                        f"Concurrent persistence conflict during Athena turn for cycle '{resolved_cycle_id}': {exc}"
+                    ) from exc
+                except BaseException:
+                    self.db.rollback()
+                    raise
 
             return AthenaChatResponse(
                 reply=clean_reply,
@@ -356,7 +442,18 @@ class AthenaChatService:
         created_at: str,
         sprint_day: Optional[int],
         sprint_number: Optional[int] = None,
+        expected_version: Optional[int] = None,
+        commit: bool = True,
     ) -> ModelReport:
+        resolved_expected_ver = expected_version
+        if resolved_expected_ver is None and not commit:
+            latest_ver = self.report_repo.get_latest_version_number(
+                cycle_id=cycle_id,
+                report_type=ATHENA_CHAT_TURN_REPORT_TYPE,
+                privacy_level=PrivacyLevel.SERVER_ONLY,
+            )
+            resolved_expected_ver = latest_ver + 1
+
         return self.report_repo.create_next_version(
             cycle_id=cycle_id,
             sprint_id=sprint_id,
@@ -374,6 +471,8 @@ class AthenaChatService:
                 "sprint_day": sprint_day,
                 "sprint_number": sprint_number,
             },
+            expected_version=resolved_expected_ver,
+            commit=commit,
         )
 
     @staticmethod
@@ -777,6 +876,8 @@ YOUR INSTRUCTION:
         pre_emergency_notice: Optional[str],
         used_emergency_fallback: bool,
         event_type: Optional[str] = None,
+        as_of: Optional[datetime] = None,
+        commit: bool = True,
     ) -> Tuple[str, bool, Optional[str]]:
         working_text = raw_response
 
@@ -800,28 +901,24 @@ YOUR INSTRUCTION:
                 log_entry = AthenaClinicalLogEntry.model_validate(parsed_dict)
                 if log_entry.status.upper() == "CRITICAL" or log_entry.red_flags:
                     is_critical_report = True
-
-                self.weekly_service.save_athena_clinical_log(
-                    cycle_id=cycle_id,
-                    log_entry=log_entry,
-                    sprint_id=sprint_id,
-                    event_type=event_type,
-                )
             except Exception as parse_err:
                 logger.warning(f"Failed to parse Athena hidden [CLINICAL_REPORT]: {parse_err}")
-                # Save fallback clinical report
-                fallback_entry = AthenaClinicalLogEntry(
+                # Build fallback clinical report
+                log_entry = AthenaClinicalLogEntry(
                     status="ALERT" if not pre_emergency else "CRITICAL",
                     symptoms_mentioned=["parsing_fallback"],
                     red_flags=pre_emergency,
                     summary_for_master="Athena turn recorded (clinical report parsing fallback)",
                 )
-                self.weekly_service.save_athena_clinical_log(
-                    cycle_id=cycle_id,
-                    log_entry=fallback_entry,
-                    sprint_id=sprint_id,
-                    event_type=event_type,
-                )
+
+            self.weekly_service.save_athena_clinical_log(
+                cycle_id=cycle_id,
+                log_entry=log_entry,
+                sprint_id=sprint_id,
+                event_type=event_type,
+                as_of=as_of,
+                commit=commit,
+            )
 
             # Completely strip [CLINICAL_REPORT] from client text
             working_text = CLINICAL_REPORT_REGEX.sub("", working_text).strip()

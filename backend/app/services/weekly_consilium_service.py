@@ -2,16 +2,20 @@ import asyncio
 from datetime import datetime, timedelta, timezone
 import json
 import re
+import time
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 import uuid
-from sqlalchemy import delete, select, update
+from sqlalchemy import delete, select, text as sql_text, update
 from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.orm import Session
 
 from app.models.model_report import ModelReport
 from app.repositories.cycle_repository import MedicalCycleRepository
 from app.repositories.measurement_repository import HealthMeasurementRepository
-from app.repositories.report_repository import ModelReportRepository
+from app.repositories.report_repository import (
+    ModelReportRepository,
+    ReportVersionConflictError,
+)
 from app.repositories.sprint_repository import WeeklySprintRepository
 from app.schemas.consilium import (
     SYSTEM_KEYS,
@@ -162,9 +166,15 @@ class WeeklyConsiliumService:
             stale_expires_iso = coord_content.get("expires_at_utc")
             expires_dt = self._parse_iso_datetime_utc(stale_expires_iso)
             if expires_dt is not None and expires_dt <= now_dt and stale_owner_id and stale_expires_iso:
+                all_cycle_lock_ids = [
+                    coord_id,
+                    lock_id,
+                    f"lock_primary_{cycle_id}"[:64],
+                    f"lock_lab_rev_{cycle_id}"[:64],
+                ]
                 stmt = (
                     delete(ModelReport)
-                    .where(ModelReport.report_id.in_([coord_id, lock_id]))
+                    .where(ModelReport.report_id.in_(all_cycle_lock_ids))
                     .where(ModelReport.content["lease_owner_id"].as_string() == stale_owner_id)
                     .where(ModelReport.content["expires_at_utc"].as_string() == stale_expires_iso)
                 )
@@ -228,7 +238,12 @@ class WeeklyConsiliumService:
         if active_lock is not None:
             lock_content = active_lock.content or {}
             consilium_type = lock_content.get("consilium_type", "weekly")
-            prefix = "Primary Consilium" if consilium_type == "primary" else "Weekly Consilium"
+            if consilium_type == "primary":
+                prefix = "Primary Consilium"
+            elif consilium_type == "lab_revision":
+                prefix = "Lab-Revision Consilium"
+            else:
+                prefix = "Weekly Consilium"
             raise ConsiliumConcurrencyConflictError(
                 f"{prefix} for cycle '{cycle_id}' is currently in progress "
                 f"(lease active until {lock_content.get('expires_at_utc')})."
@@ -506,6 +521,7 @@ class WeeklyConsiliumService:
         anchor_dt: Optional[datetime] = None,
         source: str = "first_daily_question",
         sprint_id: Optional[str] = None,
+        commit: bool = True,
     ) -> ModelReport:
         """
         Persists authoritative schedule anchor for cycle_id.
@@ -531,19 +547,38 @@ class WeeklyConsiliumService:
         else:
             effective_dt = effective_dt.astimezone(timezone.utc)
 
-        return self.report_repo.create_next_version(
-            cycle_id=cycle_id,
-            sprint_id=sprint_id,
-            model=self.gateway.flash_model,
-            report_type=ATHENA_SCHEDULE_ANCHOR_REPORT_TYPE,
-            privacy_level=PrivacyLevel.SERVER_ONLY,
-            content={
-                "agent_role": AegisAgentRole.ATHENA_CURATOR.value,
-                "anchor_timestamp_utc": effective_dt.isoformat(),
-                "source": source,
-                "created_at_utc": self._now_utc().isoformat(),
-            },
-        )
+        try:
+            return self.report_repo.create_next_version(
+                cycle_id=cycle_id,
+                sprint_id=sprint_id,
+                model=self.gateway.flash_model,
+                report_type=ATHENA_SCHEDULE_ANCHOR_REPORT_TYPE,
+                privacy_level=PrivacyLevel.SERVER_ONLY,
+                content={
+                    "agent_role": AegisAgentRole.ATHENA_CURATOR.value,
+                    "anchor_timestamp_utc": effective_dt.isoformat(),
+                    "source": source,
+                    "created_at_utc": self._now_utc().isoformat(),
+                },
+                expected_version=1,
+                max_retries=0,
+                commit=commit,
+            )
+        except (ReportVersionConflictError, IntegrityError, OperationalError):
+            if not commit:
+                raise
+            self.db.rollback()
+            self.db.expire_all()
+            existing_anchors = self.report_repo.list_server_only(
+                cycle_id=cycle_id,
+                report_type=ATHENA_SCHEDULE_ANCHOR_REPORT_TYPE,
+            )
+            if existing_anchors:
+                return min(
+                    existing_anchors,
+                    key=lambda r: (r.version, r.created_at or datetime.min.replace(tzinfo=timezone.utc)),
+                )
+            raise
 
     def find_schedule_anchor_timestamp(self, cycle_id: str) -> Optional[datetime]:
         """
@@ -725,7 +760,11 @@ class WeeklyConsiliumService:
     # ==========================================================================
 
     def resolve_active_sprint_id(
-        self, cycle_id: str, as_of: Optional[datetime] = None
+        self,
+        cycle_id: str,
+        as_of: Optional[datetime] = None,
+        commit: bool = True,
+        create_if_missing: bool = True,
     ) -> str:
         """
         Calculates and returns the authoritative active weekly sprint ID for cycle_id.
@@ -734,7 +773,8 @@ class WeeklyConsiliumService:
           sprint_id = f"sprint_{cycle_id}_w{N}"[:64]
         - If anchor not present:
           Falls back to active sprint in sprint_repo or f"sprint_{cycle_id}_w1"[:64]
-        - Guarantees sprint row exists in MedicalSprintRepository with status='active'.
+        - Guarantees sprint row exists in MedicalSprintRepository with status='active'
+          when create_if_missing=True.
         """
         if not self.cycle_repo.get(cycle_id):
             raise ConsiliumCycleNotFoundError(f"Medical cycle '{cycle_id}' not found.")
@@ -762,12 +802,14 @@ class WeeklyConsiliumService:
 
         existing = self.sprint_repo.get(target_sprint_id)
         if existing is None:
-            self.sprint_repo.create(
-                sprint_id=target_sprint_id,
-                cycle_id=cycle_id,
-                sprint_number=sprint_number,
-                status="active",
-            )
+            if create_if_missing:
+                self.sprint_repo.create(
+                    sprint_id=target_sprint_id,
+                    cycle_id=cycle_id,
+                    sprint_number=sprint_number,
+                    status="active",
+                    commit=commit,
+                )
         elif existing.cycle_id != cycle_id:
             raise ConsiliumSprintConflictError(
                 f"Sprint '{target_sprint_id}' belongs to cycle '{existing.cycle_id}', not '{cycle_id}'."
@@ -779,6 +821,7 @@ class WeeklyConsiliumService:
         cycle_id: str,
         sprint_id: Optional[str] = None,
         as_of: Optional[datetime] = None,
+        commit: bool = True,
     ) -> Optional[str]:
         if sprint_id is not None and sprint_id.strip():
             clean_sprint = sprint_id.strip()
@@ -790,6 +833,7 @@ class WeeklyConsiliumService:
                     cycle_id=cycle_id,
                     sprint_number=next_num,
                     status="active",
+                    commit=commit,
                 )
             elif existing_sprint.cycle_id != cycle_id:
                 raise ConsiliumSprintConflictError(
@@ -797,7 +841,7 @@ class WeeklyConsiliumService:
                 )
             return clean_sprint
 
-        return self.resolve_active_sprint_id(cycle_id, as_of=as_of)
+        return self.resolve_active_sprint_id(cycle_id, as_of=as_of, commit=commit)
 
     def save_athena_clinical_log(
         self,
@@ -806,6 +850,7 @@ class WeeklyConsiliumService:
         sprint_id: Optional[str] = None,
         event_type: Optional[str] = None,
         as_of: Optional[datetime] = None,
+        commit: bool = True,
     ) -> ModelReport:
         """
         Stores a hidden [CLINICAL_REPORT] entry from Athena as a server_only report
@@ -822,7 +867,7 @@ class WeeklyConsiliumService:
 
         log_ts = self._parse_iso_datetime_utc(validated.timestamp) or as_of
         resolved_sprint_id = self._resolve_or_create_sprint_id(
-            cycle_id, sprint_id, as_of=log_ts
+            cycle_id, sprint_id, as_of=log_ts, commit=commit
         )
 
         payload = validated.model_dump()
@@ -833,6 +878,15 @@ class WeeklyConsiliumService:
         if event_type:
             payload["event_type"] = event_type
 
+        expected_ver: Optional[int] = None
+        if not commit:
+            latest_ver = self.report_repo.get_latest_version_number(
+                cycle_id=cycle_id,
+                report_type=ATHENA_CLINICAL_LOG_REPORT_TYPE,
+                privacy_level=PrivacyLevel.SERVER_ONLY,
+            )
+            expected_ver = latest_ver + 1
+
         return self.report_repo.create_next_version(
             cycle_id=cycle_id,
             sprint_id=resolved_sprint_id,
@@ -840,6 +894,8 @@ class WeeklyConsiliumService:
             report_type=ATHENA_CLINICAL_LOG_REPORT_TYPE,
             privacy_level=PrivacyLevel.SERVER_ONLY,
             content=payload,
+            expected_version=expected_ver,
+            commit=commit,
         )
 
     @staticmethod
@@ -1118,6 +1174,32 @@ class WeeklyConsiliumService:
             lines.append("--------------------------------------------------")
         return "\n".join(lines)
 
+    def _get_athena_chat_history_with_version(
+        self, cycle_id: str
+    ) -> Tuple[List[Dict[str, str]], int]:
+        reports = self.report_repo.list_server_only(
+            cycle_id=cycle_id,
+            report_type=ATHENA_CHAT_HISTORY_REPORT_TYPE,
+        )
+        if not reports:
+            return [], 0
+        latest_report = reports[0]
+        latest_version = int(latest_report.version or 0)
+        latest = latest_report.content or {}
+        messages = latest.get("messages")
+        if not isinstance(messages, list):
+            return [], latest_version
+        sanitized = [
+            {
+                "sender": str(m.get("sender", "curator")),
+                "text": str(m.get("text", "")),
+                "timestamp": str(m.get("timestamp", "")),
+            }
+            for m in messages
+            if isinstance(m, dict) and str(m.get("text", "")).strip()
+        ]
+        return sanitized, latest_version
+
     def save_athena_chat_message(
         self,
         cycle_id: str,
@@ -1125,10 +1207,14 @@ class WeeklyConsiliumService:
         text: str,
         sprint_id: Optional[str] = None,
         timestamp: Optional[str] = None,
+        commit: bool = True,
+        max_retries: int = 8,
     ) -> ModelReport:
         """
         Appends a chat turn ('user' or 'curator') to the server-side chat history for cycle_id
         so that strategy updates across weekly sprints never lose conversation history.
+        Prevents lost updates under cross-process concurrency by binding each append to
+        expected_version = latest_version + 1 and re-reading the latest messages on retry.
         """
         if not self.cycle_repo.get(cycle_id):
             raise ConsiliumCycleNotFoundError(f"Medical cycle '{cycle_id}' not found.")
@@ -1140,51 +1226,76 @@ class WeeklyConsiliumService:
             raise ValueError("Chat message text cannot be empty.")
 
         msg_ts = self._parse_iso_datetime_utc(timestamp)
-        resolved_sprint_id = self._resolve_or_create_sprint_id(
-            cycle_id, sprint_id, as_of=msg_ts
-        )
-        existing_messages = self.get_athena_chat_history(cycle_id)
-        updated_messages = list(existing_messages)
-        updated_messages.append(
-            {
-                "sender": "user" if sender_norm == "user" else "curator",
-                "text": text.strip(),
-                "timestamp": timestamp or self._now_utc().isoformat(),
-            }
-        )
+        effective_timestamp = timestamp or self._now_utc().isoformat()
+        clean_text = text.strip()
+        effective_sender = "user" if sender_norm == "user" else "curator"
 
-        return self.report_repo.create_next_version(
-            cycle_id=cycle_id,
-            sprint_id=resolved_sprint_id,
-            model=self.gateway.flash_model,
-            report_type=ATHENA_CHAT_HISTORY_REPORT_TYPE,
-            privacy_level=PrivacyLevel.SERVER_ONLY,
-            content={
-                "agent_role": AegisAgentRole.ATHENA_CURATOR.value,
-                "messages": updated_messages,
-            },
+        effective_retries = max(0, int(max_retries)) if commit else 0
+
+        for attempt in range(effective_retries + 1):
+            if attempt > 0:
+                self.db.rollback()
+                self.db.expire_all()
+                time.sleep(0.015 * attempt)
+                bind = self.db.get_bind()
+                if bind is not None and bind.dialect.name == "sqlite":
+                    self.db.execute(sql_text("BEGIN IMMEDIATE"))
+            elif commit and not self.db.new and not self.db.dirty and not self.db.deleted:
+                self.db.expire_all()
+
+            try:
+                resolved_sprint_id = self._resolve_or_create_sprint_id(
+                    cycle_id, sprint_id, as_of=msg_ts, commit=commit
+                )
+                existing_messages, latest_version = self._get_athena_chat_history_with_version(
+                    cycle_id
+                )
+                expected_version = latest_version + 1
+                updated_messages = list(existing_messages)
+                updated_messages.append(
+                    {
+                        "sender": effective_sender,
+                        "text": clean_text,
+                        "timestamp": effective_timestamp,
+                    }
+                )
+
+                return self.report_repo.create_next_version(
+                    cycle_id=cycle_id,
+                    sprint_id=resolved_sprint_id,
+                    model=self.gateway.flash_model,
+                    report_type=ATHENA_CHAT_HISTORY_REPORT_TYPE,
+                    privacy_level=PrivacyLevel.SERVER_ONLY,
+                    content={
+                        "agent_role": AegisAgentRole.ATHENA_CURATOR.value,
+                        "messages": updated_messages,
+                    },
+                    expected_version=expected_version,
+                    max_retries=0,
+                    commit=commit,
+                )
+            except (ReportVersionConflictError, IntegrityError, OperationalError) as exc:
+                if commit:
+                    self.db.rollback()
+                if attempt < effective_retries:
+                    continue
+                if isinstance(exc, ReportVersionConflictError):
+                    raise
+                raise ReportVersionConflictError(
+                    f"Concurrent modification conflict while appending Athena chat message for cycle '{cycle_id}': {exc}"
+                ) from exc
+            except BaseException:
+                if commit:
+                    self.db.rollback()
+                raise
+
+        raise ReportVersionConflictError(
+            f"Exhausted retries ({effective_retries}) appending Athena chat message for cycle '{cycle_id}'."
         )
 
     def get_athena_chat_history(self, cycle_id: str) -> List[Dict[str, str]]:
-        reports = self.report_repo.list_server_only(
-            cycle_id=cycle_id,
-            report_type=ATHENA_CHAT_HISTORY_REPORT_TYPE,
-        )
-        if not reports:
-            return []
-        latest = reports[0].content or {}
-        messages = latest.get("messages")
-        if not isinstance(messages, list):
-            return []
-        return [
-            {
-                "sender": str(m.get("sender", "curator")),
-                "text": str(m.get("text", "")),
-                "timestamp": str(m.get("timestamp", "")),
-            }
-            for m in messages
-            if isinstance(m, dict) and str(m.get("text", "")).strip()
-        ]
+        messages, _ = self._get_athena_chat_history_with_version(cycle_id)
+        return messages
 
     # ==========================================================================
     # 2. SERVER-SIDE ACTIVE STRATEGY & SESSION REFRESH FOR ATHENA
@@ -1246,7 +1357,9 @@ class WeeklyConsiliumService:
 
         effective_dt = as_of or self._now_utc()
         if self.find_schedule_anchor_timestamp(cycle_id) is not None:
-            active_sprint = self.resolve_active_sprint_id(cycle_id, as_of=effective_dt)
+            active_sprint = self.resolve_active_sprint_id(
+                cycle_id, as_of=effective_dt, create_if_missing=False
+            )
             logs = self.get_seven_day_athena_logs(
                 cycle_id=cycle_id, sprint_id=active_sprint, reference_date=effective_dt
             )

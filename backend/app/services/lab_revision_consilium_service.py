@@ -5,8 +5,9 @@ import math
 import re
 import threading
 import time
-from typing import Any, Awaitable, Callable, Dict, List, Optional
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 import uuid
+from sqlalchemy import delete, update
 from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.orm import Session
 
@@ -60,6 +61,7 @@ from app.services.primary_consilium_service import (
     PREPARATORY_ANAMNESIS_REPORT_TYPE,
     PREPARATORY_OCR_REPORT_TYPE,
     PREPARATORY_ECG_REPORT_TYPE,
+    CYCLE_CONSILIUM_COORDINATION_LOCK_REPORT_TYPE,
 )
 from app.services.weekly_consilium_service import (
     ATHENA_ACTIVE_STRATEGY_REPORT_TYPE,
@@ -80,7 +82,7 @@ _NUMERIC_UNIT_RE = re.compile(
 )
 
 
-class ConsiliumCooldownError(ConsiliumError):
+class ConsiliumCooldownError(ConsiliumConcurrencyConflictError):
     """
     Raised when a user-initiated Full Lab-Revision Consilium is requested before
     the 168-hour (7-day) cooldown has elapsed since the last successful full lab revision
@@ -1255,6 +1257,10 @@ class LabRevisionConsiliumService:
             return None
 
     @staticmethod
+    def _coordination_lock_id(cycle_id: str) -> str:
+        return f"lock_consilium_coord_{cycle_id}"[:64]
+
+    @staticmethod
     def _lock_report_id(cycle_id: str) -> str:
         return f"lock_lab_rev_{cycle_id}"[:64]
 
@@ -1271,28 +1277,137 @@ class LabRevisionConsiliumService:
             .first()
         )
 
+    def _fetch_fresh_coordination_lock_row(self, cycle_id: str) -> Optional[ModelReport]:
+        """
+        Queries the cross-process cycle coordination lock row directly from SQLite using `.populate_existing()`.
+        """
+        coord_id = self._coordination_lock_id(cycle_id)
+        return (
+            self.db.query(ModelReport)
+            .filter(ModelReport.report_id == coord_id)
+            .populate_existing()
+            .first()
+        )
+
+    def _build_lease_conflict_status(
+        self, cycle_id: str, message: str
+    ) -> LabRevisionCooldownStatus:
+        """
+        Builds a fail-closed LabRevisionCooldownStatus for lease/fencing conflicts
+        without touching `self.db` (safe to call from background heartbeat sessions).
+        """
+        now_iso = self._now_utc().isoformat()
+        return LabRevisionCooldownStatus(
+            cycle_id=cycle_id,
+            cooldown_hours=LAB_REVISION_COOLDOWN_HOURS,
+            is_allowed=False,
+            remaining_seconds=self.lease_ttl_seconds,
+            remaining_hours=round(self.lease_ttl_seconds / 3600.0, 2),
+            last_completed_at_utc=now_iso,
+            next_available_at_utc=now_iso,
+            has_unreviewed_lab_changes=True,
+            evaluation_status="pending_full_consilium_revision",
+            message=message,
+            safety_notice=MEDICAL_SAFETY_COOLDOWN_NOTICE,
+        )
+
     def _get_active_in_flight_lock(self, cycle_id: str) -> Optional[ModelReport]:
         """
         Checks for an active cross-process execution lease row in `model_reports`.
-        If an expired lease row exists from a hard-terminated process (> TTL without renewal),
-        cleans it up so a crashed worker never permanently blocks future revisions.
+        Checks both the cycle coordination lock and lab-revision-specific lock.
+        If an expired lease row exists from a hard-terminated or hung process (> TTL without renewal),
+        cleans it up atomically using a WHERE condition matching the exact stale owner and expiration,
+        ensuring that a concurrent worker's active or renewed lease is NEVER deleted.
         """
-        lock_row = self._fetch_fresh_lock_row(cycle_id)
-        if lock_row is None:
-            return None
+        coord_id = self._coordination_lock_id(cycle_id)
+        lock_id = self._lock_report_id(cycle_id)
+        all_cycle_lock_ids = [
+            coord_id,
+            lock_id,
+            f"lock_primary_{cycle_id}"[:64],
+            f"lock_weekly_{cycle_id}"[:64],
+        ]
         now_dt = self._now_utc()
-        expires_dt = self._parse_iso_utc((lock_row.content or {}).get("expires_at_utc"))
-        if expires_dt is not None and expires_dt <= now_dt:
-            self.db.delete(lock_row)
-            self.db.commit()
-            return None
-        return lock_row
+
+        coord_row = (
+            self.db.query(ModelReport)
+            .filter(ModelReport.report_id == coord_id)
+            .populate_existing()
+            .first()
+        )
+        lock_row = (
+            self.db.query(ModelReport)
+            .filter(ModelReport.report_id == lock_id)
+            .populate_existing()
+            .first()
+        )
+
+        # Cleanup expired coordination lock if stale
+        if coord_row is not None:
+            coord_content = coord_row.content or {}
+            stale_owner_id = coord_content.get("lease_owner_id")
+            stale_expires_iso = coord_content.get("expires_at_utc")
+            expires_dt = self._parse_iso_utc(stale_expires_iso)
+            if expires_dt is not None and expires_dt <= now_dt and stale_owner_id and stale_expires_iso:
+                stmt = (
+                    delete(ModelReport)
+                    .where(ModelReport.report_id.in_(all_cycle_lock_ids))
+                    .where(ModelReport.content["lease_owner_id"].as_string() == stale_owner_id)
+                    .where(ModelReport.content["expires_at_utc"].as_string() == stale_expires_iso)
+                )
+                self.db.execute(stmt)
+                self.db.commit()
+                coord_row = None
+
+        # Cleanup expired lab-revision lock if stale
+        if lock_row is not None:
+            lock_content = lock_row.content or {}
+            stale_owner_id = lock_content.get("lease_owner_id")
+            stale_expires_iso = lock_content.get("expires_at_utc")
+            expires_dt = self._parse_iso_utc(stale_expires_iso)
+            if expires_dt is not None and expires_dt <= now_dt and stale_owner_id and stale_expires_iso:
+                stmt = (
+                    delete(ModelReport)
+                    .where(ModelReport.report_id.in_([coord_id, lock_id]))
+                    .where(ModelReport.content["lease_owner_id"].as_string() == stale_owner_id)
+                    .where(ModelReport.content["expires_at_utc"].as_string() == stale_expires_iso)
+                )
+                self.db.execute(stmt)
+                self.db.commit()
+                lock_row = None
+
+        # Re-verify active rows
+        fresh_lock = (
+            self.db.query(ModelReport)
+            .filter(ModelReport.report_id == lock_id)
+            .populate_existing()
+            .first()
+        )
+        if fresh_lock is not None:
+            exp = self._parse_iso_utc((fresh_lock.content or {}).get("expires_at_utc"))
+            if exp is not None and exp > now_dt:
+                return fresh_lock
+
+        fresh_coord = (
+            self.db.query(ModelReport)
+            .filter(ModelReport.report_id == coord_id)
+            .populate_existing()
+            .first()
+        )
+        if fresh_coord is not None:
+            exp = self._parse_iso_utc((fresh_coord.content or {}).get("expires_at_utc"))
+            if exp is not None and exp > now_dt:
+                return fresh_coord
+
+        return None
 
     def _acquire_cross_process_lease(self, cycle_id: str) -> str:
         """
-        Acquires an atomic database-level execution lease (`report_id = lock_lab_rev_{cycle_id}`)
-        backed by the SQLite PRIMARY KEY constraint on `model_reports.report_id` and tagged
-        with a unique `lease_owner_id` fencing token.
+        Acquires an atomic database-level execution lease backed by the SQLite PRIMARY KEY
+        constraint on `model_reports.report_id` for both the master cycle coordination lock
+        (`report_id = lock_consilium_coord_{cycle_id}`) and lab-revision-specific lock
+        (`report_id = lock_lab_rev_{cycle_id}`), tagged with a unique `lease_owner_id`
+        fencing token. Guarantees zero cross-consilium race conditions with Primary and Weekly Consilium.
         """
         cooldown_status = self.get_cooldown_status(cycle_id)
         if not cooldown_status.is_allowed:
@@ -1320,10 +1435,31 @@ class LabRevisionConsiliumService:
 
         now_dt = self._now_utc()
         expires_dt = now_dt + timedelta(seconds=self.lease_ttl_seconds)
+        coord_id = self._coordination_lock_id(cycle_id)
         lock_id = self._lock_report_id(cycle_id)
-        lease_owner_id = f"lease_{uuid.uuid4().hex}"
+        lease_owner_id = f"lease_lab_rev_{uuid.uuid4().hex}"
 
         try:
+            lock_payload = {
+                "lease_owner_id": lease_owner_id,
+                "consilium_type": "lab_revision",
+                "acquired_at_utc": now_dt.isoformat(),
+                "renewed_at_utc": now_dt.isoformat(),
+                "expires_at_utc": expires_dt.isoformat(),
+                "renewal_count": 0,
+            }
+            coord_report = ModelReport(
+                report_id=coord_id,
+                cycle_id=cycle_id,
+                sprint_id=None,
+                session_id=None,
+                model="aegis-concurrency-guard",
+                report_type=CYCLE_CONSILIUM_COORDINATION_LOCK_REPORT_TYPE,
+                privacy_level=PrivacyLevel.SERVER_ONLY.value,
+                version=1,
+                content=dict(lock_payload),
+                created_at=now_dt,
+            )
             lock_report = ModelReport(
                 report_id=lock_id,
                 cycle_id=cycle_id,
@@ -1333,52 +1469,100 @@ class LabRevisionConsiliumService:
                 report_type=LAB_REVISION_IN_FLIGHT_LOCK_REPORT_TYPE,
                 privacy_level=PrivacyLevel.SERVER_ONLY.value,
                 version=1,
-                content={
-                    "lease_owner_id": lease_owner_id,
-                    "acquired_at_utc": now_dt.isoformat(),
-                    "renewed_at_utc": now_dt.isoformat(),
-                    "expires_at_utc": expires_dt.isoformat(),
-                    "renewal_count": 0,
-                },
+                content=dict(lock_payload),
                 created_at=now_dt,
             )
+            self.db.add(coord_report)
             self.db.add(lock_report)
             self.db.commit()
             return lease_owner_id
-        except IntegrityError:
+        except (IntegrityError, OperationalError):
             self.db.rollback()
-            raise ConsiliumCooldownError(self.get_cooldown_status(cycle_id))
-
-    def _renew_cross_process_lease(self, cycle_id: str, lease_owner_id: str) -> None:
-        """
-        Verifies that `lease_owner_id` still owns the SQLite execution lease and extends
-        `expires_at_utc` by `self.lease_ttl_seconds`. If the lease was lost or replaced
-        by another owner, raises `ConsiliumCooldownError` immediately (fencing guard).
-        """
-        lock_row = self._fetch_fresh_lock_row(cycle_id)
-        lock_content = dict(lock_row.content or {}) if lock_row is not None else {}
-        if lock_row is None or lock_content.get("lease_owner_id") != lease_owner_id:
-            raise ConsiliumCooldownError(
-                self.get_cooldown_status(cycle_id).model_copy(
+            status_after = self.get_cooldown_status(cycle_id)
+            if status_after.is_allowed:
+                status_after = status_after.model_copy(
                     update={
                         "is_allowed": False,
                         "message": (
-                            f"Execution lease '{lease_owner_id}' for cycle '{cycle_id}' is no longer "
-                            "owned by this worker; aborting stale consilium execution."
+                            f"Concurrent consilium execution conflict for cycle '{cycle_id}'. "
+                            f"Another consilium is already in progress. {MEDICAL_SAFETY_COOLDOWN_NOTICE}"
                         ),
                     }
+                )
+            raise ConsiliumCooldownError(status_after)
+
+    def _renew_cross_process_lease(
+        self, cycle_id: str, lease_owner_id: str, db: Optional[Session] = None
+    ) -> None:
+        """
+        Verifies that `lease_owner_id` still owns both SQLite execution lease rows
+        (`lock_consilium_coord_{cycle_id}` and `lock_lab_rev_{cycle_id}`) and that neither
+        lease has expired, then extends `expires_at_utc` by `self.lease_ttl_seconds` using
+        an atomic SQLite UPDATE. If either lease row was lost, expired, or replaced by another
+        owner, `res.rowcount != 2`, raising `ConsiliumCooldownError` immediately (fencing guard).
+        Never uses `self.db` when an isolated `db` session is provided by the background heartbeat.
+        """
+        target_db = db or self.db
+        coord_id = self._coordination_lock_id(cycle_id)
+        lock_id = self._lock_report_id(cycle_id)
+        lock_row = (
+            target_db.query(ModelReport)
+            .filter(ModelReport.report_id == lock_id)
+            .populate_existing()
+            .first()
+        )
+        lock_content = dict(lock_row.content or {}) if lock_row is not None else {}
+        if lock_row is None or lock_content.get("lease_owner_id") != lease_owner_id:
+            raise ConsiliumCooldownError(
+                self._build_lease_conflict_status(
+                    cycle_id=cycle_id,
+                    message=(
+                        f"Execution lease '{lease_owner_id}' for cycle '{cycle_id}' is no longer "
+                        "owned by this worker; aborting stale consilium execution."
+                    ),
                 )
             )
 
         now_dt = self._now_utc()
+        lock_exp = self._parse_iso_utc(lock_content.get("expires_at_utc"))
+        if lock_exp is not None and lock_exp <= now_dt:
+            raise ConsiliumCooldownError(
+                self._build_lease_conflict_status(
+                    cycle_id=cycle_id,
+                    message=(
+                        f"Execution lease '{lease_owner_id}' for cycle '{cycle_id}' has expired "
+                        "and is no longer owned by this worker; aborting stale consilium execution."
+                    ),
+                )
+            )
+
         new_expires_dt = now_dt + timedelta(seconds=self.lease_ttl_seconds)
-        lock_content["renewed_at_utc"] = now_dt.isoformat()
-        lock_content["expires_at_utc"] = new_expires_dt.isoformat()
-        lock_content["renewal_count"] = int(lock_content.get("renewal_count", 0)) + 1
-        lock_row.content = lock_content
-        lock_row.version = int(lock_row.version or 1) + 1
-        self.db.add(lock_row)
-        self.db.commit()
+        updated_content = dict(lock_content)
+        updated_content["renewed_at_utc"] = now_dt.isoformat()
+        updated_content["expires_at_utc"] = new_expires_dt.isoformat()
+        updated_content["renewal_count"] = int(updated_content.get("renewal_count", 0)) + 1
+
+        stmt = (
+            update(ModelReport)
+            .where(ModelReport.report_id.in_([coord_id, lock_id]))
+            .where(ModelReport.content["lease_owner_id"].as_string() == lease_owner_id)
+            .where(ModelReport.content["expires_at_utc"].as_string() > now_dt.isoformat())
+            .values(content=updated_content, version=ModelReport.version + 1)
+        )
+        res = target_db.execute(stmt)
+        if res.rowcount != 2:
+            target_db.rollback()
+            raise ConsiliumCooldownError(
+                self._build_lease_conflict_status(
+                    cycle_id=cycle_id,
+                    message=(
+                        f"Execution lease '{lease_owner_id}' for cycle '{cycle_id}' was partially or completely lost "
+                        f"or is no longer owned by this worker (expected 2 lock rows renewed, got {res.rowcount}); "
+                        "aborting stale consilium execution."
+                    ),
+                )
+            )
+        target_db.commit()
 
     async def _execute_with_lease_renewal(
         self,
@@ -1389,11 +1573,17 @@ class LabRevisionConsiliumService:
         """
         Executes an async Gemini gateway call while keeping the SQLite execution lease alive:
         - Renews & verifies `lease_owner_id` before the call;
-        - Periodically renews `lease_owner_id` via a background heartbeat while awaiting I/O;
+        - Periodically renews `lease_owner_id` via a background heartbeat using an isolated DB session while awaiting I/O;
+        - If heartbeat fails to renew (lease lost or DB error), the error is immediately observed
+          by the main executor, cancelling long-running tasks and aborting publication;
         - Renews & verifies `lease_owner_id` immediately after the call returns.
         """
         self._renew_cross_process_lease(cycle_id, lease_owner_id)
         stop_event = asyncio.Event()
+        heartbeat_error: List[Exception] = []
+        engine = self.db.get_bind()
+
+        call_task = asyncio.create_task(coro_factory())
 
         async def _heartbeat() -> None:
             while not stop_event.is_set():
@@ -1405,14 +1595,31 @@ class LabRevisionConsiliumService:
                     break
                 except asyncio.TimeoutError:
                     if not stop_event.is_set():
-                        self._renew_cross_process_lease(cycle_id, lease_owner_id)
+                        try:
+                            with Session(bind=engine, autocommit=False, autoflush=False) as hb_session:
+                                self._renew_cross_process_lease(
+                                    cycle_id, lease_owner_id, db=hb_session
+                                )
+                        except Exception as exc:
+                            heartbeat_error.append(exc)
+                            call_task.cancel()
+                            break
 
         hb_task = asyncio.create_task(_heartbeat())
         try:
-            result = await coro_factory()
+            try:
+                result = await call_task
+            except asyncio.CancelledError:
+                if heartbeat_error:
+                    raise heartbeat_error[0]
+                raise
         finally:
             stop_event.set()
             await hb_task
+
+        if heartbeat_error:
+            raise heartbeat_error[0]
+
         self._renew_cross_process_lease(cycle_id, lease_owner_id)
         return result
 
@@ -1420,46 +1627,64 @@ class LabRevisionConsiliumService:
         self, cycle_id: str, lease_owner_id: str
     ) -> None:
         """
-        Fencing check before final atomic persistence: verifies the SQLite lease is still
-        owned by `lease_owner_id` and marks it for deletion inside the uncommitted transaction.
+        Fencing check before final atomic persistence: verifies that both the cycle
+        coordination lease and the lab-revision lease are still owned by `lease_owner_id`
+        and unexpired, and deletes both rows inside the uncommitted transaction using
+        atomic predicates matching `lease_owner_id` and `expires_at_utc > now_iso`.
+        If rowcount < 2, the lease was lost, expired, or superseded; rolls back any
+        partial delete and raises ConsiliumCooldownError, blocking publication of all
+        clinical reports and Athena strategy.
         Never deletes a lease owned by another worker.
         """
-        lock_row = self._fetch_fresh_lock_row(cycle_id)
-        if lock_row is None or (lock_row.content or {}).get("lease_owner_id") != lease_owner_id:
+        coord_id = self._coordination_lock_id(cycle_id)
+        lock_id = self._lock_report_id(cycle_id)
+        now_iso = self._now_utc().isoformat()
+        stmt = (
+            delete(ModelReport)
+            .where(ModelReport.report_id.in_([coord_id, lock_id]))
+            .where(ModelReport.content["lease_owner_id"].as_string() == lease_owner_id)
+            .where(ModelReport.content["expires_at_utc"].as_string() > now_iso)
+        )
+        res = self.db.execute(stmt)
+        if res.rowcount < 2:
+            self.db.rollback()
             raise ConsiliumCooldownError(
-                self.get_cooldown_status(cycle_id).model_copy(
-                    update={
-                        "is_allowed": False,
-                        "message": (
-                            f"Cannot commit Lab-Revision Consilium for cycle '{cycle_id}': "
-                            f"execution lease '{lease_owner_id}' was lost or superseded by another owner."
-                        ),
-                    }
+                self._build_lease_conflict_status(
+                    cycle_id=cycle_id,
+                    message=(
+                        f"Cannot commit Lab-Revision Consilium for cycle '{cycle_id}': "
+                        f"execution lease '{lease_owner_id}' was lost or superseded by another owner."
+                    ),
                 )
             )
-        self.db.delete(lock_row)
 
     def _release_cross_process_lease_safe(self, cycle_id: str, lease_owner_id: str) -> None:
         """
-        Safely releases the cross-process execution lease on error ONLY if the lock row
-        is still owned by `lease_owner_id`. Never deletes a lock acquired by another worker.
+        Safely releases the cross-process execution lease on error ONLY if the lock rows
+        are still owned by `lease_owner_id`. Never deletes a lock acquired by another worker.
+        Uses an isolated session with an atomic DELETE matching lease_owner_id.
         """
         try:
-            lock_row = self._fetch_fresh_lock_row(cycle_id)
-            if (
-                lock_row is not None
-                and (lock_row.content or {}).get("lease_owner_id") == lease_owner_id
-            ):
-                self.db.delete(lock_row)
-                self.db.commit()
+            coord_id = self._coordination_lock_id(cycle_id)
+            lock_id = self._lock_report_id(cycle_id)
+            stmt = (
+                delete(ModelReport)
+                .where(ModelReport.report_id.in_([coord_id, lock_id]))
+                .where(ModelReport.content["lease_owner_id"].as_string() == lease_owner_id)
+            )
+            with Session(bind=self.db.get_bind(), autocommit=False, autoflush=False) as safe_session:
+                safe_session.execute(stmt)
+                safe_session.commit()
+            self.db.expire_all()
         except Exception:
-            self.db.rollback()
+            pass
 
     def get_cooldown_status(self, cycle_id: str) -> LabRevisionCooldownStatus:
         """
         Evaluates the 168-hour (7-day) cooldown for user-initiated Full Lab-Revision Consilium:
         - Uses authoritative server UTC time (`self._now_utc()`), never client `report_date`.
-        - Checks for any active cross-process in-flight execution lease (`lab_revision_in_flight_lock`).
+        - Checks for any active cross-process in-flight execution lease (`lab_revision_in_flight_lock`
+          or `cycle_consilium_coordination_lock`).
         - Scoped strictly to `cycle_id` and `LAB_REVISION_EXECUTION_LOG_REPORT_TYPE` so:
           * Primary Consilium of a new cycle is never blocked by a previous cycle;
           * Weekly Consilium (`Flash -> Pro`) never consumes this cooldown;
@@ -1474,12 +1699,19 @@ class LabRevisionConsiliumService:
         if active_lock is not None:
             now_dt = self._now_utc()
             lock_c = active_lock.content or {}
+            consilium_type = lock_c.get("consilium_type", "lab_revision")
             acquired_iso = str(lock_c.get("acquired_at_utc") or now_dt.isoformat())
             expires_dt = self._parse_iso_utc(lock_c.get("expires_at_utc")) or (
                 now_dt + timedelta(seconds=self.lease_ttl_seconds)
             )
             rem_sec = max(1, int(math.ceil((expires_dt - now_dt).total_seconds())))
             rem_hrs = round(rem_sec / 3600.0, 2)
+            if consilium_type == "primary":
+                in_progress_label = f"Primary Consilium is already in progress for cycle '{cycle_id}'."
+            elif consilium_type == "weekly":
+                in_progress_label = f"Weekly Consilium is already in progress for cycle '{cycle_id}'."
+            else:
+                in_progress_label = f"Full Lab-Revision Consilium is already in progress for cycle '{cycle_id}'."
             return LabRevisionCooldownStatus(
                 cycle_id=cycle_id,
                 cooldown_hours=LAB_REVISION_COOLDOWN_HOURS,
@@ -1491,7 +1723,7 @@ class LabRevisionConsiliumService:
                 has_unreviewed_lab_changes=ledger_state.has_unreviewed_lab_changes,
                 evaluation_status=ledger_state.evaluation_status,
                 message=(
-                    f"Full Lab-Revision Consilium is already in progress for cycle '{cycle_id}'. "
+                    f"{in_progress_label} "
                     f"Concurrent execution across requests or worker processes is blocked. "
                     f"{MEDICAL_SAFETY_COOLDOWN_NOTICE}"
                 ),
@@ -2139,10 +2371,10 @@ class LabRevisionConsiliumService:
                     validated_overall = ClientModelReportResponse.model_validate(saved_overall_report)
 
                     self.db.commit()
-                except Exception:
+                except BaseException:
                     self.db.rollback()
                     raise
-            except Exception:
+            except BaseException:
                 self._release_cross_process_lease_safe(cycle_id, lease_owner_id)
                 raise
 
