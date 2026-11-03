@@ -457,9 +457,21 @@ async def test_weekly_consilium_patient_isolation(client_env):
     PatientRepository(session).create(patient_id=p_b_id, status="active")
     cycle_b, _ = cycle_repo.get_or_create_active_for_patient(p_b_id)
 
-    # Seed Patient A's primary consilium & diary
+    # Seed Patient A's primary consilium & diary & schedule anchor
     await _seed_completed_primary_consilium(session, cycle_id=cycle_a.cycle_id, primary_date="2026-10-18")
     _seed_seven_day_athena_logs(session, cycle_id=cycle_a.cycle_id, sprint_id="sprint_a_w1")
+    sprint_repo = WeeklySprintRepository(session)
+    sprint_repo.create(
+        sprint_id="sprint_a_w1",
+        cycle_id=cycle_a.cycle_id,
+        sprint_number=1,
+        status="active",
+    )
+    weekly_service = WeeklyConsiliumService(db=session)
+    weekly_service.record_schedule_anchor(
+        cycle_id=cycle_a.cycle_id,
+        anchor_dt=datetime.now(timezone.utc) - timedelta(hours=169),
+    )
 
     # Patient B has NO primary consilium
     calls: List[Dict[str, Any]] = []
@@ -481,7 +493,7 @@ async def test_weekly_consilium_patient_isolation(client_env):
         },
         headers=headers_a,
     )
-    assert resp.status_code == 200
+    assert resp.status_code == 200, resp.text
     body = resp.json()
     # Authoritative session took precedence: Patient A's cycle executed!
     assert body["cycle_id"] == cycle_a.cycle_id

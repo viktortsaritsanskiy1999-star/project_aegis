@@ -1,8 +1,10 @@
 from datetime import datetime, timezone
+import asyncio
+import threading
 import json
 import logging
 import re
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 import uuid
 from fastapi import HTTPException, status
 from sqlalchemy.orm import Session
@@ -76,13 +78,30 @@ class AthenaChatService:
        of Gemini API uptime.
     6. Guarantees idempotent message submission with zero duplicate AI calls or messages on retry.
     """
+    _cycle_locks: Dict[str, asyncio.Lock] = {}
+    _locks_guard: threading.Lock = threading.Lock()
 
-    def __init__(self, db: Session, gateway: Optional[GeminiGateway] = None):
+    @classmethod
+    def _get_cycle_lock(cls, cycle_id: str) -> asyncio.Lock:
+        with cls._locks_guard:
+            if cycle_id not in cls._cycle_locks:
+                cls._cycle_locks[cycle_id] = asyncio.Lock()
+            return cls._cycle_locks[cycle_id]
+
+    def __init__(
+        self,
+        db: Session,
+        gateway: Optional[GeminiGateway] = None,
+        now_provider: Optional[Callable[[], datetime]] = None,
+    ):
         self.db = db
         self.gateway = gateway or GeminiGateway()
+        self.now_provider = now_provider
         self.cycle_repo = MedicalCycleRepository(db)
         self.report_repo = ModelReportRepository(db)
-        self.weekly_service = WeeklyConsiliumService(db, gateway=self.gateway)
+        self.weekly_service = WeeklyConsiliumService(
+            db, gateway=self.gateway, now_provider=now_provider
+        )
 
     async def handle_turn(
         self,
@@ -104,83 +123,164 @@ class AthenaChatService:
                 )
         else:
             cycle, _ = self.cycle_repo.get_or_create_active_for_patient(clean_patient_id)
-        cycle_id = cycle.cycle_id
+        resolved_cycle_id = cycle.cycle_id
 
-        # 2. Idempotency Check: if client submitted an idempotency_key, check for existing turn
-        if request.idempotency_key and request.idempotency_key.strip():
-            clean_idem = request.idempotency_key.strip()
-            existing_turn = self._find_idempotent_turn(cycle_id, clean_idem)
-            if existing_turn is not None:
-                return existing_turn
+        async with self._get_cycle_lock(resolved_cycle_id):
+            # 2. Idempotency Check: if client submitted an idempotency_key, check for existing turn
+            if request.idempotency_key and request.idempotency_key.strip():
+                clean_idem = request.idempotency_key.strip()
+                existing_turn = self._find_idempotent_turn(resolved_cycle_id, clean_idem)
+                if existing_turn is not None:
+                    return existing_turn
 
-        # 3. Rule-based pre-emergency evaluation (vital signs thresholds & acute keywords)
-        pre_emergency, pre_emergency_notice = self._evaluate_pre_emergency(request)
+            turn_dt = self.weekly_service._now_utc()
+            turn_now_iso = turn_dt.isoformat()
 
-        # 4. Strategy & System Instruction Resolution
-        system_prompt, chat_history, sprint_id = self._resolve_strategy_context(cycle_id)
+            # Server-authoritative calendar schedule resolution & validation
+            auth_week, auth_day, _ = self.weekly_service.get_authoritative_calendar_schedule(
+                resolved_cycle_id, as_of=turn_dt
+            )
 
-        # 5. Formulate Prompt & Clean Record Text based on event_type
-        prompt_text, user_record_text = self._build_turn_prompt_and_record(request)
+            effective_sprint_number = request.sprint_number
+            effective_sprint_day = request.sprint_day
 
-        # 6. Build Multi-Turn Conversation Contents for Gemini
-        contents = self._build_gemini_contents(chat_history, prompt_text)
+            if request.event_type == "daily_pulse":
+                if auth_week is not None and auth_day is not None:
+                    if request.sprint_number is not None and request.sprint_number > auth_week:
+                        raise HTTPException(
+                            status_code=status.HTTP_409_CONFLICT,
+                            detail=(
+                                f"Cannot execute Daily Pulse for sprint {request.sprint_number}: "
+                                f"current authoritative calendar week is {auth_week}."
+                            ),
+                        )
+                    if (
+                        request.sprint_number is not None
+                        and request.sprint_number == auth_week
+                        and request.sprint_day is not None
+                        and request.sprint_day > auth_day
+                    ):
+                        raise HTTPException(
+                            status_code=status.HTTP_409_CONFLICT,
+                            detail=(
+                                f"Cannot execute Daily Pulse for day {request.sprint_day}: "
+                                f"current authoritative calendar day is {auth_day}."
+                            ),
+                        )
+                    if effective_sprint_number is None:
+                        effective_sprint_number = auth_week
+                    if effective_sprint_day is None:
+                        effective_sprint_day = auth_day
+                else:
+                    if effective_sprint_number is None:
+                        effective_sprint_number = 1
+                    if effective_sprint_day is None:
+                        effective_sprint_day = 1
+            else:
+                if effective_sprint_number is None and auth_week is not None:
+                    effective_sprint_number = auth_week
+                if effective_sprint_day is None and auth_day is not None:
+                    effective_sprint_day = auth_day
 
-        # 7. Execute AI Generation with Emergency Fail-Safe Fallback
-        raw_response, used_emergency_fallback = await self._execute_generation_with_fallback(
-            contents=contents,
-            system_instruction=system_prompt,
-            pre_emergency=pre_emergency,
-        )
+            # 3. Rule-based pre-emergency evaluation (vital signs thresholds & acute keywords)
+            pre_emergency, pre_emergency_notice = self._evaluate_pre_emergency(request)
 
-        # 8. Post-Processing: Extract Structured Signals & Sanitize Reply
-        clean_reply, emergency_triggered, emergency_notice = self._process_and_persist_reports(
-            cycle_id=cycle_id,
-            sprint_id=sprint_id,
-            raw_response=raw_response,
-            pre_emergency=pre_emergency,
-            pre_emergency_notice=pre_emergency_notice,
-            used_emergency_fallback=used_emergency_fallback,
-        )
+            # 4. Strategy & System Instruction Resolution
+            system_prompt, chat_history, _ = self._resolve_strategy_context(
+                resolved_cycle_id, as_of=turn_dt
+            )
 
-        # 9. Persist Dialogue Turn to Server Chat History
-        self.weekly_service.save_athena_chat_message(
-            cycle_id=cycle_id,
-            sender="user",
-            text=user_record_text,
-            sprint_id=sprint_id,
-        )
-        self.weekly_service.save_athena_chat_message(
-            cycle_id=cycle_id,
-            sender="curator",
-            text=clean_reply,
-            sprint_id=sprint_id,
-        )
+            active_sprint_id = self.weekly_service.resolve_active_sprint_id(
+                resolved_cycle_id, as_of=turn_dt
+            )
 
-        # 10. Persist Idempotency Turn Record
-        message_id = f"msg_{uuid.uuid4().hex[:16]}"
-        now_iso = datetime.now(timezone.utc).isoformat()
-        if request.idempotency_key and request.idempotency_key.strip():
-            self._save_idempotency_turn(
-                cycle_id=cycle_id,
-                sprint_id=sprint_id,
-                idempotency_key=request.idempotency_key.strip(),
-                message_id=message_id,
+            # 5. Formulate Prompt & Clean Record Text based on event_type
+            prompt_text, user_record_text = self._build_turn_prompt_and_record(
+                request,
+                effective_sprint_day=effective_sprint_day,
+            )
+
+            # 6. Build Multi-Turn Conversation Contents for Gemini
+            contents = self._build_gemini_contents(chat_history, prompt_text)
+
+            # 7. Execute AI Generation with Emergency Fail-Safe Fallback
+            raw_response, used_emergency_fallback = await self._execute_generation_with_fallback(
+                contents=contents,
+                system_instruction=system_prompt,
+                pre_emergency=pre_emergency,
+            )
+
+            # 8. Post-Processing: Extract Structured Signals & Sanitize Reply
+            clean_reply, emergency_triggered, emergency_notice = self._process_and_persist_reports(
+                cycle_id=resolved_cycle_id,
+                sprint_id=active_sprint_id,
+                raw_response=raw_response,
+                pre_emergency=pre_emergency,
+                pre_emergency_notice=pre_emergency_notice,
+                used_emergency_fallback=used_emergency_fallback,
+                event_type=request.event_type,
+            )
+
+            # 9. Persist Dialogue Turn to Server Chat History
+            self.weekly_service.save_athena_chat_message(
+                cycle_id=resolved_cycle_id,
+                sender="user",
+                text=user_record_text,
+                sprint_id=active_sprint_id,
+                timestamp=turn_now_iso,
+            )
+            self.weekly_service.save_athena_chat_message(
+                cycle_id=resolved_cycle_id,
+                sender="curator",
+                text=clean_reply,
+                sprint_id=active_sprint_id,
+                timestamp=turn_now_iso,
+            )
+
+            # Record schedule anchor if this turn is the first confirmed clinical message/question AFTER Primary Consilium
+            from app.services.primary_consilium_service import PrimaryConsiliumService
+
+            primary_service = PrimaryConsiliumService(
+                db=self.db, gateway=self.gateway, now_provider=self.now_provider
+            )
+            if (
+                request.event_type in ("initial_greeting", "daily_pulse")
+                and primary_service.is_primary_consilium_completed(resolved_cycle_id)
+            ):
+                if self.weekly_service.find_schedule_anchor_timestamp(resolved_cycle_id) is None:
+                    self.weekly_service.record_schedule_anchor(
+                        cycle_id=resolved_cycle_id,
+                        anchor_dt=turn_dt,
+                        source=f"{request.event_type}_turn",
+                        sprint_id=active_sprint_id,
+                    )
+
+            # 10. Persist Idempotency Turn Record
+            message_id = f"msg_{uuid.uuid4().hex[:16]}"
+            if request.idempotency_key and request.idempotency_key.strip():
+                self._save_idempotency_turn(
+                    cycle_id=resolved_cycle_id,
+                    sprint_id=active_sprint_id,
+                    idempotency_key=request.idempotency_key.strip(),
+                    message_id=message_id,
+                    reply=clean_reply,
+                    emergency_trigger=emergency_triggered,
+                    emergency_notice=emergency_notice,
+                    created_at=turn_now_iso,
+                    sprint_day=effective_sprint_day,
+                    sprint_number=effective_sprint_number,
+                )
+
+            return AthenaChatResponse(
                 reply=clean_reply,
                 emergency_trigger=emergency_triggered,
                 emergency_notice=emergency_notice,
-                created_at=now_iso,
-                sprint_day=request.sprint_day,
+                cycle_id=resolved_cycle_id,
+                sprint_day=effective_sprint_day,
+                sprint_number=effective_sprint_number,
+                message_id=message_id,
+                created_at=turn_now_iso,
             )
-
-        return AthenaChatResponse(
-            reply=clean_reply,
-            emergency_trigger=emergency_triggered,
-            emergency_notice=emergency_notice,
-            cycle_id=cycle_id,
-            sprint_day=request.sprint_day,
-            message_id=message_id,
-            created_at=now_iso,
-        )
 
     def get_sanitized_history(
         self,
@@ -237,6 +337,7 @@ class AthenaChatService:
                     emergency_notice=content.get("emergency_notice"),
                     cycle_id=cycle_id,
                     sprint_day=content.get("sprint_day"),
+                    sprint_number=content.get("sprint_number"),
                     message_id=str(content.get("message_id", r.report_id)),
                     created_at=str(content.get("created_at", r.created_at.isoformat())),
                 )
@@ -254,6 +355,7 @@ class AthenaChatService:
         emergency_notice: Optional[str],
         created_at: str,
         sprint_day: Optional[int],
+        sprint_number: Optional[int] = None,
     ) -> ModelReport:
         return self.report_repo.create_next_version(
             cycle_id=cycle_id,
@@ -270,6 +372,7 @@ class AthenaChatService:
                 "emergency_notice": emergency_notice,
                 "created_at": created_at,
                 "sprint_day": sprint_day,
+                "sprint_number": sprint_number,
             },
         )
 
@@ -469,12 +572,12 @@ class AthenaChatService:
         return "\n".join(sections)
 
     def _resolve_strategy_context(
-        self, cycle_id: str
+        self, cycle_id: str, as_of: Optional[datetime] = None
     ) -> Tuple[str, List[Dict[str, str]], Optional[str]]:
         medical_context = self.build_patient_medical_context(cycle_id)
 
         try:
-            ctx = self.weekly_service.get_active_athena_context(cycle_id)
+            ctx = self.weekly_service.get_active_athena_context(cycle_id, as_of=as_of)
             full_curator_context = "\n\n".join(
                 [
                     medical_context,
@@ -509,7 +612,10 @@ class AthenaChatService:
             return system_prompt, chat_history, None
 
     @staticmethod
-    def _build_turn_prompt_and_record(request: AthenaChatRequest) -> Tuple[str, str]:
+    def _build_turn_prompt_and_record(
+        request: AthenaChatRequest,
+        effective_sprint_day: Optional[int] = None,
+    ) -> Tuple[str, str]:
         event_type = request.event_type
 
         if event_type == "vitals_alert":
@@ -532,7 +638,7 @@ YOUR INSTRUCTION (MODE 2: ATTENTION AND SUPPORT):
             return prompt, user_record
 
         if event_type == "daily_pulse":
-            s_day = request.sprint_day or 1
+            s_day = effective_sprint_day or request.sprint_day or 1
             prompt = f"""Service pulse: A NEW DAY HAS COME (ROUTINE MODE). Current sprint day: {s_day} of 7.
 Study the history of past answers and the current step of the Pro route.
 1. Gently greet the user.
@@ -558,7 +664,7 @@ Don't forget to generate the initial [CLINICAL_REPORT].
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
                 detail="message must be provided and non-empty when event_type is 'user_message'.",
             )
-        s_day = request.sprint_day or 1
+        s_day = effective_sprint_day or request.sprint_day or 1
         is_sprint_end = (s_day == 7)
 
         teaser_phrase = (
@@ -670,6 +776,7 @@ YOUR INSTRUCTION:
         pre_emergency: bool,
         pre_emergency_notice: Optional[str],
         used_emergency_fallback: bool,
+        event_type: Optional[str] = None,
     ) -> Tuple[str, bool, Optional[str]]:
         working_text = raw_response
 
@@ -698,6 +805,7 @@ YOUR INSTRUCTION:
                     cycle_id=cycle_id,
                     log_entry=log_entry,
                     sprint_id=sprint_id,
+                    event_type=event_type,
                 )
             except Exception as parse_err:
                 logger.warning(f"Failed to parse Athena hidden [CLINICAL_REPORT]: {parse_err}")
@@ -712,6 +820,7 @@ YOUR INSTRUCTION:
                     cycle_id=cycle_id,
                     log_entry=fallback_entry,
                     sprint_id=sprint_id,
+                    event_type=event_type,
                 )
 
             # Completely strip [CLINICAL_REPORT] from client text

@@ -579,6 +579,7 @@ class AthenaClinicalLogEntry(BaseModel):
     summary_for_master: str = Field(..., min_length=1)
     timestamp: Optional[str] = Field(default=None, max_length=64)
     sprint_day: Optional[int] = Field(default=None, ge=1, le=7)
+    event_type: Optional[str] = Field(default=None, max_length=64)
 
 
 class ActiveAthenaStrategyContext(BaseModel):
@@ -657,6 +658,23 @@ class WeeklyConsiliumClientResponse(BaseModel):
     report_date: str
     overall_report: ClientModelReportResponse
     system_reports: Dict[str, ClientModelReportResponse]
+
+
+class WeeklySprintLifecycleState(BaseModel):
+    """
+    Authoritative server lifecycle state of weekly sprint progression for an active cycle.
+    Enforces server-driven period eligibility, preventing client-side sprint creation
+    or premature week progression.
+    """
+    model_config = ConfigDict(extra="forbid")
+
+    current_weekly_sprint_id: Optional[str] = None
+    weekly_sprint_number: Optional[int] = None
+    is_weekly_consilium_completed: bool = False
+    can_start_next_sprint: bool = False
+    next_sprint_id: Optional[str] = None
+    current_calendar_week: Optional[int] = None
+    current_calendar_day: Optional[int] = None
 
 
 # =====================================================================

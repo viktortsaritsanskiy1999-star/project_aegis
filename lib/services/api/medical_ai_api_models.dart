@@ -225,6 +225,13 @@ class ClientCascadeStatusResponse {
   final bool hasPreparatoryEcg;
   final bool isPrimaryConsiliumCompleted;
   final bool hasUnreviewedLabChanges;
+  final String? currentWeeklySprintId;
+  final int? weeklySprintNumber;
+  final bool isWeeklyConsiliumCompleted;
+  final bool canStartNextSprint;
+  final String? nextSprintId;
+  final int? currentCalendarWeek;
+  final int? currentCalendarDay;
 
   const ClientCascadeStatusResponse({
     required this.patientId,
@@ -236,6 +243,13 @@ class ClientCascadeStatusResponse {
     this.hasPreparatoryEcg = false,
     this.isPrimaryConsiliumCompleted = false,
     this.hasUnreviewedLabChanges = false,
+    this.currentWeeklySprintId,
+    this.weeklySprintNumber,
+    this.isWeeklyConsiliumCompleted = false,
+    this.canStartNextSprint = false,
+    this.nextSprintId,
+    this.currentCalendarWeek,
+    this.currentCalendarDay,
   });
 
   factory ClientCascadeStatusResponse.fromJson(Map<String, dynamic> json) {
@@ -249,6 +263,13 @@ class ClientCascadeStatusResponse {
       hasPreparatoryEcg: json['has_preparatory_ecg'] == true,
       isPrimaryConsiliumCompleted: json['is_primary_consilium_completed'] == true,
       hasUnreviewedLabChanges: json['has_unreviewed_lab_changes'] == true,
+      currentWeeklySprintId: json['current_weekly_sprint_id'] as String?,
+      weeklySprintNumber: (json['weekly_sprint_number'] as num?)?.toInt(),
+      isWeeklyConsiliumCompleted: json['is_weekly_consilium_completed'] == true,
+      canStartNextSprint: json['can_start_next_sprint'] == true,
+      nextSprintId: json['next_sprint_id'] as String?,
+      currentCalendarWeek: (json['current_calendar_week'] as num?)?.toInt(),
+      currentCalendarDay: (json['current_calendar_day'] as num?)?.toInt(),
     );
   }
 
@@ -262,6 +283,13 @@ class ClientCascadeStatusResponse {
     'has_preparatory_ecg': hasPreparatoryEcg,
     'is_primary_consilium_completed': isPrimaryConsiliumCompleted,
     'has_unreviewed_lab_changes': hasUnreviewedLabChanges,
+    if (currentWeeklySprintId != null) 'current_weekly_sprint_id': currentWeeklySprintId,
+    if (weeklySprintNumber != null) 'weekly_sprint_number': weeklySprintNumber,
+    'is_weekly_consilium_completed': isWeeklyConsiliumCompleted,
+    'can_start_next_sprint': canStartNextSprint,
+    if (nextSprintId != null) 'next_sprint_id': nextSprintId,
+    if (currentCalendarWeek != null) 'current_calendar_week': currentCalendarWeek,
+    if (currentCalendarDay != null) 'current_calendar_day': currentCalendarDay,
   };
 }
 
@@ -279,13 +307,14 @@ class LabReferenceRange {
     return LabReferenceRange(
       low: (json['low'] as num?)?.toDouble(),
       high: (json['high'] as num?)?.toDouble(),
-      textRange: json['text_range'] as String?,
+      textRange: (json['text'] ?? json['text_range']) as String?,
     );
   }
 
   Map<String, dynamic> toJson() => {
     if (low != null) 'low': low,
     if (high != null) 'high': high,
+    if (textRange != null) 'text': textRange,
     if (textRange != null) 'text_range': textRange,
   };
 }
@@ -797,6 +826,7 @@ class AthenaChatRequest {
   final String eventType;
   final AthenaVitalsAlertContext? vitalsAlert;
   final int? sprintDay;
+  final int? sprintNumber;
   final String idempotencyKey;
 
   const AthenaChatRequest({
@@ -804,6 +834,7 @@ class AthenaChatRequest {
     this.eventType = 'user_message',
     this.vitalsAlert,
     this.sprintDay,
+    this.sprintNumber,
     required this.idempotencyKey,
   }) : assert(idempotencyKey.length > 0, 'idempotencyKey must be non-empty');
 
@@ -814,6 +845,7 @@ class AthenaChatRequest {
     String eventType = 'user_message',
     AthenaVitalsAlertContext? vitalsAlert,
     int? sprintDay,
+    int? sprintNumber,
     String? idempotencyKey,
   }) {
     return AthenaChatRequest(
@@ -821,6 +853,7 @@ class AthenaChatRequest {
       eventType: eventType,
       vitalsAlert: vitalsAlert,
       sprintDay: sprintDay,
+      sprintNumber: sprintNumber,
       idempotencyKey: idempotencyKey ?? generateUuidV4(),
     );
   }
@@ -856,6 +889,7 @@ class AthenaChatRequest {
     String? eventType,
     AthenaVitalsAlertContext? vitalsAlert,
     int? sprintDay,
+    int? sprintNumber,
     String? idempotencyKey,
   }) {
     return AthenaChatRequest(
@@ -863,6 +897,7 @@ class AthenaChatRequest {
       eventType: eventType ?? this.eventType,
       vitalsAlert: vitalsAlert ?? this.vitalsAlert,
       sprintDay: sprintDay ?? this.sprintDay,
+      sprintNumber: sprintNumber ?? this.sprintNumber,
       idempotencyKey: idempotencyKey ?? this.idempotencyKey,
     );
   }
@@ -883,6 +918,7 @@ class AthenaChatRequest {
             )
           : null,
       sprintDay: json['sprint_day'] as int?,
+      sprintNumber: (json['sprint_number'] as num?)?.toInt(),
       idempotencyKey: rawKey.trim(),
     );
   }
@@ -895,6 +931,7 @@ class AthenaChatRequest {
     if (message != null) map['message'] = message;
     if (vitalsAlert != null) map['vitals_alert'] = vitalsAlert!.toJson();
     if (sprintDay != null) map['sprint_day'] = sprintDay;
+    if (sprintNumber != null) map['sprint_number'] = sprintNumber;
     return map;
   }
 }
@@ -908,6 +945,7 @@ class AthenaChatResponse {
   final String? emergencyNotice;
   final String cycleId;
   final int? sprintDay;
+  final int? sprintNumber;
   final String messageId;
   final String createdAt;
 
@@ -917,6 +955,7 @@ class AthenaChatResponse {
     this.emergencyNotice,
     required this.cycleId,
     this.sprintDay,
+    this.sprintNumber,
     required this.messageId,
     required this.createdAt,
   });
@@ -928,6 +967,7 @@ class AthenaChatResponse {
       emergencyNotice: json['emergency_notice'] as String?,
       cycleId: json['cycle_id'] as String? ?? '',
       sprintDay: json['sprint_day'] as int?,
+      sprintNumber: (json['sprint_number'] as num?)?.toInt(),
       messageId: json['message_id'] as String? ?? '',
       createdAt: json['created_at'] as String? ?? '',
     );
@@ -939,6 +979,7 @@ class AthenaChatResponse {
     if (emergencyNotice != null) 'emergency_notice': emergencyNotice,
     'cycle_id': cycleId,
     if (sprintDay != null) 'sprint_day': sprintDay,
+    if (sprintNumber != null) 'sprint_number': sprintNumber,
     'message_id': messageId,
     'created_at': createdAt,
   };

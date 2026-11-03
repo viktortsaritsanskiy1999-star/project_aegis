@@ -255,12 +255,19 @@ class AtlasScreenState extends State<AtlasScreen> {
 
       final vaultService = context.read<VaultService>();
       final timeService = context.read<TimeService>();
+      final apiClient = context.read<AegisApiClient>();
+      final authManager = context.read<AuthSessionManager>();
       final cascadeController = AegisCascadeController(vaultService: vaultService);
 
       _athenaTriggerService.startMonitoring(
         vaultService: vaultService,
         timeService: timeService,
+        apiClient: apiClient,
+        authSessionManager: authManager,
         cascadeController: cascadeController,
+        onWeeklyConsiliumAvailable: () {
+          _fetchPrimaryConsiliumReports();
+        },
       );
 
       _checkAndShowAthenaWelcome();
@@ -785,9 +792,13 @@ class AtlasScreenState extends State<AtlasScreen> {
       // 1. Verify server status and readiness
       final status = await apiClient.getCascadeStatus();
 
-      if (!mounted ||
-          _weeklyConsiliumFetchEpoch != runEpoch ||
-          authManager.confirmedAttributionPatientId != patientId) {
+      if (!mounted) return;
+      if (_weeklyConsiliumFetchEpoch != runEpoch ||
+          authManager.confirmedAttributionPatientId != patientId ||
+          vaultService.sessionEpoch != initialVaultEpoch) {
+        setState(() {
+          _isExecutingWeeklyConsilium = false;
+        });
         return;
       }
 
@@ -816,9 +827,13 @@ class AtlasScreenState extends State<AtlasScreen> {
       // 2. Query published server reports to determine current weekly sprint
       final existingReports = await apiClient.getClientReports(cycleId: cycleId);
 
-      if (!mounted ||
-          _weeklyConsiliumFetchEpoch != runEpoch ||
-          authManager.confirmedAttributionPatientId != patientId) {
+      if (!mounted) return;
+      if (_weeklyConsiliumFetchEpoch != runEpoch ||
+          authManager.confirmedAttributionPatientId != patientId ||
+          vaultService.sessionEpoch != initialVaultEpoch) {
+        setState(() {
+          _isExecutingWeeklyConsilium = false;
+        });
         return;
       }
 
@@ -828,34 +843,64 @@ class AtlasScreenState extends State<AtlasScreen> {
 
       String? sprintIdToRun;
       if (isNewPeriod) {
-        // Contract safety requirement:
-        // "Если сервер не предоставляет достаточного контракта для определения следующего периода,
-        // остановись с PARTIAL. Не генерируй sprint_id по догадке клиента."
-        if (targetSprintId == null || targetSprintId.trim().isEmpty) {
-          setState(() {
-            _isExecutingWeeklyConsilium = false;
-            _weeklyConsiliumErrorMessage =
-                'Next weekly sprint contract unavailable: server status does not provide next period scheduling. Refusing to guess sprint_id.';
-          });
-          return;
+        // Explicit request to transition to next weekly period (Week 2+)
+        if (targetSprintId != null && targetSprintId.trim().isNotEmpty) {
+          sprintIdToRun = targetSprintId.trim();
+        } else {
+          // Verify server lifecycle contract for next period
+          if (!status.canStartNextSprint) {
+            setState(() {
+              _isExecutingWeeklyConsilium = false;
+              _weeklyConsiliumErrorMessage =
+                  'Early launch blocked: next weekly sprint period has not elapsed yet (168h boundary). Next weekly sprint contract unavailable: server status does not provide next period scheduling. Refusing to guess sprint_id.';
+            });
+            return;
+          }
+          if (status.nextSprintId == null || status.nextSprintId!.trim().isEmpty) {
+            setState(() {
+              _isExecutingWeeklyConsilium = false;
+              _weeklyConsiliumErrorMessage =
+                  'Next weekly sprint contract unavailable: server status does not provide next period scheduling. Refusing to guess sprint_id.';
+            });
+            return;
+          }
+          sprintIdToRun = status.nextSprintId!.trim();
         }
-        sprintIdToRun = targetSprintId.trim();
       } else {
         if (targetSprintId != null && targetSprintId.trim().isNotEmpty) {
           sprintIdToRun = targetSprintId.trim();
         } else if (existingWeeklyOverall.isNotEmpty) {
-          // Retry / replay existing current sprint
-          sprintIdToRun = existingWeeklyOverall.last.sprintId;
+          // Safe replay of existing completed sprint (does not require can_start_next_sprint == true)
+          sprintIdToRun = existingWeeklyOverall.last.sprintId ?? status.currentWeeklySprintId;
         } else {
-          // First launch: server will create sprint_{cycleId}_w1
-          sprintIdToRun = null;
+          // Initial launch (Week 1): strictly use server lifecycle contract
+          if (!status.canStartNextSprint) {
+            setState(() {
+              _isExecutingWeeklyConsilium = false;
+              _weeklyConsiliumErrorMessage =
+                  'Early launch blocked: weekly sprint schedule boundary has not elapsed yet (168h boundary). Next weekly sprint contract unavailable: server status does not provide next period scheduling. Refusing to guess sprint_id.';
+            });
+            return;
+          }
+          if (status.nextSprintId == null || status.nextSprintId!.trim().isEmpty) {
+            setState(() {
+              _isExecutingWeeklyConsilium = false;
+              _weeklyConsiliumErrorMessage =
+                  'Next weekly sprint contract unavailable: server status does not provide next period scheduling. Refusing to guess sprint_id.';
+            });
+            return;
+          }
+          sprintIdToRun = status.nextSprintId!.trim();
         }
       }
 
       expectedSprintId = sprintIdToRun ?? 'sprint_${cycleId}_w1';
 
       // 3. Stable idempotency key across retries of the same operation
-      final keySprint = sprintIdToRun ?? 'w1';
+      String keySprint = sprintIdToRun ?? 'w1';
+      if (keySprint.startsWith('sprint_${cycleId}_')) {
+        keySprint = keySprint.substring('sprint_${cycleId}_'.length);
+      }
       if (_activeWeeklySprintKey != keySprint || _stableWeeklyIdempotencyKey == null) {
         _activeWeeklySprintKey = keySprint;
         _stableWeeklyIdempotencyKey = 'atlas_weekly_${cycleId}_$keySprint';
@@ -868,9 +913,13 @@ class AtlasScreenState extends State<AtlasScreen> {
         idempotencyKey: _stableWeeklyIdempotencyKey,
       );
 
-      if (!mounted ||
-          _weeklyConsiliumFetchEpoch != runEpoch ||
-          authManager.confirmedAttributionPatientId != patientId) {
+      if (!mounted) return;
+      if (_weeklyConsiliumFetchEpoch != runEpoch ||
+          authManager.confirmedAttributionPatientId != patientId ||
+          vaultService.sessionEpoch != initialVaultEpoch) {
+        setState(() {
+          _isExecutingWeeklyConsilium = false;
+        });
         return;
       }
 
@@ -885,9 +934,13 @@ class AtlasScreenState extends State<AtlasScreen> {
         expectedPatientId: patientId,
       );
 
-      if (!mounted ||
-          _weeklyConsiliumFetchEpoch != runEpoch ||
-          authManager.confirmedAttributionPatientId != patientId) {
+      if (!mounted) return;
+      if (_weeklyConsiliumFetchEpoch != runEpoch ||
+          authManager.confirmedAttributionPatientId != patientId ||
+          vaultService.sessionEpoch != initialVaultEpoch) {
+        setState(() {
+          _isExecutingWeeklyConsilium = false;
+        });
         return;
       }
 
@@ -908,36 +961,37 @@ class AtlasScreenState extends State<AtlasScreen> {
         _weeklyConsiliumErrorMessage = null;
       });
     } on AegisConflictException catch (e) {
-      if (mounted &&
-          _weeklyConsiliumFetchEpoch == runEpoch &&
-          authManager.confirmedAttributionPatientId == patientId) {
-        final lower = e.message.toLowerCase();
-        if (lower.contains('lease') ||
-            lower.contains('concurrency') ||
-            lower.contains('in-flight') ||
-            lower.contains('concurrent') ||
-            lower.contains('lock')) {
-          setState(() {
-            _isExecutingWeeklyConsilium = false;
-            _weeklyConsiliumIsBusy = true;
-            _weeklyConsiliumErrorMessage =
-                'Weekly Consilium is temporarily busy: another analysis process holds the execution lock.';
-          });
-        } else {
-          setState(() {
-            _isExecutingWeeklyConsilium = false;
-            _weeklyConsiliumErrorMessage = e.message;
-          });
-        }
-      }
-    } on AegisInsufficientScopeException catch (e) {
-      if (mounted &&
-          _weeklyConsiliumFetchEpoch == runEpoch &&
-          authManager.confirmedAttributionPatientId == patientId) {
+      if (mounted) {
         setState(() {
           _isExecutingWeeklyConsilium = false;
-          _weeklyConsiliumErrorMessage =
-              'Access denied: missing scope ${e.requiredScope ?? "cascade:run"}.';
+          if (_weeklyConsiliumFetchEpoch == runEpoch &&
+              authManager.confirmedAttributionPatientId == patientId &&
+              vaultService.sessionEpoch == initialVaultEpoch) {
+            final lower = e.message.toLowerCase();
+            if (lower.contains('lease') ||
+                lower.contains('concurrency') ||
+                lower.contains('in-flight') ||
+                lower.contains('concurrent') ||
+                lower.contains('lock')) {
+              _weeklyConsiliumIsBusy = true;
+              _weeklyConsiliumErrorMessage =
+                  'Weekly Consilium is temporarily busy: another analysis process holds the execution lock.';
+            } else {
+              _weeklyConsiliumErrorMessage = e.message;
+            }
+          }
+        });
+      }
+    } on AegisInsufficientScopeException catch (e) {
+      if (mounted) {
+        setState(() {
+          _isExecutingWeeklyConsilium = false;
+          if (_weeklyConsiliumFetchEpoch == runEpoch &&
+              authManager.confirmedAttributionPatientId == patientId &&
+              vaultService.sessionEpoch == initialVaultEpoch) {
+            _weeklyConsiliumErrorMessage =
+                'Access denied: missing scope ${e.requiredScope ?? "cascade:run"}.';
+          }
         });
       }
     } on AegisNetworkException catch (e) {
@@ -1009,12 +1063,14 @@ class AtlasScreenState extends State<AtlasScreen> {
         } catch (_) {}
       }
 
-      if (mounted &&
-          _weeklyConsiliumFetchEpoch == runEpoch &&
-          authManager.confirmedAttributionPatientId == patientId) {
+      if (mounted) {
         setState(() {
           _isExecutingWeeklyConsilium = false;
-          _weeklyConsiliumErrorMessage = 'Network error: ${e.message}';
+          if (_weeklyConsiliumFetchEpoch == runEpoch &&
+              authManager.confirmedAttributionPatientId == patientId &&
+              vaultService.sessionEpoch == initialVaultEpoch) {
+            _weeklyConsiliumErrorMessage = 'Network error: ${e.message}';
+          }
         });
       }
     } on AegisTimeoutException catch (_) {
@@ -1086,32 +1142,38 @@ class AtlasScreenState extends State<AtlasScreen> {
         } catch (_) {}
       }
 
-      if (mounted &&
-          _weeklyConsiliumFetchEpoch == runEpoch &&
-          authManager.confirmedAttributionPatientId == patientId) {
+      if (mounted) {
         setState(() {
           _isExecutingWeeklyConsilium = false;
-          _weeklyConsiliumErrorMessage = expectedSprintId != null
-              ? 'Weekly consilium execution timed out. Results for $expectedSprintId not confirmed on server.'
-              : 'Weekly consilium execution timed out';
+          if (_weeklyConsiliumFetchEpoch == runEpoch &&
+              authManager.confirmedAttributionPatientId == patientId &&
+              vaultService.sessionEpoch == initialVaultEpoch) {
+            _weeklyConsiliumErrorMessage = expectedSprintId != null
+                ? 'Weekly consilium execution timed out. Results for $expectedSprintId not confirmed on server.'
+                : 'Weekly consilium execution timed out';
+          }
         });
       }
     } on AegisApiException catch (e) {
-      if (mounted &&
-          _weeklyConsiliumFetchEpoch == runEpoch &&
-          authManager.confirmedAttributionPatientId == patientId) {
+      if (mounted) {
         setState(() {
           _isExecutingWeeklyConsilium = false;
-          _weeklyConsiliumErrorMessage = e.message;
+          if (_weeklyConsiliumFetchEpoch == runEpoch &&
+              authManager.confirmedAttributionPatientId == patientId &&
+              vaultService.sessionEpoch == initialVaultEpoch) {
+            _weeklyConsiliumErrorMessage = e.message;
+          }
         });
       }
     } catch (e) {
-      if (mounted &&
-          _weeklyConsiliumFetchEpoch == runEpoch &&
-          authManager.confirmedAttributionPatientId == patientId) {
+      if (mounted) {
         setState(() {
           _isExecutingWeeklyConsilium = false;
-          _weeklyConsiliumErrorMessage = 'Error: $e';
+          if (_weeklyConsiliumFetchEpoch == runEpoch &&
+              authManager.confirmedAttributionPatientId == patientId &&
+              vaultService.sessionEpoch == initialVaultEpoch) {
+            _weeklyConsiliumErrorMessage = 'Error: $e';
+          }
         });
       }
     }

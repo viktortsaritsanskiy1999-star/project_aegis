@@ -24,7 +24,8 @@ class AthenaChatRequest(BaseModel):
     event_type: str = Field(default="user_message", max_length=64)
     vitals_alert: Optional[AthenaVitalsAlertContext] = None
     sprint_day: Optional[int] = Field(default=None, ge=1, le=7)
-    idempotency_key: Optional[str] = Field(default=None, max_length=64)
+    sprint_number: Optional[int] = Field(default=None, ge=1)
+    idempotency_key: Optional[str] = Field(default=None, max_length=128)
 
     @field_validator("event_type", mode="after")
     @classmethod
@@ -49,6 +50,7 @@ class AthenaChatResponse(BaseModel):
     emergency_notice: Optional[str] = None
     cycle_id: str
     sprint_day: Optional[int] = None
+    sprint_number: Optional[int] = None
     message_id: str
     created_at: str
 

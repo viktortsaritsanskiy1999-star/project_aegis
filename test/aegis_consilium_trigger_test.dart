@@ -1307,5 +1307,478 @@ void main() {
       // pat_002's Vault must NOT be contaminated with pat_001's reports
       expect(vault.isConsiliumCompleted, isFalse);
     });
+    // -------------------------------------------------------------------------
+    // ARGON BUG-04: PRIMARY CONSILIUM RECOVERY CYCLE & EPOCH FENCING
+    // -------------------------------------------------------------------------
+    testWidgets('14. Timeout recovery with matching cycle and epoch succeeds and navigates', (tester) async {
+      int runPrimaryCalls = 0;
+      int getReportsCalls = 0;
+      bool serverFinishedConsilium = false;
+
+      final mockClient = MockClient((request) async {
+        if (request.url.path == '/api/v1/client/cascade/status') {
+          return http.Response(
+            json.encode({
+              'patient_id': 'pat_001',
+              'device_id': 'dev_test_consilium',
+              'has_active_cycle': true,
+              'active_cycle_id': 'cycle_timeout_match',
+              'has_preparatory_anamnesis': true,
+              'is_primary_consilium_completed': serverFinishedConsilium,
+            }),
+            200,
+            headers: {'content-type': 'application/json'},
+          );
+        }
+        if (request.url.path == '/api/v1/client/cascade/run-primary') {
+          runPrimaryCalls++;
+          serverFinishedConsilium = true;
+          throw TimeoutException('Simulated timeout during primary consilium');
+        }
+        if (request.url.path == '/api/v1/reports/client') {
+          getReportsCalls++;
+          return http.Response(
+            json.encode(_sampleClientReportsJson(cycleId: 'cycle_timeout_match')),
+            200,
+            headers: {'content-type': 'application/json'},
+          );
+        }
+        return http.Response('Not Found', 404);
+      });
+
+      final client = AegisApiClient(baseUrl: 'http://127.0.0.1:8000', client: mockClient);
+      final authManager = AuthSessionManager(apiClient: client, storage: memoryAuthStorage);
+      authManager.setSessionForTesting(
+        AuthSession(
+          accessToken: _buildTestJwt(patientId: 'pat_001'),
+          refreshToken: 'ref_tok',
+          expiresIn: 3600,
+          expiresAt: DateTime.now().toUtc().add(const Duration(hours: 1)),
+          refreshExpiresAt: DateTime.now().toUtc().add(const Duration(days: 30)),
+          patientId: 'pat_001',
+          deviceId: 'dev_test_consilium',
+          scope: 'cascade:intake cascade:run cycle:read reports:read',
+        ),
+        status: AuthSessionStatus.authenticated,
+      );
+
+      final vault = VaultService(storage: memoryVaultStorage, authSessionManager: authManager);
+      await vault.initFuture;
+
+      await tester.pumpWidget(
+        _buildConsiliumTestApp(
+          apiClient: client,
+          authManager: authManager,
+          vaultService: vault,
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      await tester.tap(find.byKey(const Key('run_consilium_btn')));
+      await tester.pumpAndSettle();
+
+      expect(runPrimaryCalls, equals(1));
+      expect(getReportsCalls, equals(1));
+      expect(vault.isConsiliumCompleted, isTrue);
+    });
+
+    testWidgets('15. Network error recovery with matching cycle and epoch succeeds and navigates', (tester) async {
+      int runPrimaryCalls = 0;
+      int getReportsCalls = 0;
+      bool serverFinishedConsilium = false;
+
+      final mockClient = MockClient((request) async {
+        if (request.url.path == '/api/v1/client/cascade/status') {
+          return http.Response(
+            json.encode({
+              'patient_id': 'pat_001',
+              'device_id': 'dev_test_consilium',
+              'has_active_cycle': true,
+              'active_cycle_id': 'cycle_net_match',
+              'has_preparatory_anamnesis': true,
+              'is_primary_consilium_completed': serverFinishedConsilium,
+            }),
+            200,
+            headers: {'content-type': 'application/json'},
+          );
+        }
+        if (request.url.path == '/api/v1/client/cascade/run-primary') {
+          runPrimaryCalls++;
+          serverFinishedConsilium = true;
+          throw const SocketException('Simulated network disconnect during primary consilium');
+        }
+        if (request.url.path == '/api/v1/reports/client') {
+          getReportsCalls++;
+          return http.Response(
+            json.encode(_sampleClientReportsJson(cycleId: 'cycle_net_match')),
+            200,
+            headers: {'content-type': 'application/json'},
+          );
+        }
+        return http.Response('Not Found', 404);
+      });
+
+      final client = AegisApiClient(baseUrl: 'http://127.0.0.1:8000', client: mockClient);
+      final authManager = AuthSessionManager(apiClient: client, storage: memoryAuthStorage);
+      authManager.setSessionForTesting(
+        AuthSession(
+          accessToken: _buildTestJwt(patientId: 'pat_001'),
+          refreshToken: 'ref_tok',
+          expiresIn: 3600,
+          expiresAt: DateTime.now().toUtc().add(const Duration(hours: 1)),
+          refreshExpiresAt: DateTime.now().toUtc().add(const Duration(days: 30)),
+          patientId: 'pat_001',
+          deviceId: 'dev_test_consilium',
+          scope: 'cascade:intake cascade:run cycle:read reports:read',
+        ),
+        status: AuthSessionStatus.authenticated,
+      );
+
+      final vault = VaultService(storage: memoryVaultStorage, authSessionManager: authManager);
+      await vault.initFuture;
+
+      await tester.pumpWidget(
+        _buildConsiliumTestApp(
+          apiClient: client,
+          authManager: authManager,
+          vaultService: vault,
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      await tester.tap(find.byKey(const Key('run_consilium_btn')));
+      await tester.pumpAndSettle();
+
+      expect(runPrimaryCalls, equals(1));
+      expect(getReportsCalls, equals(1));
+      expect(vault.isConsiliumCompleted, isTrue);
+    });
+
+    testWidgets('16. Timeout recovery fails closed when activeCycleId changes on server', (tester) async {
+      int runPrimaryCalls = 0;
+      int getReportsCalls = 0;
+
+      final mockClient = MockClient((request) async {
+        if (request.url.path == '/api/v1/client/cascade/status') {
+          return http.Response(
+            json.encode({
+              'patient_id': 'pat_001',
+              'device_id': 'dev_test_consilium',
+              'has_active_cycle': true,
+              'active_cycle_id': runPrimaryCalls == 0 ? 'cycle_original' : 'cycle_different_after_timeout',
+              'has_preparatory_anamnesis': true,
+              'is_primary_consilium_completed': runPrimaryCalls > 0,
+            }),
+            200,
+            headers: {'content-type': 'application/json'},
+          );
+        }
+        if (request.url.path == '/api/v1/client/cascade/run-primary') {
+          runPrimaryCalls++;
+          throw TimeoutException('Simulated timeout during primary consilium');
+        }
+        if (request.url.path == '/api/v1/reports/client') {
+          getReportsCalls++;
+          return http.Response(
+            json.encode(_sampleClientReportsJson(cycleId: 'cycle_different_after_timeout')),
+            200,
+            headers: {'content-type': 'application/json'},
+          );
+        }
+        return http.Response('Not Found', 404);
+      });
+
+      final client = AegisApiClient(baseUrl: 'http://127.0.0.1:8000', client: mockClient);
+      final authManager = AuthSessionManager(apiClient: client, storage: memoryAuthStorage);
+      authManager.setSessionForTesting(
+        AuthSession(
+          accessToken: _buildTestJwt(patientId: 'pat_001'),
+          refreshToken: 'ref_tok',
+          expiresIn: 3600,
+          expiresAt: DateTime.now().toUtc().add(const Duration(hours: 1)),
+          refreshExpiresAt: DateTime.now().toUtc().add(const Duration(days: 30)),
+          patientId: 'pat_001',
+          deviceId: 'dev_test_consilium',
+          scope: 'cascade:intake cascade:run cycle:read reports:read',
+        ),
+        status: AuthSessionStatus.authenticated,
+      );
+
+      final vault = VaultService(storage: memoryVaultStorage, authSessionManager: authManager);
+      await vault.initFuture;
+
+      await tester.pumpWidget(
+        _buildConsiliumTestApp(
+          apiClient: client,
+          authManager: authManager,
+          vaultService: vault,
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      await tester.tap(find.byKey(const Key('run_consilium_btn')));
+      await tester.pumpAndSettle();
+
+      expect(runPrimaryCalls, equals(1));
+      // Client reports from mismatched cycle MUST NOT be fetched
+      expect(getReportsCalls, equals(0));
+      // Vault MUST NOT be completed with reports from mismatched cycle
+      expect(vault.isConsiliumCompleted, isFalse);
+      // Screen must show error status
+      expect(find.byKey(const Key('retry_consilium_btn')), findsOneWidget);
+      expect(find.textContaining('timed out'), findsOneWidget);
+    });
+
+    testWidgets('17. Network recovery fails closed when activeCycleId changes on server', (tester) async {
+      int runPrimaryCalls = 0;
+      int getReportsCalls = 0;
+
+      final mockClient = MockClient((request) async {
+        if (request.url.path == '/api/v1/client/cascade/status') {
+          return http.Response(
+            json.encode({
+              'patient_id': 'pat_001',
+              'device_id': 'dev_test_consilium',
+              'has_active_cycle': true,
+              'active_cycle_id': runPrimaryCalls == 0 ? 'cycle_original' : 'cycle_different_after_neterr',
+              'has_preparatory_anamnesis': true,
+              'is_primary_consilium_completed': runPrimaryCalls > 0,
+            }),
+            200,
+            headers: {'content-type': 'application/json'},
+          );
+        }
+        if (request.url.path == '/api/v1/client/cascade/run-primary') {
+          runPrimaryCalls++;
+          throw const SocketException('Connection reset');
+        }
+        if (request.url.path == '/api/v1/reports/client') {
+          getReportsCalls++;
+          return http.Response(
+            json.encode(_sampleClientReportsJson(cycleId: 'cycle_different_after_neterr')),
+            200,
+            headers: {'content-type': 'application/json'},
+          );
+        }
+        return http.Response('Not Found', 404);
+      });
+
+      final client = AegisApiClient(baseUrl: 'http://127.0.0.1:8000', client: mockClient);
+      final authManager = AuthSessionManager(apiClient: client, storage: memoryAuthStorage);
+      authManager.setSessionForTesting(
+        AuthSession(
+          accessToken: _buildTestJwt(patientId: 'pat_001'),
+          refreshToken: 'ref_tok',
+          expiresIn: 3600,
+          expiresAt: DateTime.now().toUtc().add(const Duration(hours: 1)),
+          refreshExpiresAt: DateTime.now().toUtc().add(const Duration(days: 30)),
+          patientId: 'pat_001',
+          deviceId: 'dev_test_consilium',
+          scope: 'cascade:intake cascade:run cycle:read reports:read',
+        ),
+        status: AuthSessionStatus.authenticated,
+      );
+
+      final vault = VaultService(storage: memoryVaultStorage, authSessionManager: authManager);
+      await vault.initFuture;
+
+      await tester.pumpWidget(
+        _buildConsiliumTestApp(
+          apiClient: client,
+          authManager: authManager,
+          vaultService: vault,
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      await tester.tap(find.byKey(const Key('run_consilium_btn')));
+      await tester.pumpAndSettle();
+
+      expect(runPrimaryCalls, equals(1));
+      // Client reports from mismatched cycle MUST NOT be fetched
+      expect(getReportsCalls, equals(0));
+      // Vault MUST NOT be completed with reports from mismatched cycle
+      expect(vault.isConsiliumCompleted, isFalse);
+      // Screen must show error status
+      expect(find.byKey(const Key('retry_consilium_btn')), findsOneWidget);
+      expect(find.textContaining('Network connection failed'), findsOneWidget);
+    });
+
+    testWidgets('18. Patient switch during timeout recovery aborts attribution and fails closed', (tester) async {
+      final reportsCompleter = Completer<http.Response>();
+      int runPrimaryCalls = 0;
+      late AuthSessionManager authManagerRef;
+
+      final mockClient = MockClient((request) async {
+        if (request.url.path == '/api/v1/client/cascade/status') {
+          final isPat1 = request.headers['Authorization']?.contains('pat_001') ?? true;
+          return http.Response(
+            json.encode({
+              'patient_id': isPat1 ? 'pat_001' : 'pat_002',
+              'device_id': 'dev_test_consilium',
+              'has_active_cycle': true,
+              'active_cycle_id': isPat1 ? 'cycle_timeout_switch' : 'cycle_pat2',
+              'has_preparatory_anamnesis': true,
+              'is_primary_consilium_completed': isPat1 && runPrimaryCalls > 0,
+            }),
+            200,
+            headers: {'content-type': 'application/json'},
+          );
+        }
+        if (request.url.path == '/api/v1/client/cascade/run-primary') {
+          runPrimaryCalls++;
+          throw TimeoutException('Simulated timeout during primary consilium');
+        }
+        if (request.url.path == '/api/v1/reports/client') {
+          // Switch patient while recovery GET reports is in-flight
+          authManagerRef.setSessionForTesting(
+            AuthSession(
+              accessToken: _buildTestJwt(patientId: 'pat_002'),
+              refreshToken: 'ref_tok_2',
+              expiresIn: 3600,
+              expiresAt: DateTime.now().toUtc().add(const Duration(hours: 1)),
+              refreshExpiresAt: DateTime.now().toUtc().add(const Duration(days: 30)),
+              patientId: 'pat_002',
+              deviceId: 'dev_test_consilium',
+              scope: 'cascade:intake cascade:run cycle:read reports:read',
+            ),
+            status: AuthSessionStatus.authenticated,
+          );
+          return reportsCompleter.future;
+        }
+        return http.Response('Not Found', 404);
+      });
+
+      final client = AegisApiClient(baseUrl: 'http://127.0.0.1:8000', client: mockClient);
+      final authManager = AuthSessionManager(apiClient: client, storage: memoryAuthStorage);
+      authManagerRef = authManager;
+      authManager.setSessionForTesting(
+        AuthSession(
+          accessToken: _buildTestJwt(patientId: 'pat_001'),
+          refreshToken: 'ref_tok',
+          expiresIn: 3600,
+          expiresAt: DateTime.now().toUtc().add(const Duration(hours: 1)),
+          refreshExpiresAt: DateTime.now().toUtc().add(const Duration(days: 30)),
+          patientId: 'pat_001',
+          deviceId: 'dev_test_consilium',
+          scope: 'cascade:intake cascade:run cycle:read reports:read',
+        ),
+        status: AuthSessionStatus.authenticated,
+      );
+
+      final vault = VaultService(storage: memoryVaultStorage, authSessionManager: authManager);
+      await vault.initFuture;
+
+      await tester.pumpWidget(
+        _buildConsiliumTestApp(
+          apiClient: client,
+          authManager: authManager,
+          vaultService: vault,
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      await tester.tap(find.byKey(const Key('run_consilium_btn')));
+      await tester.pump(); // Advance until reports request is in flight
+
+      reportsCompleter.complete(http.Response(
+        json.encode(_sampleClientReportsJson(cycleId: 'cycle_timeout_switch')),
+        200,
+        headers: {'content-type': 'application/json'},
+      ));
+      await tester.pumpAndSettle();
+
+      // pat_002's Vault must NOT be contaminated with pat_001's reports
+      expect(vault.isConsiliumCompleted, isFalse);
+    });
+
+    testWidgets('19. Patient switch during network error recovery aborts attribution and fails closed', (tester) async {
+      final reportsCompleter = Completer<http.Response>();
+      int runPrimaryCalls = 0;
+      late AuthSessionManager authManagerRef;
+
+      final mockClient = MockClient((request) async {
+        if (request.url.path == '/api/v1/client/cascade/status') {
+          final isPat1 = request.headers['Authorization']?.contains('pat_001') ?? true;
+          return http.Response(
+            json.encode({
+              'patient_id': isPat1 ? 'pat_001' : 'pat_002',
+              'device_id': 'dev_test_consilium',
+              'has_active_cycle': true,
+              'active_cycle_id': isPat1 ? 'cycle_net_switch' : 'cycle_pat2',
+              'has_preparatory_anamnesis': true,
+              'is_primary_consilium_completed': isPat1 && runPrimaryCalls > 0,
+            }),
+            200,
+            headers: {'content-type': 'application/json'},
+          );
+        }
+        if (request.url.path == '/api/v1/client/cascade/run-primary') {
+          runPrimaryCalls++;
+          throw const SocketException('Connection reset');
+        }
+        if (request.url.path == '/api/v1/reports/client') {
+          // Switch patient while recovery GET reports is in-flight
+          authManagerRef.setSessionForTesting(
+            AuthSession(
+              accessToken: _buildTestJwt(patientId: 'pat_002'),
+              refreshToken: 'ref_tok_2',
+              expiresIn: 3600,
+              expiresAt: DateTime.now().toUtc().add(const Duration(hours: 1)),
+              refreshExpiresAt: DateTime.now().toUtc().add(const Duration(days: 30)),
+              patientId: 'pat_002',
+              deviceId: 'dev_test_consilium',
+              scope: 'cascade:intake cascade:run cycle:read reports:read',
+            ),
+            status: AuthSessionStatus.authenticated,
+          );
+          return reportsCompleter.future;
+        }
+        return http.Response('Not Found', 404);
+      });
+
+      final client = AegisApiClient(baseUrl: 'http://127.0.0.1:8000', client: mockClient);
+      final authManager = AuthSessionManager(apiClient: client, storage: memoryAuthStorage);
+      authManagerRef = authManager;
+      authManager.setSessionForTesting(
+        AuthSession(
+          accessToken: _buildTestJwt(patientId: 'pat_001'),
+          refreshToken: 'ref_tok',
+          expiresIn: 3600,
+          expiresAt: DateTime.now().toUtc().add(const Duration(hours: 1)),
+          refreshExpiresAt: DateTime.now().toUtc().add(const Duration(days: 30)),
+          patientId: 'pat_001',
+          deviceId: 'dev_test_consilium',
+          scope: 'cascade:intake cascade:run cycle:read reports:read',
+        ),
+        status: AuthSessionStatus.authenticated,
+      );
+
+      final vault = VaultService(storage: memoryVaultStorage, authSessionManager: authManager);
+      await vault.initFuture;
+
+      await tester.pumpWidget(
+        _buildConsiliumTestApp(
+          apiClient: client,
+          authManager: authManager,
+          vaultService: vault,
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      await tester.tap(find.byKey(const Key('run_consilium_btn')));
+      await tester.pump(); // Advance until reports request is in flight
+
+      reportsCompleter.complete(http.Response(
+        json.encode(_sampleClientReportsJson(cycleId: 'cycle_net_switch')),
+        200,
+        headers: {'content-type': 'application/json'},
+      ));
+      await tester.pumpAndSettle();
+
+      // pat_002's Vault must NOT be contaminated with pat_001's reports
+      expect(vault.isConsiliumCompleted, isFalse);
+    });
+
   });
 }

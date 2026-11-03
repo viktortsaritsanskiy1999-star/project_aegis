@@ -133,6 +133,13 @@ class ClientCascadeStatusResponse(BaseModel):
     has_preparatory_ecg: bool = False
     is_primary_consilium_completed: bool = False
     has_unreviewed_lab_changes: bool = False
+    current_weekly_sprint_id: Optional[str] = None
+    weekly_sprint_number: Optional[int] = None
+    is_weekly_consilium_completed: bool = False
+    can_start_next_sprint: bool = False
+    next_sprint_id: Optional[str] = None
+    current_calendar_week: Optional[int] = None
+    current_calendar_day: Optional[int] = None
 
 
 class ClientWeeklyConsiliumRunRequest(BaseModel):
@@ -266,6 +273,7 @@ def get_client_cascade_status(
     session: DeviceSession = Depends(require_device_session),
     _scope: DeviceSession = Depends(require_scopes("cycle:read")),
     gateway: GeminiGateway = Depends(get_gemini_gateway),
+    now_provider: Callable[[], datetime] = Depends(get_server_now_provider),
 ) -> ClientCascadeStatusResponse:
     cycle_repo = MedicalCycleRepository(db)
     active_cycle = cycle_repo.get_active_for_patient(session.patient_id)
@@ -275,12 +283,20 @@ def get_client_cascade_status(
             patient_id=session.patient_id,
             device_id=session.device_id,
             has_active_cycle=False,
+            current_weekly_sprint_id=None,
+            weekly_sprint_number=None,
+            is_weekly_consilium_completed=False,
+            can_start_next_sprint=False,
+            next_sprint_id=None,
+            current_calendar_week=None,
+            current_calendar_day=None,
         )
 
     cycle_id = active_cycle.cycle_id
     report_repo = ModelReportRepository(db)
-    primary_service = PrimaryConsiliumService(db=db, gateway=gateway)
+    primary_service = PrimaryConsiliumService(db=db, gateway=gateway, now_provider=now_provider)
     lab_service = LabRevisionConsiliumService(db=db, gateway=gateway)
+    weekly_service = WeeklyConsiliumService(db=db, gateway=gateway, now_provider=now_provider)
 
     has_m1 = len(report_repo.list_server_only(cycle_id=cycle_id, report_type=PREPARATORY_ANAMNESIS_REPORT_TYPE)) > 0
     has_ecg = len(report_repo.list_server_only(cycle_id=cycle_id, report_type=PREPARATORY_ECG_REPORT_TYPE)) > 0
@@ -289,6 +305,8 @@ def get_client_cascade_status(
 
     ledger_state = lab_service.get_lab_ledger_state(cycle_id)
     has_unreviewed = ledger_state.has_unreviewed_lab_changes
+
+    weekly_state = weekly_service.get_weekly_sprint_lifecycle_state(cycle_id)
 
     return ClientCascadeStatusResponse(
         patient_id=session.patient_id,
@@ -300,6 +318,13 @@ def get_client_cascade_status(
         has_preparatory_ecg=has_ecg,
         is_primary_consilium_completed=is_completed,
         has_unreviewed_lab_changes=has_unreviewed,
+        current_weekly_sprint_id=weekly_state.current_weekly_sprint_id,
+        weekly_sprint_number=weekly_state.weekly_sprint_number,
+        is_weekly_consilium_completed=weekly_state.is_weekly_consilium_completed,
+        can_start_next_sprint=weekly_state.can_start_next_sprint,
+        next_sprint_id=weekly_state.next_sprint_id,
+        current_calendar_week=weekly_state.current_calendar_week,
+        current_calendar_day=weekly_state.current_calendar_day,
     )
 
 
@@ -679,26 +704,81 @@ async def run_client_weekly_consilium(
                     response.headers["X-Aegis-Idempotent-Replay"] = "true"
                     return recovered
 
-    if sprint_id and sprint_id.strip():
-        existing_sprint = service.sprint_repo.get(sprint_id.strip())
+    # 2. Authoritative Period Resolution & Replay / Validation
+    lifecycle = service.get_weekly_sprint_lifecycle_state(cycle.cycle_id)
+    clean_sprint_id = sprint_id.strip() if sprint_id and sprint_id.strip() else None
+
+    if clean_sprint_id:
+        existing_sprint = service.sprint_repo.get(clean_sprint_id)
         if existing_sprint is not None:
             if existing_sprint.cycle_id != cycle.cycle_id:
                 raise HTTPException(
                     status_code=status.HTTP_409_CONFLICT,
-                    detail=f"Sprint '{sprint_id.strip()}' belongs to a different clinical cycle.",
+                    detail=f"Sprint '{clean_sprint_id}' belongs to a different clinical cycle.",
                 )
             if existing_sprint.status == "completed":
                 recovered = service.recover_completed_response(
-                    cycle.cycle_id, sprint_id=sprint_id.strip()
+                    cycle.cycle_id, sprint_id=clean_sprint_id
                 )
                 if recovered is not None:
                     response.headers["X-Aegis-Idempotent-Replay"] = "true"
                     return recovered
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail=f"Sprint '{clean_sprint_id}' is marked completed but client reports could not be recovered.",
+                )
+            # Revalidate server-side eligibility for unfinished or pre-created active sprints:
+            # An active record in DB must NEVER bypass the fixed 168-hour scheduling boundary!
+            if not lifecycle.can_start_next_sprint or clean_sprint_id != lifecycle.next_sprint_id:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail=(
+                        f"Cannot run weekly consilium for sprint '{clean_sprint_id}': "
+                        f"scheduling boundary has not elapsed or sprint transition is not authorized."
+                    ),
+                )
+            target_sprint_id = clean_sprint_id
+        else:
+            # Client requested a sprint that does not exist in DB yet.
+            # Client cannot invent unauthorized sprints or force arrival of next week.
+            if not lifecycle.can_start_next_sprint or clean_sprint_id != lifecycle.next_sprint_id:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail=(
+                        f"Cannot start sprint '{clean_sprint_id}': "
+                        f"transition to this weekly sprint is not authorized by server authority."
+                    ),
+                )
+            target_sprint_id = clean_sprint_id
+    else:
+        # Client did not specify sprint_id -> server resolves authoritative target
+        if lifecycle.is_weekly_consilium_completed and lifecycle.current_weekly_sprint_id is not None:
+            # Replay latest completed sprint without re-running Gemini
+            recovered = service.recover_completed_response(
+                cycle.cycle_id, sprint_id=lifecycle.current_weekly_sprint_id
+            )
+            if recovered is not None:
+                response.headers["X-Aegis-Idempotent-Replay"] = "true"
+                return recovered
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(
+                    f"Sprint '{lifecycle.current_weekly_sprint_id}' is completed "
+                    "but client reports could not be recovered."
+                ),
+            )
+        elif lifecycle.can_start_next_sprint and lifecycle.next_sprint_id is not None:
+            target_sprint_id = lifecycle.next_sprint_id
+        else:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Weekly Consilium is not eligible to start for this clinical cycle.",
+            )
 
     try:
         return await service.run_weekly_consilium(
             cycle_id=cycle.cycle_id,
-            sprint_id=sprint_id,
+            sprint_id=target_sprint_id,
             report_date=report_date,
             idempotency_key=idempotency_key,
         )

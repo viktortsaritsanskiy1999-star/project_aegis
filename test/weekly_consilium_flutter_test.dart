@@ -427,6 +427,8 @@ void main() {
               'has_preparatory_ecg': true,
               'is_primary_consilium_completed': true,
               'has_unreviewed_lab_changes': false,
+              'can_start_next_sprint': true,
+              'next_sprint_id': 'sprint_cycle_gamma_w1',
             }),
             200,
             headers: {'content-type': 'application/json'},

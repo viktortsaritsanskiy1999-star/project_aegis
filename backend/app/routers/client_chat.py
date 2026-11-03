@@ -1,4 +1,5 @@
-from typing import Optional
+from datetime import datetime, timezone
+from typing import Callable, Optional
 from fastapi import APIRouter, Depends, status
 from sqlalchemy.orm import Session
 
@@ -23,6 +24,10 @@ def get_gemini_gateway() -> GeminiGateway:
     return GeminiGateway()
 
 
+def get_server_now_provider() -> Callable[[], datetime]:
+    return lambda: datetime.now(timezone.utc)
+
+
 @router.post(
     "/athena",
     response_model=AthenaChatResponse,
@@ -41,8 +46,9 @@ async def athena_chat_turn_endpoint(
     _scope: DeviceSession = Depends(require_scopes(SCOPE_CHAT_WRITE)),
     db: Session = Depends(get_db),
     gateway: GeminiGateway = Depends(get_gemini_gateway),
+    now_provider: Callable[[], datetime] = Depends(get_server_now_provider),
 ) -> AthenaChatResponse:
-    service = AthenaChatService(db=db, gateway=gateway)
+    service = AthenaChatService(db=db, gateway=gateway, now_provider=now_provider)
     return await service.handle_turn(
         patient_id=session.patient_id,
         request=payload,
@@ -64,6 +70,7 @@ def athena_chat_history_endpoint(
     session: DeviceSession = Depends(require_device_session),
     _scope: DeviceSession = Depends(require_scopes(SCOPE_CHAT_READ)),
     db: Session = Depends(get_db),
+    now_provider: Callable[[], datetime] = Depends(get_server_now_provider),
 ) -> AthenaChatHistoryResponse:
-    service = AthenaChatService(db=db)
+    service = AthenaChatService(db=db, now_provider=now_provider)
     return service.get_sanitized_history(patient_id=session.patient_id)

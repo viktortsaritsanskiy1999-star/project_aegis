@@ -3009,6 +3009,9 @@ class VaultService extends ChangeNotifier {
 
   // 🗑️ Absolute reset of all device data and memory
   Future<void> resetVault({bool keepWorkoutHistory = true}) async {
+    final String? currentPatientId = _activePatientId;
+    final int currentEpoch = _sessionEpoch;
+
     List<dynamic> preservedWorkoutSessions = [];
     List<dynamic> preservedHeartRateSamples = [];
     Map<String, dynamic> preservedWorkoutContext = {};
@@ -3023,80 +3026,70 @@ class VaultService extends ChangeNotifier {
       preservedWorkoutReports = (sw['workout_analysis_reports'] as List<dynamic>? ?? []).toList();
     }
 
-    _athenaClinicalLogs.clear();
-    _systemFolders['global']?['athena_sprint_day'] = 1;
-    _hasUnreadAthenaMessage = false;
-    if (_activePatientId != null) {
-      final key = VaultStorageService.derivePatientStorageKey(_activePatientId!);
+    // 1. Immediately wipe all sensitive clinical memory data synchronously
+    _clearSensitiveMemoryData();
+
+    // 2. Restore workout data if explicitly requested by contract
+    if (keepWorkoutHistory) {
+      _ensureSmartWatchStructure();
+      final sw = _smartWatchData;
+      sw['workout_sessions'] = preservedWorkoutSessions;
+      sw['heart_rate_samples'] = preservedHeartRateSamples;
+      sw['workout_context'] = preservedWorkoutContext;
+      sw['workout_analysis_reports'] = preservedWorkoutReports;
+    }
+
+    if (_systemFolders['global'] == null) {
+      _systemFolders['global'] = <String, dynamic>{};
+    }
+    _systemFolders['global']!['athena_sprint_day'] = 1;
+
+    // 3. Clear persistent storage under sequential queue
+    if (currentPatientId != null) {
+      final key = VaultStorageService.derivePatientStorageKey(currentPatientId);
       final clearSeq = ++_writeSequence;
       await _enqueueWrite(
         storageKey: key,
         writeSeq: clearSeq,
-        patientId: _activePatientId,
-        epoch: _sessionEpoch,
+        patientId: currentPatientId,
+        epoch: currentEpoch,
         writeAction: () => _storage.clearPatientVault(key),
-        errorContext: 'clear patient vault ($_activePatientId)',
+        errorContext: 'clear patient vault ($currentPatientId)',
       );
     } else {
       final clearSeq = ++_writeSequence;
-      await _enqueueWrite(
-        storageKey: VaultStorageService.unauthenticatedStorageKey,
-        writeSeq: clearSeq,
-        patientId: null,
-        epoch: _sessionEpoch,
-        writeAction: () => _storage.clearUnauthenticatedVault(),
-        errorContext: 'clear unauthenticated vault',
-      );
+      await Future.wait([
+        _enqueueWrite(
+          storageKey: VaultStorageService.guestDraftStorageKey,
+          writeSeq: clearSeq,
+          patientId: null,
+          epoch: currentEpoch,
+          writeAction: () => _storage.clearGuestDraft(),
+          errorContext: 'clear guest draft',
+        ),
+        _enqueueWrite(
+          storageKey: VaultStorageService.unauthenticatedStorageKey,
+          writeSeq: clearSeq,
+          patientId: null,
+          epoch: currentEpoch,
+          writeAction: () => _storage.clearUnauthenticatedVault(),
+          errorContext: 'clear unauthenticated vault',
+        ),
+      ]);
     }
-    _selectedSystem = null;
-    _curatorChatHistory.clear();
-    _athenaClinicalLogs.clear();
-    _data.clear();
-    _data.addAll({
-      "health_systems": {
-        "cvs": {
-          "name": "Cardiovascular",
-          "completeness": 0.0,
-          "color": "0xFFFF0000",
-          "markers": {
-            "smart_watch": {
-              "workout_sessions": preservedWorkoutSessions,
-              "heart_rate_samples": preservedHeartRateSamples,
-              "workout_context": preservedWorkoutContext,
-              "workout_analysis_reports": preservedWorkoutReports,
-            }
-          }
-        },
-        "gi_tract": {"name": "GI Tract", "completeness": 0.0, "color": "0xFFFFA500", "markers": {}},
-        "respiratory": {"name": "Respiratory", "completeness": 0.0, "color": "0xFF00FFFF", "markers": {}},
-        "nervous": {"name": "Nervous", "completeness": 0.0, "color": "0xFF8A2BE2", "markers": {}},
-        "musculoskeletal": {"name": "Musculoskeletal", "completeness": 0.0, "color": "0xFFB0C4DE", "markers": {}},
-        "kidneys": {"name": "Renal", "completeness": 0.0, "color": "0xFF0000FF", "markers": {}},
-        "immune": {"name": "Immune and Blood", "completeness": 0.0, "color": "0xFF32CD32", "markers": {}},
-        "endocrine": {"name": "Endocrine", "completeness": 0.0, "color": "0xFFEE82EE", "markers": {}},
-      }
-    });
-    _systemFolders.clear();
-    _systemFolders.addAll({
-      'respiratory': {'labs': <String, dynamic>{}, 'system_general_shelf': 'Analysis not performed', 'system_training_shelf': 'Logs are empty'},
-      'immune': {'labs': <String, dynamic>{}, 'system_general_shelf': 'Analysis not performed', 'system_training_shelf': 'Logs are empty'},
-      'cvs': {'labs': <String, dynamic>{}, 'system_general_shelf': 'Analysis not performed', 'system_training_shelf': 'Logs are empty'},
-      'gi_tract': {'labs': <String, dynamic>{}, 'system_general_shelf': 'Analysis not performed', 'system_training_shelf': 'Logs are empty'},
-      'kidneys': {'labs': <String, dynamic>{}, 'system_general_shelf': 'Analysis not performed', 'system_training_shelf': 'Logs are empty'},
-      'endocrine': {'labs': <String, dynamic>{}, 'system_general_shelf': 'Analysis not performed', 'system_training_shelf': 'Logs are empty'},
-      'nervous': {'labs': <String, dynamic>{}, 'system_general_shelf': 'Analysis not performed', 'system_training_shelf': 'Logs are empty'},
-      'musculoskeletal': {'labs': <String, dynamic>{}, 'system_general_shelf': 'Analysis not performed', 'system_training_shelf': 'Logs are empty'},
-      'core_cascade': {
-        'flash_general_shelf': 'Waiting for Gemini Flash output...',
-        'flash_training_shelf': 'Gemini Flash deficiency logs...',
-        'pro_general_shelf': 'Waiting for Gemini Pro output...',
-        'pro_training_shelf': 'Gemini Pro deficiency logs...',
-      },
-      'notes_export': <String, dynamic>{},
-      'global': {'labs': <String, dynamic>{}},
-      'training_sandbox': {'raw_predictions': [], 'missing_data': [], 'risk_analysis': "PENDING..."},
-    });
+
+    // 4. Epoch & patient isolation check: abort if patient changed or session disposed
+    if (_isDisposed || _sessionEpoch != currentEpoch || _activePatientId != currentPatientId) {
+      return;
+    }
+
+    // 5. Persist clean default snapshot (with preserved workouts if kept)
     await _persist();
+
+    if (_isDisposed || _sessionEpoch != currentEpoch || _activePatientId != currentPatientId) {
+      return;
+    }
+
     notifyListeners();
   }
 
@@ -3130,6 +3123,15 @@ class VaultService extends ChangeNotifier {
     return (_systemFolders['global']?['athena_sprint_day'] as int?) ?? 1;
   }
 
+  void setAthenaSprintDay(int day) {
+    if (_systemFolders['global'] == null) {
+      _systemFolders['global'] = {};
+    }
+    _systemFolders['global']!['athena_sprint_day'] = day;
+    _persist();
+    notifyListeners();
+  }
+
   int incrementAthenaSprintDay() {
     int currentDay = getAthenaSprintDay();
     if (currentDay >= 7) {
@@ -3137,12 +3139,7 @@ class VaultService extends ChangeNotifier {
     } else {
       currentDay++;
     }
-    if (_systemFolders['global'] == null) {
-      _systemFolders['global'] = {};
-    }
-    _systemFolders['global']!['athena_sprint_day'] = currentDay;
-    _persist();
-    notifyListeners();
+    setAthenaSprintDay(currentDay);
     return currentDay;
   }
 }

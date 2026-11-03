@@ -1,7 +1,8 @@
 import asyncio
 from datetime import datetime, timedelta, timezone
 import json
-from typing import Any, Awaitable, Callable, Dict, List, Optional
+import re
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 import uuid
 from sqlalchemy import delete, select, update
 from sqlalchemy.exc import IntegrityError, OperationalError
@@ -22,6 +23,7 @@ from app.schemas.consilium import (
     ActiveAthenaStrategyContext,
     AthenaSessionState,
     WeeklyConsiliumClientResponse,
+    WeeklySprintLifecycleState,
     validate_no_guaranteed_unchanged_claim,
 )
 from app.schemas.privacy import PrivacyLevel
@@ -56,6 +58,8 @@ WEEKLY_CONSILIUM_LOCK_HEARTBEAT_SECONDS: float = 15.0
 WEEKLY_CONSILIUM_IN_FLIGHT_LOCK_REPORT_TYPE: str = "weekly_consilium_in_flight_lock"
 WEEKLY_CONSILIUM_EXECUTION_LOG_REPORT_TYPE: str = "weekly_consilium_execution_log"
 CYCLE_CONSILIUM_COORDINATION_LOCK_REPORT_TYPE: str = "cycle_consilium_coordination_lock"
+ATHENA_SCHEDULE_ANCHOR_REPORT_TYPE: str = "athena_schedule_anchor"
+WEEKLY_SPRINT_HOURS: int = 168
 
 
 class ConsiliumSprintConflictError(ConsiliumConcurrencyConflictError):
@@ -496,39 +500,312 @@ class WeeklyConsiliumService:
             system_reports=system_reports,
         )
 
+    def record_schedule_anchor(
+        self,
+        cycle_id: str,
+        anchor_dt: Optional[datetime] = None,
+        source: str = "first_daily_question",
+        sprint_id: Optional[str] = None,
+    ) -> ModelReport:
+        """
+        Persists authoritative schedule anchor for cycle_id.
+        Represents the first confirmed meaningful daily question/message of Athena after Primary Consilium.
+        If an anchor report already exists for this cycle, returns the initial confirmed record T0 without creating a new version.
+        """
+        if not self.cycle_repo.get(cycle_id):
+            raise ConsiliumCycleNotFoundError(f"Medical cycle '{cycle_id}' not found.")
+
+        existing_anchors = self.report_repo.list_server_only(
+            cycle_id=cycle_id,
+            report_type=ATHENA_SCHEDULE_ANCHOR_REPORT_TYPE,
+        )
+        if existing_anchors:
+            return min(
+                existing_anchors,
+                key=lambda r: (r.version, r.created_at or datetime.min.replace(tzinfo=timezone.utc)),
+            )
+
+        effective_dt = anchor_dt or self._now_utc()
+        if effective_dt.tzinfo is None:
+            effective_dt = effective_dt.replace(tzinfo=timezone.utc)
+        else:
+            effective_dt = effective_dt.astimezone(timezone.utc)
+
+        return self.report_repo.create_next_version(
+            cycle_id=cycle_id,
+            sprint_id=sprint_id,
+            model=self.gateway.flash_model,
+            report_type=ATHENA_SCHEDULE_ANCHOR_REPORT_TYPE,
+            privacy_level=PrivacyLevel.SERVER_ONLY,
+            content={
+                "agent_role": AegisAgentRole.ATHENA_CURATOR.value,
+                "anchor_timestamp_utc": effective_dt.isoformat(),
+                "source": source,
+                "created_at_utc": self._now_utc().isoformat(),
+            },
+        )
+
+    def find_schedule_anchor_timestamp(self, cycle_id: str) -> Optional[datetime]:
+        """
+        Locates the confirmed anchor UTC timestamp for the cycle's 168-hour weekly schedule grid.
+        Defined as the first confirmed meaningful daily question/message of Athena after Primary Consilium.
+
+        Rules:
+        1. Exclusively uses 'athena_schedule_anchor' server-only report (single source of truth).
+        2. Uses the initial confirmed record T0 (version 1 / earliest), never latest version.
+        3. Never falls back on user text strings [Daily Pulse] / [Daily Question] or clinical logs.
+        4. If none found, returns None (never guesses the start date).
+        """
+        anchor_reports = self.report_repo.list_server_only(
+            cycle_id=cycle_id,
+            report_type=ATHENA_SCHEDULE_ANCHOR_REPORT_TYPE,
+        )
+        if anchor_reports:
+            sorted_anchors = sorted(
+                anchor_reports,
+                key=lambda r: (r.version, r.created_at or datetime.min.replace(tzinfo=timezone.utc)),
+            )
+            for r in sorted_anchors:
+                content = r.content or {}
+                raw_ts = content.get("anchor_timestamp_utc")
+                dt = self._parse_iso_datetime_utc(raw_ts)
+                if dt is not None:
+                    return dt
+
+        return None
+
+    def get_authoritative_calendar_schedule(
+        self, cycle_id: str, as_of: Optional[datetime] = None
+    ) -> Tuple[Optional[int], Optional[int], Optional[datetime]]:
+        """
+        Calculates authoritative calendar schedule from persisted Athena schedule anchor T0:
+        - current_calendar_week: N = max(1, int(hours_elapsed // 168) + 1)
+        - current_calendar_day: 1..7 within week N: min(7, max(1, int((hours_elapsed % 168) // 24) + 1))
+        - next_weekly_boundary_dt: anchor_dt + N * 168 hours
+        If anchor_dt is not found (prior to first post-Primary question), returns (None, None, None).
+        """
+        anchor_dt = self.find_schedule_anchor_timestamp(cycle_id)
+        if anchor_dt is None:
+            return (None, None, None)
+
+        effective_dt = as_of or self._now_utc()
+        if effective_dt.tzinfo is None:
+            effective_dt = effective_dt.replace(tzinfo=timezone.utc)
+        else:
+            effective_dt = effective_dt.astimezone(timezone.utc)
+
+        if effective_dt < anchor_dt:
+            return (1, 1, anchor_dt + timedelta(hours=WEEKLY_SPRINT_HOURS))
+
+        hours_elapsed = (effective_dt - anchor_dt).total_seconds() / 3600.0
+        week_n = max(1, int(hours_elapsed // WEEKLY_SPRINT_HOURS) + 1)
+        hours_in_week = hours_elapsed % WEEKLY_SPRINT_HOURS
+        day_n = min(7, max(1, int(hours_in_week // 24) + 1))
+        next_boundary = anchor_dt + timedelta(hours=WEEKLY_SPRINT_HOURS * week_n)
+
+        return (week_n, day_n, next_boundary)
+
+    def get_weekly_sprint_lifecycle_state(
+        self, cycle_id: str
+    ) -> WeeklySprintLifecycleState:
+        """
+        Calculates authoritative server lifecycle state for weekly sprints in an active cycle
+        based on fixed 168-hour periods anchored at Athena's first confirmed daily question.
+        - Point of reference (anchor): first confirmed daily question/message of Athena after Primary Consilium.
+        - Fixed 168-hour grid: period N boundary = anchor_dt + N * 168h.
+        - Early requests before 168h boundary are rejected (can_start_next_sprint=False).
+        - Late execution does NOT shift subsequent schedule boundaries.
+        - Patient answer count does not determine or delay the schedule.
+        - If anchor event does not exist, refuses to guess start date (can_start_next_sprint=False).
+        """
+        from app.services.primary_consilium_service import PrimaryConsiliumService
+
+        primary_service = PrimaryConsiliumService(
+            db=self.db, gateway=self.gateway, now_provider=self.now_provider
+        )
+        if not primary_service.is_primary_consilium_completed(cycle_id):
+            return WeeklySprintLifecycleState(
+                current_weekly_sprint_id=None,
+                weekly_sprint_number=None,
+                is_weekly_consilium_completed=False,
+                can_start_next_sprint=False,
+                next_sprint_id=None,
+                current_calendar_week=None,
+                current_calendar_day=None,
+            )
+
+        anchor_dt = self.find_schedule_anchor_timestamp(cycle_id)
+        if anchor_dt is None:
+            # Anchor not established yet -> schedule cannot start.
+            # Do NOT guess start date.
+            return WeeklySprintLifecycleState(
+                current_weekly_sprint_id=None,
+                weekly_sprint_number=None,
+                is_weekly_consilium_completed=False,
+                can_start_next_sprint=False,
+                next_sprint_id=None,
+                current_calendar_week=None,
+                current_calendar_day=None,
+            )
+
+        now_dt = self._now_utc()
+        cal_week, cal_day, _ = self.get_authoritative_calendar_schedule(cycle_id, as_of=now_dt)
+        existing_sprints = self.sprint_repo.list_by_cycle(cycle_id)
+
+        # Inspect completed sprints with valid recovered reports
+        completed_numbers = set()
+        for s in existing_sprints:
+            if s.status == "completed":
+                rec = self.recover_completed_response(cycle_id, sprint_id=s.sprint_id)
+                if rec is not None:
+                    completed_numbers.add(s.sprint_number)
+
+        # Next sprint in sequence
+        next_num = 1
+        while next_num in completed_numbers:
+            next_num += 1
+
+        # Fixed 168-hour schedule from initial anchor_dt:
+        # Period N boundary = anchor_dt + N * 168 hours
+        target_boundary_dt = anchor_dt + timedelta(hours=WEEKLY_SPRINT_HOURS * next_num)
+        has_boundary_elapsed = (now_dt >= target_boundary_dt)
+        target_next_sprint_id = f"sprint_{cycle_id}_w{next_num}"[:64]
+
+        active_sprint = self.sprint_repo.get_active_for_cycle(cycle_id)
+
+        # Determine effective next sprint ID: if an active sprint for next_num exists, use it
+        if active_sprint is not None and active_sprint.sprint_number == next_num:
+            effective_next_sprint_id = active_sprint.sprint_id
+        else:
+            effective_next_sprint_id = target_next_sprint_id
+
+        # Case 1: No completed sprints yet (Week 1)
+        if not completed_numbers:
+            return WeeklySprintLifecycleState(
+                current_weekly_sprint_id=active_sprint.sprint_id if active_sprint else None,
+                weekly_sprint_number=active_sprint.sprint_number if active_sprint else None,
+                is_weekly_consilium_completed=False,
+                can_start_next_sprint=has_boundary_elapsed,
+                next_sprint_id=effective_next_sprint_id if has_boundary_elapsed else None,
+                current_calendar_week=cal_week,
+                current_calendar_day=cal_day,
+            )
+
+        # Case 2: One or more sprints have completed (Week 2+)
+        if active_sprint is not None and active_sprint.sprint_number == next_num:
+            return WeeklySprintLifecycleState(
+                current_weekly_sprint_id=active_sprint.sprint_id,
+                weekly_sprint_number=active_sprint.sprint_number,
+                is_weekly_consilium_completed=False,
+                can_start_next_sprint=has_boundary_elapsed,
+                next_sprint_id=active_sprint.sprint_id if has_boundary_elapsed else None,
+                current_calendar_week=cal_week,
+                current_calendar_day=cal_day,
+            )
+
+        latest_completed_num = max(completed_numbers)
+        latest_completed_id = f"sprint_{cycle_id}_w{latest_completed_num}"[:64]
+        for s in existing_sprints:
+            if s.sprint_number == latest_completed_num:
+                latest_completed_id = s.sprint_id
+                break
+
+        return WeeklySprintLifecycleState(
+            current_weekly_sprint_id=latest_completed_id,
+            weekly_sprint_number=latest_completed_num,
+            is_weekly_consilium_completed=True,
+            can_start_next_sprint=has_boundary_elapsed,
+            next_sprint_id=effective_next_sprint_id if has_boundary_elapsed else None,
+            current_calendar_week=cal_week,
+            current_calendar_day=cal_day,
+        )
+
     # ==========================================================================
     # 1. ATHENA 7-DAY CLINICAL DIARY & CHAT HISTORY (SERVER-ONLY)
     # ==========================================================================
+
+    def resolve_active_sprint_id(
+        self, cycle_id: str, as_of: Optional[datetime] = None
+    ) -> str:
+        """
+        Calculates and returns the authoritative active weekly sprint ID for cycle_id.
+        - Uses confirmed Athena schedule anchor (T0) if present:
+          N = max(1, int((as_of - anchor_dt).total_seconds() / 3600.0 // 168) + 1)
+          sprint_id = f"sprint_{cycle_id}_w{N}"[:64]
+        - If anchor not present:
+          Falls back to active sprint in sprint_repo or f"sprint_{cycle_id}_w1"[:64]
+        - Guarantees sprint row exists in MedicalSprintRepository with status='active'.
+        """
+        if not self.cycle_repo.get(cycle_id):
+            raise ConsiliumCycleNotFoundError(f"Medical cycle '{cycle_id}' not found.")
+
+        anchor_dt = self.find_schedule_anchor_timestamp(cycle_id)
+        effective_dt = as_of or self._now_utc()
+        if effective_dt.tzinfo is None:
+            effective_dt = effective_dt.replace(tzinfo=timezone.utc)
+        else:
+            effective_dt = effective_dt.astimezone(timezone.utc)
+
+        if anchor_dt is not None:
+            if effective_dt < anchor_dt:
+                sprint_number = 1
+            else:
+                hours_elapsed = (effective_dt - anchor_dt).total_seconds() / 3600.0
+                sprint_number = max(1, int(hours_elapsed // WEEKLY_SPRINT_HOURS) + 1)
+            target_sprint_id = f"sprint_{cycle_id}_w{sprint_number}"[:64]
+        else:
+            active_sprint = self.sprint_repo.get_active_for_cycle(cycle_id)
+            if active_sprint is not None:
+                return active_sprint.sprint_id
+            sprint_number = 1
+            target_sprint_id = f"sprint_{cycle_id}_w1"[:64]
+
+        existing = self.sprint_repo.get(target_sprint_id)
+        if existing is None:
+            self.sprint_repo.create(
+                sprint_id=target_sprint_id,
+                cycle_id=cycle_id,
+                sprint_number=sprint_number,
+                status="active",
+            )
+        elif existing.cycle_id != cycle_id:
+            raise ConsiliumSprintConflictError(
+                f"Sprint '{target_sprint_id}' belongs to cycle '{existing.cycle_id}', not '{cycle_id}'."
+            )
+        return target_sprint_id
 
     def _resolve_or_create_sprint_id(
         self,
         cycle_id: str,
         sprint_id: Optional[str] = None,
+        as_of: Optional[datetime] = None,
     ) -> Optional[str]:
-        if sprint_id is not None:
-            existing_sprint = self.sprint_repo.get(sprint_id)
+        if sprint_id is not None and sprint_id.strip():
+            clean_sprint = sprint_id.strip()
+            existing_sprint = self.sprint_repo.get(clean_sprint)
             if existing_sprint is None:
                 next_num = len(self.sprint_repo.list_by_cycle(cycle_id)) + 1
                 self.sprint_repo.create(
-                    sprint_id=sprint_id,
+                    sprint_id=clean_sprint,
                     cycle_id=cycle_id,
                     sprint_number=next_num,
                     status="active",
                 )
             elif existing_sprint.cycle_id != cycle_id:
                 raise ConsiliumSprintConflictError(
-                    f"Sprint '{sprint_id}' belongs to cycle '{existing_sprint.cycle_id}', not '{cycle_id}'."
+                    f"Sprint '{clean_sprint}' belongs to cycle '{existing_sprint.cycle_id}', not '{cycle_id}'."
                 )
-            return sprint_id
+            return clean_sprint
 
-        active_sprint = self.sprint_repo.get_active_for_cycle(cycle_id)
-        return active_sprint.sprint_id if active_sprint is not None else None
+        return self.resolve_active_sprint_id(cycle_id, as_of=as_of)
 
     def save_athena_clinical_log(
         self,
         cycle_id: str,
         log_entry: AthenaClinicalLogEntry | Dict[str, Any],
         sprint_id: Optional[str] = None,
+        event_type: Optional[str] = None,
+        as_of: Optional[datetime] = None,
     ) -> ModelReport:
         """
         Stores a hidden [CLINICAL_REPORT] entry from Athena as a server_only report
@@ -543,13 +820,18 @@ class WeeklyConsiliumService:
             else AthenaClinicalLogEntry.model_validate(log_entry)
         )
 
-        resolved_sprint_id = self._resolve_or_create_sprint_id(cycle_id, sprint_id)
+        log_ts = self._parse_iso_datetime_utc(validated.timestamp) or as_of
+        resolved_sprint_id = self._resolve_or_create_sprint_id(
+            cycle_id, sprint_id, as_of=log_ts
+        )
 
         payload = validated.model_dump()
         if not payload.get("timestamp"):
-            payload["timestamp"] = datetime.now(timezone.utc).isoformat()
+            payload["timestamp"] = (log_ts or self._now_utc()).isoformat()
         payload["agent_role"] = AegisAgentRole.ATHENA_CURATOR.value
         payload["sprint_id"] = resolved_sprint_id
+        if event_type:
+            payload["event_type"] = event_type
 
         return self.report_repo.create_next_version(
             cycle_id=cycle_id,
@@ -594,12 +876,11 @@ class WeeklyConsiliumService:
         except ValueError:
             return None
 
-    @classmethod
     def _resolve_seven_day_window(
-        cls, reference_date: Optional[str | datetime] = None
+        self, reference_date: Optional[str | datetime] = None
     ) -> tuple[datetime, datetime]:
         if isinstance(reference_date, str) and len(reference_date.strip()) == 10:
-            parsed_ref = cls._parse_iso_datetime_utc(reference_date.strip())
+            parsed_ref = self._parse_iso_datetime_utc(reference_date.strip())
             if parsed_ref is not None:
                 window_end = parsed_ref.replace(
                     hour=23, minute=59, second=59, microsecond=999999
@@ -616,7 +897,7 @@ class WeeklyConsiliumService:
                 )
                 return window_start, window_end
 
-        ref_dt = cls._parse_iso_datetime_utc(reference_date) or datetime.now(timezone.utc)
+        ref_dt = self._parse_iso_datetime_utc(reference_date) or self._now_utc()
         window_end = ref_dt
         start_date = (ref_dt - timedelta(days=7)).date()
         window_start = datetime(
@@ -630,47 +911,192 @@ class WeeklyConsiliumService:
         )
         return window_start, window_end
 
+    def resolve_sprint_observation_window(
+        self,
+        cycle_id: str,
+        sprint_number: Optional[int] = None,
+        sprint_id: Optional[str] = None,
+        reference_date: Optional[str | datetime] = None,
+    ) -> Tuple[datetime, datetime]:
+        """
+        Calculates the authoritative observation time window [window_start, window_end) for a weekly sprint:
+        - When athena_schedule_anchor (T0) exists:
+            Sprint 1: [T0 - 10 min, T0 + 168 hours)
+            Sprint N (N > 1): [T0 + 168 * (N - 1) hours, T0 + 168 * N hours)
+          Guarantees fixed 168-hour observation periods derived from T0, completely decoupled from
+          the execution timestamp (distinction between execution date and observation period).
+        - When anchor does not exist: falls back to 7-day window ending at reference_date or self._now_utc().
+        """
+        anchor_dt = self.find_schedule_anchor_timestamp(cycle_id)
+        if anchor_dt is not None:
+            target_n: Optional[int] = sprint_number
+            if target_n is None and sprint_id is not None:
+                sprint_row = self.sprint_repo.get(sprint_id)
+                if sprint_row is not None and sprint_row.sprint_number:
+                    target_n = sprint_row.sprint_number
+                else:
+                    m = re.search(r'[_-]w(\d+)$', sprint_id)
+                    if m:
+                        target_n = int(m.group(1))
+
+            if target_n is None:
+                if reference_date is not None:
+                    ref_dt = self._parse_iso_datetime_utc(reference_date)
+                    if ref_dt is not None:
+                        h = (ref_dt - anchor_dt).total_seconds() / 3600.0
+                        target_n = max(1, int(h // WEEKLY_SPRINT_HOURS) + 1)
+                if target_n is None:
+                    now_dt = self._now_utc()
+                    h = (now_dt - anchor_dt).total_seconds() / 3600.0
+                    target_n = max(1, int(h // WEEKLY_SPRINT_HOURS) + 1)
+
+            if target_n == 1:
+                window_start = anchor_dt - timedelta(minutes=10)
+                window_end = anchor_dt + timedelta(hours=WEEKLY_SPRINT_HOURS)
+            else:
+                window_start = anchor_dt + timedelta(hours=WEEKLY_SPRINT_HOURS * (target_n - 1))
+                window_end = anchor_dt + timedelta(hours=WEEKLY_SPRINT_HOURS * target_n)
+
+            return window_start, window_end
+
+        return self._resolve_seven_day_window(reference_date)
+
     def get_seven_day_athena_logs(
         self,
         cycle_id: str,
         sprint_id: Optional[str] = None,
         reference_date: Optional[str | datetime] = None,
+        sprint_number: Optional[int] = None,
     ) -> List[AthenaClinicalLogEntry]:
         """
         Returns Athena's 7-day clinical diary entries for the given cycle and sprint
         in chronological order (up to the 7 daily logs of the current 7-day window):
-        - Strictly filters by cycle_id and sprint_id (when provided), never mixing previous weeks.
-        - Strictly excludes logs with future timestamps (log_dt > window_end).
-        - Strictly excludes old logs outside the 7-day window (log_dt < window_start).
+        - When athena_schedule_anchor exists, calculates exact fixed 168-hour window
+          from anchor_dt (T0), ensuring late execution does not mix adjacent weeks.
+        - Strictly filters by cycle_id, never mixing other patients or cycles.
+        - Fallback to _resolve_seven_day_window if anchor_dt is not present.
         """
-        window_start, window_end = self._resolve_seven_day_window(reference_date)
+        anchor_dt = self.find_schedule_anchor_timestamp(cycle_id)
         versions = self.report_repo.list_versions(
             cycle_id=cycle_id,
             report_type=ATHENA_CLINICAL_LOG_REPORT_TYPE,
             privacy_level=PrivacyLevel.SERVER_ONLY,
         )
-        filtered: List[AthenaClinicalLogEntry] = []
-        for r in versions:
-            if sprint_id is not None and r.sprint_id != sprint_id:
-                continue
-            content = dict(r.content or {})
-            content.pop("agent_role", None)
-            content.pop("sprint_id", None)
-            entry = AthenaClinicalLogEntry.model_validate(content)
 
-            log_dt = self._parse_iso_datetime_utc(entry.timestamp) or self._parse_iso_datetime_utc(
-                r.created_at
+        if anchor_dt is not None:
+            # 1. Authoritative 168-hour fixed grid schedule based on anchor_dt (T0)
+            target_n: Optional[int] = sprint_number
+            if target_n is None and sprint_id is not None:
+                sprint_row = self.sprint_repo.get(sprint_id)
+                if sprint_row is not None and sprint_row.sprint_number:
+                    target_n = sprint_row.sprint_number
+                else:
+                    m = re.search(r'[_-]w(\d+)$', sprint_id)
+                    if m:
+                        target_n = int(m.group(1))
+
+            if target_n is None:
+                if reference_date is not None:
+                    ref_dt = self._parse_iso_datetime_utc(reference_date)
+                    if ref_dt is not None:
+                        h = (ref_dt - anchor_dt).total_seconds() / 3600.0
+                        target_n = max(1, int(h // WEEKLY_SPRINT_HOURS) + 1)
+                if target_n is None:
+                    now_dt = self._now_utc()
+                    h = (now_dt - anchor_dt).total_seconds() / 3600.0
+                    target_n = max(1, int(h // WEEKLY_SPRINT_HOURS) + 1)
+
+            # Fixed period boundaries:
+            # Sprint 1: [anchor_dt - 10 min, anchor_dt + 168 hours)
+            # Sprint N (N > 1): [anchor_dt + 168 * (N - 1) hours, anchor_dt + 168 * N hours)
+            if target_n == 1:
+                window_start = anchor_dt - timedelta(minutes=10)
+                window_end = anchor_dt + timedelta(hours=WEEKLY_SPRINT_HOURS)
+            else:
+                window_start = anchor_dt + timedelta(hours=WEEKLY_SPRINT_HOURS * (target_n - 1))
+                window_end = anchor_dt + timedelta(hours=WEEKLY_SPRINT_HOURS * target_n)
+
+            filtered: List[AthenaClinicalLogEntry] = []
+            for r in versions:
+                # Cycle isolation guard
+                if r.cycle_id != cycle_id:
+                    continue
+
+                content = dict(r.content or {})
+                content.pop("agent_role", None)
+                content.pop("sprint_id", None)
+                entry = AthenaClinicalLogEntry.model_validate(content)
+
+                log_dt = self._parse_iso_datetime_utc(entry.timestamp) or self._parse_iso_datetime_utc(
+                    r.created_at
+                )
+                if log_dt is None:
+                    continue
+
+                # Strict fixed time window check: prevents mixing adjacent weeks even on late execution
+                if log_dt < window_start or log_dt >= window_end:
+                    continue
+
+                # Sprint identity check:
+                # Disallow logs explicitly bound to a DIFFERENT cycle
+                if r.sprint_id is not None:
+                    sprint_meta = self.sprint_repo.get(r.sprint_id)
+                    if sprint_meta is not None and sprint_meta.cycle_id != cycle_id:
+                        continue
+
+                # Acceptable sprint_id matching for target week target_n:
+                # - None (unattributed Week 1 logs)
+                # - canonical "sprint_{cycle_id}_w{target_n}"
+                # - legacy strategy sprint attribution "sprint_{cycle_id}_w{target_n - 1}"
+                # - sprint_id if explicitly specified
+                expected_ids = {
+                    None,
+                    f"sprint_{cycle_id}_w{target_n}",
+                    f"sprint_{cycle_id}_w{target_n - 1}",
+                }
+                if sprint_id is not None:
+                    expected_ids.add(sprint_id)
+
+                if r.sprint_id not in expected_ids:
+                    continue
+
+                filtered.append(entry)
+
+            filtered.sort(
+                key=lambda item: self._parse_iso_datetime_utc(item.timestamp)
+                or datetime.min.replace(tzinfo=timezone.utc)
             )
-            if log_dt is None:
-                continue
-            # Strictly exclude future dates and stale logs outside the 7-day period
-            if log_dt > window_end or log_dt < window_start:
-                continue
+            return filtered[-7:]
 
-            filtered.append(entry)
+        else:
+            # Fallback path when schedule anchor is not yet recorded (e.g. legacy tests)
+            window_start, window_end = self._resolve_seven_day_window(reference_date)
+            filtered = []
+            for r in versions:
+                if r.cycle_id != cycle_id:
+                    continue
+                if sprint_id is not None and r.sprint_id is not None and r.sprint_id != sprint_id:
+                    continue
+                content = dict(r.content or {})
+                content.pop("agent_role", None)
+                content.pop("sprint_id", None)
+                entry = AthenaClinicalLogEntry.model_validate(content)
 
-        # Return the 7-day slice (latest 7 logs in chronological order within the window)
-        return filtered[-7:]
+                log_dt = self._parse_iso_datetime_utc(entry.timestamp) or self._parse_iso_datetime_utc(
+                    r.created_at
+                )
+                if log_dt is None:
+                    continue
+                if log_dt > window_end or log_dt < window_start:
+                    continue
+
+                filtered.append(entry)
+
+            filtered.sort(
+                key=lambda item: self._parse_iso_datetime_utc(item.timestamp)
+                or datetime.min.replace(tzinfo=timezone.utc)
+            )
+            return filtered[-7:]
 
     @staticmethod
     def format_athena_diary_for_consilium(logs: List[AthenaClinicalLogEntry]) -> str:
@@ -698,6 +1124,7 @@ class WeeklyConsiliumService:
         sender: str,
         text: str,
         sprint_id: Optional[str] = None,
+        timestamp: Optional[str] = None,
     ) -> ModelReport:
         """
         Appends a chat turn ('user' or 'curator') to the server-side chat history for cycle_id
@@ -712,14 +1139,17 @@ class WeeklyConsiliumService:
         if not isinstance(text, str) or not text.strip():
             raise ValueError("Chat message text cannot be empty.")
 
-        resolved_sprint_id = self._resolve_or_create_sprint_id(cycle_id, sprint_id)
+        msg_ts = self._parse_iso_datetime_utc(timestamp)
+        resolved_sprint_id = self._resolve_or_create_sprint_id(
+            cycle_id, sprint_id, as_of=msg_ts
+        )
         existing_messages = self.get_athena_chat_history(cycle_id)
         updated_messages = list(existing_messages)
         updated_messages.append(
             {
                 "sender": "user" if sender_norm == "user" else "curator",
                 "text": text.strip(),
-                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "timestamp": timestamp or self._now_utc().isoformat(),
             }
         )
 
@@ -760,7 +1190,9 @@ class WeeklyConsiliumService:
     # 2. SERVER-SIDE ACTIVE STRATEGY & SESSION REFRESH FOR ATHENA
     # ==========================================================================
 
-    def get_active_athena_context(self, cycle_id: str) -> ActiveAthenaStrategyContext:
+    def get_active_athena_context(
+        self, cycle_id: str, as_of: Optional[datetime] = None
+    ) -> ActiveAthenaStrategyContext:
         """
         Returns the authoritative, latest active strategy and system prompt for Athena.
         - Checks versioned 'athena_active_strategy' reports first (created by Weekly Consilium).
@@ -812,7 +1244,16 @@ class WeeklyConsiliumService:
             strategy_version = 1
             sprint_id = pro_primary[0].sprint_id
 
-        logs = self.get_seven_day_athena_logs(cycle_id=cycle_id, sprint_id=sprint_id)
+        effective_dt = as_of or self._now_utc()
+        if self.find_schedule_anchor_timestamp(cycle_id) is not None:
+            active_sprint = self.resolve_active_sprint_id(cycle_id, as_of=effective_dt)
+            logs = self.get_seven_day_athena_logs(
+                cycle_id=cycle_id, sprint_id=active_sprint, reference_date=effective_dt
+            )
+        else:
+            logs = self.get_seven_day_athena_logs(
+                cycle_id=cycle_id, sprint_id=sprint_id, reference_date=effective_dt
+            )
         athena_logs_summary = self.format_athena_diary_for_consilium(logs)
 
         full_curator_context = "\n".join(
@@ -1224,7 +1665,7 @@ class WeeklyConsiliumService:
         resolved_date = (
             report_date.strip()
             if isinstance(report_date, str) and report_date.strip()
-            else datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            else self._now_utc().strftime("%Y-%m-%d")
         )
 
         async with self._get_weekly_lock(cycle_id):
@@ -1284,26 +1725,48 @@ class WeeklyConsiliumService:
                             f"Sprint '{sprint_id}' belongs to cycle '{target_sprint.cycle_id}', not '{cycle_id}'."
                         )
                     resolved_sprint_id = sprint_id
-                    resolved_sprint_number = (
-                        target_sprint.sprint_number
-                        if target_sprint is not None
-                        else len(existing_sprints) + 1
-                    )
-                else:
-                    active_sprint = self.sprint_repo.get_active_for_cycle(cycle_id)
-                    if active_sprint is not None:
-                        resolved_sprint_id = active_sprint.sprint_id
-                        resolved_sprint_number = active_sprint.sprint_number
+                    if target_sprint is not None and target_sprint.sprint_number is not None:
+                        resolved_sprint_number = target_sprint.sprint_number
                     else:
-                        resolved_sprint_number = len(existing_sprints) + 1
+                        m = re.search(r'[_-]w(\d+)$', sprint_id)
+                        if m:
+                            resolved_sprint_number = int(m.group(1))
+                        else:
+                            resolved_sprint_number = len(existing_sprints) + 1
+                else:
+                    anchor_dt = self.find_schedule_anchor_timestamp(cycle_id)
+                    if anchor_dt is not None:
+                        completed_numbers = {
+                            s.sprint_number for s in existing_sprints
+                            if s.status == "completed" and self.recover_completed_response(cycle_id, sprint_id=s.sprint_id) is not None
+                        }
+                        next_num = 1
+                        while next_num in completed_numbers:
+                            next_num += 1
+                        resolved_sprint_number = next_num
                         resolved_sprint_id = f"sprint_{cycle_id}_w{resolved_sprint_number}"[:64]
+                    else:
+                        active_sprint = self.sprint_repo.get_active_for_cycle(cycle_id)
+                        if active_sprint is not None:
+                            resolved_sprint_id = active_sprint.sprint_id
+                            resolved_sprint_number = active_sprint.sprint_number
+                        else:
+                            resolved_sprint_number = len(existing_sprints) + 1
+                            resolved_sprint_id = f"sprint_{cycle_id}_w{resolved_sprint_number}"[:64]
 
                 # 5. Load previous conclusions, active strategy, and 7-day Athena diary
                 prev_ctx = self._load_previous_consilium_context(cycle_id)
+                window_start, window_end = self.resolve_sprint_observation_window(
+                    cycle_id=cycle_id,
+                    sprint_number=resolved_sprint_number,
+                    sprint_id=resolved_sprint_id,
+                    reference_date=resolved_date,
+                )
                 seven_day_logs = self.get_seven_day_athena_logs(
                     cycle_id=cycle_id,
                     sprint_id=resolved_sprint_id,
                     reference_date=resolved_date,
+                    sprint_number=resolved_sprint_number,
                 )
                 athena_diary_str = self.format_athena_diary_for_consilium(seven_day_logs)
 
@@ -1576,6 +2039,9 @@ class WeeklyConsiliumService:
                             "sprint_id": resolved_sprint_id,
                             "sprint_number": resolved_sprint_number,
                             "report_date": resolved_date,
+                            "execution_date_utc": self._now_utc().isoformat(),
+                            "observation_period_start_utc": window_start.isoformat(),
+                            "observation_period_end_utc": window_end.isoformat(),
                             "completed_at_utc": self._now_utc().isoformat(),
                             "system_count": len(final_system_updates),
                         },

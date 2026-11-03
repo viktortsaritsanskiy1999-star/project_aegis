@@ -119,12 +119,16 @@ class _AegisConsiliumScreenState extends State<AegisConsiliumScreen> {
 
     final apiClient = _resolveApiClient();
     final vault = _resolveVaultService();
+    final int initialVaultEpoch = vault.sessionEpoch;
 
     try {
       final status = await apiClient.getCascadeStatus();
 
       // Epoch & attribution fence check after network hop
-      if (!mounted || _requestEpoch != epoch || auth.confirmedAttributionPatientId != patientId) {
+      if (!mounted ||
+          _requestEpoch != epoch ||
+          auth.confirmedAttributionPatientId != patientId ||
+          vault.sessionEpoch != initialVaultEpoch) {
         return;
       }
 
@@ -143,13 +147,19 @@ class _AegisConsiliumScreenState extends State<AegisConsiliumScreen> {
         if (!vault.isConsiliumCompleted && status.activeCycleId != null) {
           try {
             final reports = await apiClient.getClientReports(cycleId: status.activeCycleId!);
-            if (mounted && _requestEpoch == epoch && auth.confirmedAttributionPatientId == patientId) {
+            if (mounted &&
+                _requestEpoch == epoch &&
+                auth.confirmedAttributionPatientId == patientId &&
+                vault.sessionEpoch == initialVaultEpoch) {
               final bool saved = await vault.recordClientReports(
                 cycleId: status.activeCycleId!,
                 reports: reports,
                 expectedPatientId: patientId,
               );
-              if (!mounted || _requestEpoch != epoch || auth.confirmedAttributionPatientId != patientId) {
+              if (!mounted ||
+                  _requestEpoch != epoch ||
+                  auth.confirmedAttributionPatientId != patientId ||
+                  vault.sessionEpoch != initialVaultEpoch) {
                 return;
               }
               if (!saved) {
@@ -251,12 +261,17 @@ class _AegisConsiliumScreenState extends State<AegisConsiliumScreen> {
 
     final apiClient = _resolveApiClient();
     final vault = _resolveVaultService();
+    final int initialVaultEpoch = vault.sessionEpoch;
+    String? requestCycleId;
 
     try {
       // 1. Verify server status before executing or retrying
       final status = await apiClient.getCascadeStatus();
 
-      if (!mounted || _requestEpoch != epoch || auth.confirmedAttributionPatientId != patientId) {
+      if (!mounted ||
+          _requestEpoch != epoch ||
+          auth.confirmedAttributionPatientId != patientId ||
+          vault.sessionEpoch != initialVaultEpoch) {
         return;
       }
 
@@ -281,12 +296,16 @@ class _AegisConsiliumScreenState extends State<AegisConsiliumScreen> {
       }
 
       final String cycleId = status.activeCycleId!;
+      requestCycleId = cycleId;
 
       // If already completed on server (e.g. following previous timeout), recover via GET without POST
       if (status.isPrimaryConsiliumCompleted) {
         final reports = await apiClient.getClientReports(cycleId: cycleId);
 
-        if (!mounted || _requestEpoch != epoch || auth.confirmedAttributionPatientId != patientId) {
+        if (!mounted ||
+            _requestEpoch != epoch ||
+            auth.confirmedAttributionPatientId != patientId ||
+            vault.sessionEpoch != initialVaultEpoch) {
           return;
         }
 
@@ -296,7 +315,10 @@ class _AegisConsiliumScreenState extends State<AegisConsiliumScreen> {
           expectedPatientId: patientId,
         );
 
-        if (!mounted || _requestEpoch != epoch || auth.confirmedAttributionPatientId != patientId) {
+        if (!mounted ||
+            _requestEpoch != epoch ||
+            auth.confirmedAttributionPatientId != patientId ||
+            vault.sessionEpoch != initialVaultEpoch) {
           return;
         }
 
@@ -335,7 +357,10 @@ class _AegisConsiliumScreenState extends State<AegisConsiliumScreen> {
       );
 
       // Epoch & attribution fence check after network hop
-      if (!mounted || _requestEpoch != epoch || auth.confirmedAttributionPatientId != patientId) {
+      if (!mounted ||
+          _requestEpoch != epoch ||
+          auth.confirmedAttributionPatientId != patientId ||
+          vault.sessionEpoch != initialVaultEpoch) {
         return;
       }
 
@@ -351,7 +376,10 @@ class _AegisConsiliumScreenState extends State<AegisConsiliumScreen> {
       );
 
       // Epoch & attribution fence check after vault persistence
-      if (!mounted || _requestEpoch != epoch || auth.confirmedAttributionPatientId != patientId) {
+      if (!mounted ||
+          _requestEpoch != epoch ||
+          auth.confirmedAttributionPatientId != patientId ||
+          vault.sessionEpoch != initialVaultEpoch) {
         return;
       }
 
@@ -410,17 +438,32 @@ class _AegisConsiliumScreenState extends State<AegisConsiliumScreen> {
     } on AegisNetworkException catch (e) {
       // In case of network drop / socket timeout after server accepted request, check server status first
       try {
-        final recoveryStatus = await apiClient.getCascadeStatus();
-        if (mounted && _requestEpoch == epoch && auth.confirmedAttributionPatientId == patientId) {
-          if (recoveryStatus.isPrimaryConsiliumCompleted && recoveryStatus.activeCycleId != null) {
-            final reports = await apiClient.getClientReports(cycleId: recoveryStatus.activeCycleId!);
-            if (mounted && _requestEpoch == epoch && auth.confirmedAttributionPatientId == patientId) {
+        if (mounted &&
+            _requestEpoch == epoch &&
+            auth.confirmedAttributionPatientId == patientId &&
+            vault.sessionEpoch == initialVaultEpoch &&
+            requestCycleId != null) {
+          final recoveryStatus = await apiClient.getCascadeStatus();
+          if (mounted &&
+              _requestEpoch == epoch &&
+              auth.confirmedAttributionPatientId == patientId &&
+              vault.sessionEpoch == initialVaultEpoch &&
+              recoveryStatus.isPrimaryConsiliumCompleted &&
+              recoveryStatus.activeCycleId == requestCycleId) {
+            final reports = await apiClient.getClientReports(cycleId: requestCycleId);
+            if (mounted &&
+                _requestEpoch == epoch &&
+                auth.confirmedAttributionPatientId == patientId &&
+                vault.sessionEpoch == initialVaultEpoch) {
               final bool saved = await vault.recordClientReports(
-                cycleId: recoveryStatus.activeCycleId!,
+                cycleId: requestCycleId,
                 reports: reports,
                 expectedPatientId: patientId,
               );
-              if (mounted && _requestEpoch == epoch && auth.confirmedAttributionPatientId == patientId) {
+              if (mounted &&
+                  _requestEpoch == epoch &&
+                  auth.confirmedAttributionPatientId == patientId &&
+                  vault.sessionEpoch == initialVaultEpoch) {
                 if (saved) {
                   _stableIdempotencyKey = null;
                   _activeConsiliumCycleId = null;
@@ -445,17 +488,32 @@ class _AegisConsiliumScreenState extends State<AegisConsiliumScreen> {
     } on AegisTimeoutException catch (_) {
       // In case of timeout after server accepted request, check server status first
       try {
-        final recoveryStatus = await apiClient.getCascadeStatus();
-        if (mounted && _requestEpoch == epoch && auth.confirmedAttributionPatientId == patientId) {
-          if (recoveryStatus.isPrimaryConsiliumCompleted && recoveryStatus.activeCycleId != null) {
-            final reports = await apiClient.getClientReports(cycleId: recoveryStatus.activeCycleId!);
-            if (mounted && _requestEpoch == epoch && auth.confirmedAttributionPatientId == patientId) {
+        if (mounted &&
+            _requestEpoch == epoch &&
+            auth.confirmedAttributionPatientId == patientId &&
+            vault.sessionEpoch == initialVaultEpoch &&
+            requestCycleId != null) {
+          final recoveryStatus = await apiClient.getCascadeStatus();
+          if (mounted &&
+              _requestEpoch == epoch &&
+              auth.confirmedAttributionPatientId == patientId &&
+              vault.sessionEpoch == initialVaultEpoch &&
+              recoveryStatus.isPrimaryConsiliumCompleted &&
+              recoveryStatus.activeCycleId == requestCycleId) {
+            final reports = await apiClient.getClientReports(cycleId: requestCycleId);
+            if (mounted &&
+                _requestEpoch == epoch &&
+                auth.confirmedAttributionPatientId == patientId &&
+                vault.sessionEpoch == initialVaultEpoch) {
               final bool saved = await vault.recordClientReports(
-                cycleId: recoveryStatus.activeCycleId!,
+                cycleId: requestCycleId,
                 reports: reports,
                 expectedPatientId: patientId,
               );
-              if (mounted && _requestEpoch == epoch && auth.confirmedAttributionPatientId == patientId) {
+              if (mounted &&
+                  _requestEpoch == epoch &&
+                  auth.confirmedAttributionPatientId == patientId &&
+                  vault.sessionEpoch == initialVaultEpoch) {
                 if (saved) {
                   _stableIdempotencyKey = null;
                   _activeConsiliumCycleId = null;

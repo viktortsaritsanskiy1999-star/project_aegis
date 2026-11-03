@@ -6,6 +6,8 @@ import '../services/api/medical_ai_api_models.dart';
 import '../services/api/vitals_api_models.dart';
 import '../services/auth/auth_models.dart';
 import '../services/auth/auth_session_manager.dart';
+import '../services/health_data_provider.dart';
+import '../services/sync/vitals_sync_queue.dart';
 import '../services/vault_service.dart';
 import 'upload_analysis_screen.dart';
 
@@ -13,19 +15,40 @@ class SmartWatchImportScreen extends StatefulWidget {
   final AegisApiClient? apiClient;
   final AuthSessionManager? authSessionManager;
   final XFile? initialEcgFile;
+  final HealthDataProvider? healthDataProvider;
+  final VitalsSyncQueue? syncQueue;
+  final VoidCallback? onNavigateToAtlas;
 
   const SmartWatchImportScreen({
     super.key,
     this.apiClient,
     this.authSessionManager,
     this.initialEcgFile,
+    this.healthDataProvider,
+    this.syncQueue,
+    this.onNavigateToAtlas,
   });
 
+  static bool isValidBloodPressure(int? sys, int? dia) {
+    if (sys == null || dia == null) return false;
+    return sys >= 40 && sys <= 300 && dia >= 20 && dia <= 200 && sys > dia;
+  }
+
+  static bool isValidPulse(int? pulse) {
+    if (pulse == null) return false;
+    return pulse >= 20 && pulse <= 300;
+  }
+
+  static bool isValidSpo2(int? spo2) {
+    if (spo2 == null) return false;
+    return spo2 >= 50 && spo2 <= 100;
+  }
+
   @override
-  State<SmartWatchImportScreen> createState() => _SmartWatchImportScreenState();
+  State<SmartWatchImportScreen> createState() => SmartWatchImportScreenState();
 }
 
-class _SmartWatchImportScreenState extends State<SmartWatchImportScreen> {
+class SmartWatchImportScreenState extends State<SmartWatchImportScreen> {
   final TextEditingController _systolicController = TextEditingController();
   final TextEditingController _diastolicController = TextEditingController();
   final TextEditingController _pulseController = TextEditingController();
@@ -58,12 +81,159 @@ class _SmartWatchImportScreenState extends State<SmartWatchImportScreen> {
     super.dispose();
   }
 
+  bool _isSaving = false;
+  String? _lastSavedSignature;
+
   AuthSessionManager? _tryReadAuthManager() {
     try {
       return Provider.of<AuthSessionManager>(context, listen: false);
     } catch (_) {
       return null;
     }
+  }
+
+  HealthDataProvider? _tryReadHealthDataProvider() {
+    if (widget.healthDataProvider != null) return widget.healthDataProvider;
+    try {
+      return Provider.of<HealthDataProvider>(context, listen: false);
+    } catch (_) {
+      return null;
+    }
+  }
+
+  VitalsSyncQueue? _tryReadSyncQueue() {
+    if (widget.syncQueue != null) return widget.syncQueue;
+    try {
+      return Provider.of<VitalsSyncQueue>(context, listen: false);
+    } catch (_) {
+      return null;
+    }
+  }
+
+  Future<void> saveMarkersAndProceed() async {
+    if (_isEcgAnalyzing || _isSaving) return;
+
+    final vault = Provider.of<VaultService>(context, listen: false);
+    final authMgr = widget.authSessionManager ?? (mounted ? _tryReadAuthManager() : null);
+
+    // 1. Capture patient and session epoch before any async boundary
+    final String? capturedPatientId = vault.activePatientId;
+    final int capturedEpoch = vault.sessionEpoch;
+    final String? capturedAuthPatientId = authMgr?.confirmedAttributionPatientId;
+
+    // 2. Parse and validate inputs against technical bounds
+    final int? rawSys = int.tryParse(_systolicController.text.trim());
+    final int? rawDia = int.tryParse(_diastolicController.text.trim());
+    final int? rawPulse = int.tryParse(_pulseController.text.trim());
+    final int? rawSpo2 = int.tryParse(_spo2Controller.text.trim());
+
+    final bool bpValid = SmartWatchImportScreen.isValidBloodPressure(rawSys, rawDia);
+    final int? validSys = bpValid ? rawSys : null;
+    final int? validDia = bpValid ? rawDia : null;
+    final int? validPulse = SmartWatchImportScreen.isValidPulse(rawPulse) ? rawPulse : null;
+    final int? validSpo2 = SmartWatchImportScreen.isValidSpo2(rawSpo2) ? rawSpo2 : null;
+
+    final bool hasValidVitals = bpValid || validPulse != null || validSpo2 != null;
+
+    final String? ecgSummary = _latestEcgResponse != null
+        ? "ECG recorded on server (v${_latestEcgResponse!.intakeVersion}, ${_latestEcgResponse!.qualityDisplay})"
+        : null;
+
+    // 3. Preserve existing local Vault behavior
+    vault.updateSmartWatchMetrics(
+      systolic: validSys,
+      diastolic: validDia,
+      pulse: validPulse,
+      spo2: validSpo2,
+      ecgSummary: ecgSummary,
+    );
+
+    // 4. Dispatch to server sync queue if valid vitals are present
+    if (hasValidVitals) {
+      final signature = '$validSys/$validDia-$validPulse-$validSpo2';
+      if (_lastSavedSignature == signature) {
+        // Repeated save with exact same data: do not create duplicate measurements
+        _navigateToAtlas();
+        return;
+      }
+
+      setState(() {
+        _isSaving = true;
+        _errorMessage = null;
+      });
+
+      try {
+        final healthProvider = _tryReadHealthDataProvider();
+        final syncQueue = _tryReadSyncQueue();
+
+        if (healthProvider != null) {
+          if (healthProvider.syncQueue == null && syncQueue != null) {
+            healthProvider.syncQueue = syncQueue;
+          }
+          final bool success = await healthProvider.dispatchManualInput(
+            systolic: validSys,
+            diastolic: validDia,
+            pulse: validPulse,
+            spo2: validSpo2,
+            ecgStatus: ecgSummary,
+          );
+          if (!success && healthProvider.hasEnqueueError) {
+            if (!mounted) return;
+            setState(() {
+              _isSaving = false;
+              _errorMessage = "Sync queue error: ${healthProvider.lastEnqueueErrorMessage}";
+            });
+            return;
+          }
+        } else if (syncQueue != null) {
+          final measurement = HealthMeasurement(
+            timestamp: DateTime.now(),
+            pulse: validPulse,
+            systolic: validSys,
+            diastolic: validDia,
+            spo2: validSpo2,
+            ecgStatus: ecgSummary,
+            source: HealthDataSource.manualInput,
+            isSimulated: false,
+          );
+          await syncQueue.enqueue(
+            measurement,
+            phase: 'standby',
+          );
+          syncQueue.scheduleFlush();
+        }
+
+        _lastSavedSignature = signature;
+      } catch (e) {
+        if (!mounted) return;
+        setState(() {
+          _isSaving = false;
+          _errorMessage = "Failed to sync manual vitals: $e";
+        });
+        return;
+      } finally {
+        if (mounted) {
+          setState(() {
+            _isSaving = false;
+          });
+        }
+      }
+    }
+
+    if (!mounted) return;
+
+    // 5. Patient session epoch fencing check
+    if (vault.activePatientId != capturedPatientId ||
+        vault.sessionEpoch != capturedEpoch ||
+        (authMgr != null && authMgr.confirmedAttributionPatientId != capturedAuthPatientId)) {
+      setState(() {
+        _isSaving = false;
+        _errorMessage = "Patient session changed during save. Operation aborted.";
+      });
+      return;
+    }
+
+    _navigateToAtlas();
   }
 
   Future<void> _pickAndAnalyzeEcg() async {
@@ -362,8 +532,6 @@ class _SmartWatchImportScreenState extends State<SmartWatchImportScreen> {
 
   @override
   Widget build(BuildContext context) {
-    final vault = Provider.of<VaultService>(context, listen: false);
-
     return Scaffold(
       backgroundColor: const Color(0xFF1A1A1A),
       body: SafeArea(
@@ -588,7 +756,7 @@ class _SmartWatchImportScreenState extends State<SmartWatchImportScreen> {
                     child: TextField(
                       controller: _systolicController,
                       keyboardType: TextInputType.number,
-                      enabled: !_isEcgAnalyzing,
+                      enabled: !_isEcgAnalyzing && !_isSaving,
                       style: const TextStyle(color: Colors.white),
                       decoration: const InputDecoration(
                         hintText: "Sys (e.g. 120)",
@@ -604,7 +772,7 @@ class _SmartWatchImportScreenState extends State<SmartWatchImportScreen> {
                     child: TextField(
                       controller: _diastolicController,
                       keyboardType: TextInputType.number,
-                      enabled: !_isEcgAnalyzing,
+                      enabled: !_isEcgAnalyzing && !_isSaving,
                       style: const TextStyle(color: Colors.white),
                       decoration: const InputDecoration(
                         hintText: "Dia (e.g. 80)",
@@ -628,7 +796,7 @@ class _SmartWatchImportScreenState extends State<SmartWatchImportScreen> {
                         TextField(
                           controller: _pulseController,
                           keyboardType: TextInputType.number,
-                          enabled: !_isEcgAnalyzing,
+                          enabled: !_isEcgAnalyzing && !_isSaving,
                           style: const TextStyle(color: Colors.white),
                           decoration: const InputDecoration(
                             hintText: "E.g. 72",
@@ -648,7 +816,7 @@ class _SmartWatchImportScreenState extends State<SmartWatchImportScreen> {
                         TextField(
                           controller: _spo2Controller,
                           keyboardType: TextInputType.number,
-                          enabled: !_isEcgAnalyzing,
+                          enabled: !_isEcgAnalyzing && !_isSaving,
                           style: const TextStyle(color: Colors.white),
                           decoration: const InputDecoration(
                             hintText: "E.g. 98",
@@ -663,55 +831,39 @@ class _SmartWatchImportScreenState extends State<SmartWatchImportScreen> {
               ),
               const SizedBox(height: 50),
 
-              // SAVE DATA BUTTON (DISABLED DURING ANALYSIS)
+              // SAVE DATA BUTTON (DISABLED DURING ANALYSIS OR SAVING)
               SizedBox(
                 width: double.infinity,
                 height: 55,
                 child: ElevatedButton(
                   style: ElevatedButton.styleFrom(
-                    backgroundColor: _isEcgAnalyzing
+                    backgroundColor: (_isEcgAnalyzing || _isSaving)
                         ? Colors.white10
                         : const Color(0x1A00FF7F),
                     disabledBackgroundColor: Colors.white10,
                     side: BorderSide(
-                      color: _isEcgAnalyzing ? Colors.white12 : Colors.greenAccent,
+                      color: (_isEcgAnalyzing || _isSaving) ? Colors.white12 : Colors.greenAccent,
                       width: 1,
                     ),
                     shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
                   ),
-                  onPressed: _isEcgAnalyzing
+                  onPressed: (_isEcgAnalyzing || _isSaving)
                       ? null
-                      : () {
-                          final int? sys = int.tryParse(_systolicController.text);
-                          final int? dia = int.tryParse(_diastolicController.text);
-                          final int? pulse = int.tryParse(_pulseController.text);
-                          final int? spo2 = int.tryParse(_spo2Controller.text);
-
-                          final String? ecgSummary = _latestEcgResponse != null
-                              ? "ECG recorded on server (v${_latestEcgResponse!.intakeVersion}, ${_latestEcgResponse!.qualityDisplay})"
-                              : null;
-
-                          vault.updateSmartWatchMetrics(
-                            systolic: (sys != null && dia != null) ? sys : null,
-                            diastolic: (sys != null && dia != null) ? dia : null,
-                            pulse: pulse,
-                            spo2: spo2,
-                            ecgSummary: ecgSummary,
-                          );
-
-                          _navigateToAtlas();
-                        },
-                  child: _isEcgAnalyzing
-                      ? const Row(
+                      : saveMarkersAndProceed,
+                  child: (_isEcgAnalyzing || _isSaving)
+                      ? Row(
                           mainAxisAlignment: MainAxisAlignment.center,
                           children: [
-                            SizedBox(
+                            const SizedBox(
                               width: 18,
                               height: 18,
                               child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white38),
                             ),
-                            SizedBox(width: 12),
-                            Text("Analyzing image...", style: TextStyle(color: Colors.white38, fontSize: 15)),
+                            const SizedBox(width: 12),
+                            Text(
+                              _isEcgAnalyzing ? "Analyzing image..." : "Saving markers...",
+                              style: const TextStyle(color: Colors.white38, fontSize: 15),
+                            ),
                           ],
                         )
                       : const Text(
@@ -724,10 +876,10 @@ class _SmartWatchImportScreenState extends State<SmartWatchImportScreen> {
 
               // SKIP ALL BUTTON
               TextButton(
-                onPressed: _isEcgAnalyzing ? null : () => _navigateToAtlas(),
+                onPressed: (_isEcgAnalyzing || _isSaving) ? null : () => _navigateToAtlas(),
                 child: Text(
                   "Skip this step",
-                  style: TextStyle(color: _isEcgAnalyzing ? Colors.white12 : Colors.white38, fontSize: 14),
+                  style: TextStyle(color: (_isEcgAnalyzing || _isSaving) ? Colors.white12 : Colors.white38, fontSize: 14),
                 ),
               ),
             ],
@@ -745,6 +897,10 @@ class _SmartWatchImportScreenState extends State<SmartWatchImportScreen> {
   }
 
   void _navigateToAtlas() {
+    if (widget.onNavigateToAtlas != null) {
+      widget.onNavigateToAtlas!();
+      return;
+    }
     Navigator.pushReplacement(
       context,
       MaterialPageRoute(builder: (context) => const UploadAnalysisScreen()),
