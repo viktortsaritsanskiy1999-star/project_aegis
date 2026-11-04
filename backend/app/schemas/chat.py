@@ -1,6 +1,91 @@
 from datetime import datetime, timezone
+from enum import Enum
 from typing import Any, Dict, List, Literal, Optional
 from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+
+class AthenaGoalStatus(str, Enum):
+    """Execution status for an individual observation goal in Athena's weekly plan."""
+    ACTIVE = "active"
+    COMPLETED = "completed"
+    DEFERRED = "deferred"
+    UNRESOLVED = "unresolved"
+
+
+class AthenaGoalItem(BaseModel):
+    """
+    Structured observation goal within the Athena Weekly Plan.
+    Focuses on clinical necessity, avoiding repeat questions for already known facts.
+    """
+    model_config = ConfigDict(extra="forbid")
+
+    goal_id: str = Field(description="Unique goal identifier, e.g. 'goal_1'")
+    title: str = Field(description="Short title of the observation goal")
+    clinical_rationale: str = Field(description="Why this observation is needed based on Pro strategy")
+    priority: int = Field(ge=1, le=5, description="Priority rank from 1 (highest) to 5")
+    known_facts: List[str] = Field(default_factory=list, description="Already established facts to prevent repetitive questions")
+    target_clarification: str = Field(description="Specific information or symptom dynamics to clarify")
+    sufficiency_criteria: str = Field(description="Criteria determining when the answer is clinically sufficient to complete this goal")
+    status: AthenaGoalStatus = Field(default=AthenaGoalStatus.ACTIVE)
+    progress_notes: Optional[str] = Field(default=None, description="Progress notes recorded during dialogue")
+    questions_asked_count: int = Field(default=0, ge=0, description="Number of questions asked for this goal")
+
+
+class AthenaWeeklyPlanRecord(BaseModel):
+    """
+    Athena's structured 7-day observation goal plan (Stage 1).
+    Stored in model_reports (report_type='athena_weekly_plan', SERVER_ONLY).
+    Contains as many meaningful goals as necessary (not constrained to 7 days).
+    """
+    model_config = ConfigDict(extra="forbid")
+
+    plan_id: str
+    cycle_id: str
+    week_number: int = Field(ge=1)
+    source_strategy_report_id: Optional[str] = None
+    source_strategy_version: Optional[int] = None
+    created_at_utc: str
+    summary_for_curator: str = Field(description="Internal strategy summary for Athena")
+    goals: List[AthenaGoalItem] = Field(min_length=1, max_length=20, description="List of observation goals")
+    status: str = Field(default="active")
+
+
+class AthenaGoalProgressionDecision(BaseModel):
+    """
+    Structured evaluation output parsed from [GOAL_PROGRESSION] block
+    produced by Gemini Flash during patient turn evaluation.
+    """
+    model_config = ConfigDict(extra="ignore", str_strip_whitespace=True)
+
+    goal_id: str
+    is_sufficient: bool = False
+    decision: Literal["completed", "clarify", "deferred", "unresolved"] = "completed"
+    reasoning: str = Field(default="", description="Clinical evaluation rationale for sufficiency")
+    unresolved_points: List[str] = Field(default_factory=list)
+    next_action: Literal["ask_clarification", "ask_next_goal", "conclude_day", "no_active_goals"] = "conclude_day"
+    clarifying_question: Optional[str] = None
+
+
+class AthenaPlanExecutionLogEntry(BaseModel):
+    """
+    Technical execution log entry for Athena's weekly plan progression (Stage 2).
+    Stored under report_type='athena_plan_execution_log', SERVER_ONLY.
+    STRICTLY FORBIDDEN to be exposed in Weekly Consilium or patient chat.
+    """
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    log_id: str
+    cycle_id: str
+    sprint_number: int = Field(default=1, ge=1)
+    sprint_day: int = Field(default=1, ge=1, le=7)
+    goal_id: str
+    goal_title: str
+    goal_status: AthenaGoalStatus
+    questions_asked_count: int = Field(default=0, ge=0)
+    transition_reason: str
+    unresolved_points: List[str] = Field(default_factory=list)
+    next_action: str
+    timestamp_utc: str
 
 
 class AthenaVitalsAlertContext(BaseModel):
@@ -36,6 +121,7 @@ class AthenaChatRequest(BaseModel):
             "vitals_alert",
             "daily_pulse",
             "initial_greeting",
+            "first_planned_question",
             "routine_answer",
             "out_of_turn_message",
             "wearable_event",

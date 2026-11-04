@@ -120,6 +120,15 @@ class Settings(BaseSettings):
         default="https://generativelanguage.googleapis.com/v1beta",
         alias="AEGIS_GEMINI_BASE_URL",
     )
+    # Stage 1 & Stage A2.2 automation flags (disabled by default in production)
+    enable_weekly_plan: bool = Field(
+        default=False,
+        alias="AEGIS_ENABLE_WEEKLY_PLAN",
+    )
+    enable_daily_journal: bool = Field(
+        default=False,
+        alias="AEGIS_ENABLE_DAILY_JOURNAL",
+    )
 
 
 settings = Settings()

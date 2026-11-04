@@ -58,9 +58,11 @@ class AutomationJobType(str, Enum):
       and is NEVER scheduled as an automatic intake job.
     - Athena does NOT generate 24-hour timer questions without patient replies.
     - `post_primary_init`: post-Primary Athena initial greeting & T0 anchor.
+    - `first_planned_question`: Stage 1 first planned question at T0 + 30s linked to weekly plan.
     - `daily_journal_closure`: evidence-preserving daily journal closure + internal Gemini Flash assessment (Stage A2.2).
     """
     POST_PRIMARY_INIT = "post_primary_init"
+    FIRST_PLANNED_QUESTION = "first_planned_question"
     DAILY_JOURNAL_CLOSURE = "daily_journal_closure"
 
 
@@ -121,6 +123,7 @@ class ClinicalAutomationService:
         base_backoff_seconds: int = DEFAULT_BASE_BACKOFF_SECONDS,
         max_backoff_seconds: int = DEFAULT_MAX_BACKOFF_SECONDS,
         enable_daily_journal: bool = False,
+        enable_weekly_plan: bool = False,
     ):
         self.db = db
         self.gateway = gateway or GeminiGateway()
@@ -130,6 +133,7 @@ class ClinicalAutomationService:
         self.base_backoff_seconds = max(1, int(base_backoff_seconds))
         self.max_backoff_seconds = max(self.base_backoff_seconds, int(max_backoff_seconds))
         self.enable_daily_journal = enable_daily_journal
+        self.enable_weekly_plan = enable_weekly_plan
 
         self.cycle_repo = MedicalCycleRepository(db)
         self.report_repo = ModelReportRepository(db)
@@ -216,6 +220,7 @@ class ClinicalAutomationService:
         job_type: AutomationJobType | str = AutomationJobType.POST_PRIMARY_INIT,
         idempotency_key: Optional[str] = None,
         max_attempts: int = DEFAULT_JOB_MAX_ATTEMPTS,
+        next_attempt_at_utc: Optional[str] = None,
     ) -> AutomationJobRecord:
         clean_patient = (patient_id or "").strip()
         clean_cycle = (cycle_id or "").strip()
@@ -233,7 +238,7 @@ class ClinicalAutomationService:
         except ValueError as exc:
             raise ValueError(
                 f"Unsupported automation job_type '{job_type}'. "
-                "First Primary Consilium is manual; only 'post_primary_init' and 'daily_journal_closure' are allowed."
+                "First Primary Consilium is manual; only supported automation jobs are allowed."
             ) from exc
 
         cycle = self.cycle_repo.get(clean_cycle)
@@ -249,6 +254,17 @@ class ClinicalAutomationService:
                 raise ConsiliumContextMissingError(
                     f"Cannot enqueue post-Primary initialization for cycle '{clean_cycle}': "
                     "manual Primary Consilium has not been completed yet."
+                )
+        elif resolved_type == AutomationJobType.FIRST_PLANNED_QUESTION:
+            if not self.primary_service.is_primary_consilium_completed(clean_cycle):
+                raise ConsiliumContextMissingError(
+                    f"Cannot enqueue first planned question for cycle '{clean_cycle}': "
+                    "manual Primary Consilium has not been completed yet."
+                )
+            if self.weekly_service.find_schedule_anchor_timestamp(clean_cycle) is None:
+                raise ConsiliumContextMissingError(
+                    f"Cannot enqueue first planned question for cycle '{clean_cycle}': "
+                    "schedule anchor T0 has not been established yet."
                 )
         elif resolved_type == AutomationJobType.DAILY_JOURNAL_CLOSURE:
             if not self.primary_service.is_primary_consilium_completed(clean_cycle):
@@ -292,7 +308,7 @@ class ClinicalAutomationService:
             status=AutomationJobStatus.PENDING,
             attempts=0,
             max_attempts=max(1, int(max_attempts)),
-            next_attempt_at_utc=now_iso,
+            next_attempt_at_utc=next_attempt_at_utc or now_iso,
             lease_owner_id=None,
             lease_expires_at_utc=None,
             renewed_at_utc=None,
@@ -367,6 +383,42 @@ class ClinicalAutomationService:
                 clean_cycle, AutomationJobType.POST_PRIMARY_INIT
             ),
             max_attempts=max_attempts,
+        )
+
+    def enqueue_first_planned_question(
+        self,
+        *,
+        cycle_id: str,
+        patient_id: Optional[str] = None,
+        available_at_utc: datetime,
+        max_attempts: int = DEFAULT_JOB_MAX_ATTEMPTS,
+    ) -> Optional[AutomationJobRecord]:
+        """
+        Enqueues the first planned question (first_planned_question) at T0 + 30 seconds.
+        Idempotent: at most one first question job per cycle.
+        """
+        clean_cycle = (cycle_id or "").strip()
+        if not clean_cycle:
+            return None
+        cycle = self.cycle_repo.get(clean_cycle)
+        if cycle is None:
+            return None
+        effective_patient_id = (patient_id or cycle.patient_id or "").strip()
+        if not effective_patient_id:
+            return None
+        if not self.primary_service.is_primary_consilium_completed(clean_cycle):
+            return None
+        if self.weekly_service.find_schedule_anchor_timestamp(clean_cycle) is None:
+            return None
+
+        idempotency_key = f"first_planned_q_{clean_cycle}"
+        return self.enqueue_or_get_job(
+            patient_id=effective_patient_id,
+            cycle_id=clean_cycle,
+            job_type=AutomationJobType.FIRST_PLANNED_QUESTION,
+            idempotency_key=idempotency_key,
+            max_attempts=max_attempts,
+            next_attempt_at_utc=available_at_utc.isoformat(),
         )
 
     def enqueue_daily_journal_closure(
@@ -511,6 +563,26 @@ class ClinicalAutomationService:
             )
             if job is not None:
                 discovered.append(job)
+
+            # Discover first_planned_question if weekly plan enabled and anchor T0 established
+            if self.enable_weekly_plan:
+                anchor_dt = self.weekly_service.find_schedule_anchor_timestamp(cycle.cycle_id)
+                if anchor_dt is not None:
+                    has_unanswered = self.athena_service.has_unanswered_routine_question(cycle.cycle_id)
+                    q1_key = f"first_planned_q_{cycle.cycle_id}"
+                    existing_q1_job = self.get_job(
+                        cycle_id=cycle.cycle_id,
+                        job_type=AutomationJobType.FIRST_PLANNED_QUESTION,
+                        idempotency_key=q1_key,
+                    )
+                    if not has_unanswered and existing_q1_job is None:
+                        q1_job = self.enqueue_first_planned_question(
+                            cycle_id=cycle.cycle_id,
+                            patient_id=cycle.patient_id,
+                            available_at_utc=anchor_dt + timedelta(seconds=30),
+                        )
+                        if q1_job is not None:
+                            discovered.append(q1_job)
 
             # Discover completed observation days requiring daily journal closure
             if should_discover_dj:
@@ -968,10 +1040,12 @@ class ClinicalAutomationService:
         Executes Stage A1 post-Primary initialization (`post_primary_init`):
         1. Verifies patient/cycle ownership and that manual Primary Consilium is completed.
         2. Yields if a cycle consilium coordination lock (`lock_consilium_coord_{cycle_id}`) is active.
-        3. If a valid post-Primary initial greeting / T0 schedule anchor already exists
+        3. Generates or retrieves Athena's 7-day Weekly Plan (Stage 1).
+        4. If a valid post-Primary initial greeting / T0 schedule anchor already exists
            (e.g., created by the Flutter app), reuses it without calling Gemini.
-        4. Otherwise invokes `AthenaChatService.handle_turn` with `event_type="initial_greeting"`
+        5. Otherwise invokes `AthenaChatService.handle_turn` with `event_type="initial_greeting"`
            and the job's stable cycle-scoped idempotency key (`athena_init_greeting_{cycle_id}`).
+        6. Enqueues the first planned question (`first_planned_question`) with next_attempt_at_utc = T0 + 30s.
         """
         cycle = self.cycle_repo.get(job.cycle_id)
         if cycle is None or cycle.patient_id != job.patient_id:
@@ -993,35 +1067,107 @@ class ClinicalAutomationService:
                 f"(until {lock_content.get('expires_at_utc')}); deferring post-Primary initialization."
             )
 
+        # 1. If weekly plan is enabled, generate and save Athena's 7-day Weekly Plan (Stage 1)
+        plan_id = None
+        q1_available_at = None
+        if self.enable_weekly_plan:
+            from app.services.athena_weekly_plan_service import AthenaWeeklyPlanService
+            plan_service = AthenaWeeklyPlanService(
+                db=self.db, gateway=self.gateway, now_provider=self.now_provider
+            )
+            plan = await plan_service.create_or_get_weekly_plan(job.cycle_id, week_number=1)
+            plan_id = plan.plan_id
+
+        # 2. Execute or reuse initial greeting at T0
         existing_greeting = self.athena_service.find_existing_post_primary_initial_greeting(
             job.cycle_id
         )
         if existing_greeting is not None:
             anchor_dt = self.weekly_service.find_schedule_anchor_timestamp(job.cycle_id)
+            reused = True
+            msg_id = existing_greeting.message_id
+            effective_anchor = anchor_dt or self._now_utc()
+        else:
+            response = await self.athena_service.handle_turn(
+                patient_id=job.patient_id,
+                cycle_id=job.cycle_id,
+                request=AthenaChatRequest(
+                    message="Start accompaniment",
+                    event_type="initial_greeting",
+                    idempotency_key=job.idempotency_key,
+                ),
+            )
+            anchor_dt = self.weekly_service.find_schedule_anchor_timestamp(job.cycle_id)
+            reused = False
+            msg_id = response.message_id
+            effective_anchor = anchor_dt or self._now_utc()
+
+        # 3. Schedule first planned question at T0 + 30 seconds if weekly plan enabled
+        if self.enable_weekly_plan:
+            q1_available_at = effective_anchor + timedelta(seconds=30)
+            self.enqueue_first_planned_question(
+                cycle_id=job.cycle_id,
+                patient_id=job.patient_id,
+                available_at_utc=q1_available_at,
+            )
+
+        res_meta: Dict[str, Any] = {
+            "reused_existing": reused,
+            "message_id": msg_id,
+            "anchor_timestamp_utc": effective_anchor.isoformat(),
+        }
+        if plan_id is not None:
+            res_meta["weekly_plan_id"] = plan_id
+        if q1_available_at is not None:
+            res_meta["first_question_available_at_utc"] = q1_available_at.isoformat()
+        return res_meta
+
+    async def _execute_first_planned_question(
+        self, job: AutomationJobRecord
+    ) -> Dict[str, Any]:
+        """
+        Executes Stage 1 first planned question (`first_planned_question`):
+        1. Verifies patient/cycle ownership and coordination lock.
+        2. Reuses existing unanswered routine question if already formulated.
+        3. Formulates the first targeted question based on Goal 1 from Athena's Weekly Plan.
+        4. Registers the question as unanswered routine question in `model_reports`.
+        """
+        cycle = self.cycle_repo.get(job.cycle_id)
+        if cycle is None or cycle.patient_id != job.patient_id:
+            raise ConsiliumCycleNotFoundError(
+                f"Active cycle '{job.cycle_id}' not found for patient '{job.patient_id}'."
+            )
+
+        active_consilium_lock = self.weekly_service._get_active_in_flight_lock(job.cycle_id)
+        if active_consilium_lock is not None:
+            lock_content = active_consilium_lock.content or {}
+            raise ConsiliumConcurrencyConflictError(
+                f"Consilium lease active for cycle '{job.cycle_id}' "
+                f"(until {lock_content.get('expires_at_utc')}); deferring first planned question."
+            )
+
+        active_q = self.athena_service.get_active_routine_question(job.cycle_id)
+        if active_q is not None and active_q.get("status") == "unanswered":
             return {
                 "reused_existing": True,
-                "message_id": existing_greeting.message_id,
-                "anchor_timestamp_utc": (
-                    anchor_dt.isoformat() if anchor_dt is not None else existing_greeting.created_at
-                ),
+                "question_id": active_q.get("question_id"),
+                "question_text": active_q.get("question_text"),
             }
 
         response = await self.athena_service.handle_turn(
             patient_id=job.patient_id,
             cycle_id=job.cycle_id,
             request=AthenaChatRequest(
-                message="Start accompaniment",
-                event_type="initial_greeting",
+                message="Ask first planned question",
+                event_type="first_planned_question",
                 idempotency_key=job.idempotency_key,
             ),
         )
-        anchor_dt = self.weekly_service.find_schedule_anchor_timestamp(job.cycle_id)
         return {
             "reused_existing": False,
             "message_id": response.message_id,
-            "anchor_timestamp_utc": (
-                anchor_dt.isoformat() if anchor_dt is not None else response.created_at
-            ),
+            "question_id": response.question_id,
+            "routine_question_status": response.routine_question_status,
         }
 
     async def _execute_daily_journal_closure(
@@ -1091,6 +1237,12 @@ class ClinicalAutomationService:
                     claimed.job_id,
                     lease_owner_id,
                     lambda: self._execute_post_primary_init(claimed),
+                )
+            elif claimed.job_type == AutomationJobType.FIRST_PLANNED_QUESTION:
+                result_meta = await self._execute_with_job_lease_renewal(
+                    claimed.job_id,
+                    lease_owner_id,
+                    lambda: self._execute_first_planned_question(claimed),
                 )
             elif claimed.job_type == AutomationJobType.DAILY_JOURNAL_CLOSURE:
                 result_meta = await self._execute_with_job_lease_renewal(
@@ -1166,6 +1318,7 @@ class ClinicalAutomationWorker:
         base_backoff_seconds: int = DEFAULT_BASE_BACKOFF_SECONDS,
         max_backoff_seconds: int = DEFAULT_MAX_BACKOFF_SECONDS,
         enable_daily_journal: bool = False,
+        enable_weekly_plan: bool = False,
     ):
         self.session_factory = session_factory
         self.gateway_factory = gateway_factory or GeminiGateway
@@ -1176,6 +1329,7 @@ class ClinicalAutomationWorker:
         self.base_backoff_seconds = base_backoff_seconds
         self.max_backoff_seconds = max_backoff_seconds
         self.enable_daily_journal = enable_daily_journal
+        self.enable_weekly_plan = enable_weekly_plan
 
         self._wake_event: Optional[asyncio.Event] = None
         self._stop_event: Optional[asyncio.Event] = None
@@ -1208,6 +1362,7 @@ class ClinicalAutomationWorker:
                 base_backoff_seconds=self.base_backoff_seconds,
                 max_backoff_seconds=self.max_backoff_seconds,
                 enable_daily_journal=self.enable_daily_journal,
+                enable_weekly_plan=self.enable_weekly_plan,
             )
             return await service.process_due_jobs(
                 discover=discover,

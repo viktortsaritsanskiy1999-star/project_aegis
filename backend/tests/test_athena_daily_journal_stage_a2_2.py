@@ -215,13 +215,23 @@ async def test_01_patient_answer_preserved_verbatim(tmp_path: Path):
         athena_service = AthenaChatService(db=session, gateway=gw, now_provider=clock.now)
 
         # 1. Day 1: Routine question asked
-        q_resp = await athena_service.handle_turn(
+        await athena_service.handle_turn(
             patient_id="pat_01",
             cycle_id="cyc_01",
             request=AthenaChatRequest(
                 message="Start accompaniment",
                 event_type="initial_greeting",
                 idempotency_key="init_cyc_01",
+            ),
+        )
+        clock.advance(seconds=30)
+        q_resp = await athena_service.handle_turn(
+            patient_id="pat_01",
+            cycle_id="cyc_01",
+            request=AthenaChatRequest(
+                message="First question",
+                event_type="first_planned_question",
+                idempotency_key="q1_cyc_01",
             ),
         )
 
@@ -426,6 +436,16 @@ async def test_04_no_response_but_available_wellness_data(tmp_path: Path):
                 message="Start accompaniment",
                 event_type="initial_greeting",
                 idempotency_key="init_cyc_04",
+            ),
+        )
+        clock.advance(seconds=30)
+        await athena_service.handle_turn(
+            patient_id="pat_04",
+            cycle_id="cyc_04",
+            request=AthenaChatRequest(
+                message="First question",
+                event_type="first_planned_question",
+                idempotency_key="q1_cyc_04",
             ),
         )
 
@@ -1071,6 +1091,16 @@ async def test_17_substantive_evidence_triggers_mocked_gemini_flash_assessment(t
                 idempotency_key="init_cyc_17",
             ),
         )
+        clock.advance(seconds=30)
+        await athena_service.handle_turn(
+            patient_id="pat_17",
+            cycle_id="cyc_17",
+            request=AthenaChatRequest(
+                message="First question",
+                event_type="first_planned_question",
+                idempotency_key="q1_cyc_17",
+            ),
+        )
 
         # 2. Spontaneous out-of-turn message + wearable measurement (routine question remains pending!)
         clock.advance(hours=3)
@@ -1129,7 +1159,7 @@ async def test_17_substantive_evidence_triggers_mocked_gemini_flash_assessment(t
         assert call["method"] == "generate_structured"
         assert call["schema"] == "AthenaDailyAssessmentModelOutput"
         assert call["kwargs"]["model"] == GeminiModelRole.FLASH
-        assert "You are Athena, a personal curator for Wellness" in call["kwargs"]["system_instruction"]
+        assert "You are Athena (" in call["kwargs"]["system_instruction"]
         assert "Monitor blood pressure and sleep" in call["kwargs"]["system_instruction"]
 
         # Verify persisted journal Section D

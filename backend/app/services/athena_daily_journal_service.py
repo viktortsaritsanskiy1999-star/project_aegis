@@ -289,6 +289,7 @@ class AthenaDailyJournalService:
             if raw_text.startswith((
                 "[Initialization]:",
                 "[Daily Pulse",
+                "[First Question]:",
                 "[Reminder]:",
                 "[Vitals Alert]:",
                 "[Wearable Event]:",

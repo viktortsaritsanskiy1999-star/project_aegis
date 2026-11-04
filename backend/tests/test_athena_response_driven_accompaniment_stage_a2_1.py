@@ -81,6 +81,18 @@ def _create_file_db(db_path: Path, busy_timeout_ms: int = 5000):
     return engine, SessionFactory
 
 
+def _gemini_text_envelope(text: str) -> Dict[str, Any]:
+    return {
+        "candidates": [
+            {
+                "content": {
+                    "parts": [{"text": text}]
+                }
+            }
+        ]
+    }
+
+
 def _build_athena_gateway(recorded_calls: List[Dict[str, Any]]) -> GeminiGateway:
     state = {"calls": 0}
 
@@ -105,6 +117,22 @@ def _build_athena_gateway(recorded_calls: List[Dict[str, Any]]) -> GeminiGateway
         if "you are the head of department" in prompt_text.lower():
             return httpx.Response(200, json=_gemini_envelope(_sample_weekly_flash_output()))
 
+        if "первое знакомство" in prompt_text.lower() or "initialization" in prompt_text.lower() or "initial_greeting" in prompt_text.lower():
+            reply = (
+                "Здравствуйте! Меня зовут Афина. Я ваш персональный AI-ассистент в системе Aegis. "
+                "Я буду рядом, чтобы помогать вам беречь здоровье.\n\n"
+                "[CLINICAL_REPORT]\n"
+                "{\n"
+                '  "status": "INITIALIZATION",\n'
+                '  "symptoms_mentioned": [],\n'
+                '  "adherence_to_plan": "UNKNOWN",\n'
+                '  "red_flags": false,\n'
+                '  "summary_for_master": "Athena onboarding completed. Baseline initialization."\n'
+                "}\n"
+                "[/CLINICAL_REPORT]"
+            )
+            return httpx.Response(200, json=_gemini_text_envelope(reply))
+
         reply = (
             f"Здравствуйте! Я Афина. Вопрос шага {idx + 1}: Как вы оцениваете качество своего сна сегодня?\n\n"
             "[CLINICAL_REPORT]\n"
@@ -118,7 +146,7 @@ def _build_athena_gateway(recorded_calls: List[Dict[str, Any]]) -> GeminiGateway
             "}\n"
             "[/CLINICAL_REPORT]"
         )
-        return httpx.Response(200, json=_gemini_envelope(reply))
+        return httpx.Response(200, json=_gemini_text_envelope(reply))
 
     return GeminiGateway(
         api_key="test-stage-a2-1-key",
@@ -213,13 +241,26 @@ async def test_01_first_question_awaits_patient_response(tmp_path: Path):
 
         assert athena_service.has_unanswered_routine_question("cycle_01") is False
 
-        # Execute post-Primary initial greeting
-        resp = await athena_service.handle_turn(
+        # Execute post-Primary initial greeting (greeting only at T0)
+        greeting_resp = await athena_service.handle_turn(
             patient_id="pat_01",
             cycle_id="cycle_01",
             request=AthenaChatRequest(
                 event_type="initial_greeting",
                 idempotency_key="init_pat_01_cycle_01",
+            ),
+        )
+        assert greeting_resp.routine_question_status is None
+        assert athena_service.has_unanswered_routine_question("cycle_01") is False
+
+        # First planned question at T0 + 30 seconds
+        clock.advance(seconds=30)
+        resp = await athena_service.handle_turn(
+            patient_id="pat_01",
+            cycle_id="cycle_01",
+            request=AthenaChatRequest(
+                event_type="first_planned_question",
+                idempotency_key="q1_pat_01_cycle_01",
             ),
         )
 
@@ -258,13 +299,22 @@ async def test_02_unanswered_question_blocks_new_routine_questions_over_multiple
             db=session, gateway=gateway, now_provider=clock.now
         )
 
-        # Initial greeting generates question 1
+        # Initial greeting and first planned question
         await athena_service.handle_turn(
             patient_id="pat_02",
             cycle_id="cycle_02",
             request=AthenaChatRequest(
                 event_type="initial_greeting",
                 idempotency_key="init_02",
+            ),
+        )
+        clock.advance(seconds=30)
+        await athena_service.handle_turn(
+            patient_id="pat_02",
+            cycle_id="cycle_02",
+            request=AthenaChatRequest(
+                event_type="first_planned_question",
+                idempotency_key="q1_02",
             ),
         )
         initial_calls_count = len(calls)
@@ -340,13 +390,22 @@ async def test_03_bounded_reminders_without_gemini_calls(tmp_path: Path):
             reminder_cooldown_seconds=0,
         )
 
-        # Initial greeting generates question 1
+        # Initial greeting and first planned question
         await athena_service.handle_turn(
             patient_id="pat_03",
             cycle_id="cycle_03",
             request=AthenaChatRequest(
                 event_type="initial_greeting",
                 idempotency_key="init_03",
+            ),
+        )
+        clock.advance(seconds=30)
+        await athena_service.handle_turn(
+            patient_id="pat_03",
+            cycle_id="cycle_03",
+            request=AthenaChatRequest(
+                event_type="first_planned_question",
+                idempotency_key="q1_03",
             ),
         )
         calls_after_init = len(calls)
@@ -415,13 +474,22 @@ async def test_04_patient_answer_permits_next_strategy_driven_question(tmp_path:
             db=session, gateway=gateway, now_provider=clock.now
         )
 
-        # Initial greeting generates question 1
+        # Initial greeting and first planned question
         await athena_service.handle_turn(
             patient_id="pat_04",
             cycle_id="cycle_04",
             request=AthenaChatRequest(
                 event_type="initial_greeting",
                 idempotency_key="init_04",
+            ),
+        )
+        clock.advance(seconds=30)
+        await athena_service.handle_turn(
+            patient_id="pat_04",
+            cycle_id="cycle_04",
+            request=AthenaChatRequest(
+                event_type="first_planned_question",
+                idempotency_key="q1_04",
             ),
         )
         assert athena_service.has_unanswered_routine_question("cycle_04") is True
@@ -482,13 +550,22 @@ async def test_05_exceptional_events_do_not_consume_routine_question(tmp_path: P
             db=session, gateway=gateway, now_provider=clock.now
         )
 
-        # Initial greeting generates question 1
-        q1_resp = await athena_service.handle_turn(
+        # Initial greeting and first planned question
+        await athena_service.handle_turn(
             patient_id="pat_05",
             cycle_id="cycle_05",
             request=AthenaChatRequest(
                 event_type="initial_greeting",
                 idempotency_key="init_05",
+            ),
+        )
+        clock.advance(seconds=30)
+        q1_resp = await athena_service.handle_turn(
+            patient_id="pat_05",
+            cycle_id="cycle_05",
+            request=AthenaChatRequest(
+                event_type="first_planned_question",
+                idempotency_key="q1_05",
             ),
         )
         q1_id = q1_resp.question_id
@@ -584,13 +661,22 @@ async def test_06_duplicate_retry_and_idempotency_safety(tmp_path: Path):
             reminder_cooldown_seconds=0,
         )
 
-        # Initial greeting
+        # Initial greeting and first planned question
         await athena_service.handle_turn(
             patient_id="pat_06",
             cycle_id="cycle_06",
             request=AthenaChatRequest(
                 event_type="initial_greeting",
                 idempotency_key="init_06",
+            ),
+        )
+        clock.advance(seconds=30)
+        await athena_service.handle_turn(
+            patient_id="pat_06",
+            cycle_id="cycle_06",
+            request=AthenaChatRequest(
+                event_type="first_planned_question",
+                idempotency_key="q1_06",
             ),
         )
 
@@ -680,6 +766,15 @@ async def test_07_patient_and_cycle_isolation(tmp_path: Path):
                 idempotency_key="init_A",
             ),
         )
+        clock.advance(seconds=30)
+        await athena_service.handle_turn(
+            patient_id="pat_A",
+            cycle_id="cycle_A",
+            request=AthenaChatRequest(
+                event_type="first_planned_question",
+                idempotency_key="q1_A",
+            ),
+        )
         assert athena_service.has_unanswered_routine_question("cycle_A") is True
 
         # Patient B gets initial question and ANSWERS
@@ -689,6 +784,15 @@ async def test_07_patient_and_cycle_isolation(tmp_path: Path):
             request=AthenaChatRequest(
                 event_type="initial_greeting",
                 idempotency_key="init_B",
+            ),
+        )
+        clock.advance(seconds=30)
+        await athena_service.handle_turn(
+            patient_id="pat_B",
+            cycle_id="cycle_B",
+            request=AthenaChatRequest(
+                event_type="first_planned_question",
+                idempotency_key="q1_B",
             ),
         )
         await athena_service.handle_turn(
@@ -768,6 +872,15 @@ async def test_08_weekly_schedule_unaffected_by_missing_replies(tmp_path: Path):
                 idempotency_key="init_08",
             ),
         )
+        clock.advance(seconds=30)
+        await athena_service.handle_turn(
+            patient_id="pat_08",
+            cycle_id="cycle_08",
+            request=AthenaChatRequest(
+                event_type="first_planned_question",
+                idempotency_key="q1_08",
+            ),
+        )
         assert athena_service.has_unanswered_routine_question("cycle_08") is True
 
         # Before 168 hours: Sprint 1 is ongoing, cannot start next sprint
@@ -822,6 +935,15 @@ async def test_09_cascade_status_endpoint_reports_routine_question_state(tmp_pat
             request=AthenaChatRequest(
                 event_type="initial_greeting",
                 idempotency_key="init_09",
+            ),
+        )
+        clock.advance(seconds=30)
+        await athena_service.handle_turn(
+            patient_id="pat_09",
+            cycle_id="cycle_09",
+            request=AthenaChatRequest(
+                event_type="first_planned_question",
+                idempotency_key="q1_09",
             ),
         )
 

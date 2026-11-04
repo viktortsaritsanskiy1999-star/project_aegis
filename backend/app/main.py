@@ -45,7 +45,11 @@ async def lifespan(app: FastAPI):
         worker_session_factory = sessionmaker(
             autocommit=False, autoflush=False, bind=db_engine
         )
-        worker = ClinicalAutomationWorker(session_factory=worker_session_factory)
+        worker = ClinicalAutomationWorker(
+            session_factory=worker_session_factory,
+            enable_weekly_plan=settings.enable_weekly_plan,
+            enable_daily_journal=settings.enable_daily_journal,
+        )
         app.state.automation_worker = worker
         await worker.start()
     try:

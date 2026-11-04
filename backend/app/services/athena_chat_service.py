@@ -53,6 +53,7 @@ DEFAULT_REMINDER_COOLDOWN_SECONDS = 0
 
 # Regex for stripping [CLINICAL_REPORT] JSON block
 CLINICAL_REPORT_REGEX = re.compile(r"\[CLINICAL_REPORT\]([\s\S]*?)\[/CLINICAL_REPORT\]", re.IGNORECASE)
+GOAL_PROGRESSION_REGEX = re.compile(r"\[GOAL_PROGRESSION\]([\s\S]*?)\[/GOAL_PROGRESSION\]", re.IGNORECASE)
 EMERGENCY_TRIGGER_REGEX = re.compile(r"\[EMERGENCY_TRIGGER\]", re.IGNORECASE)
 
 # Keywords indicating acute emergency triggers in user messages
@@ -430,6 +431,7 @@ class AthenaChatService:
             # 5. Formulate Prompt & Clean Record Text based on event_type
             prompt_text, user_record_text = self._build_turn_prompt_and_record(
                 request,
+                resolved_cycle_id,
                 effective_sprint_day=effective_sprint_day,
             )
 
@@ -492,7 +494,7 @@ class AthenaChatService:
                     )
 
                     # 8. Post-Processing: Extract Structured Signals, Sanitize Reply & Flush Clinical Log
-                    clean_reply, emergency_triggered, emergency_notice = self._process_and_persist_reports(
+                    clean_reply, emergency_triggered, emergency_notice, parsed_prog = self._process_and_persist_reports(
                         cycle_id=resolved_cycle_id,
                         sprint_id=active_sprint_id,
                         raw_response=raw_response,
@@ -522,19 +524,23 @@ class AthenaChatService:
                         commit=False,
                     )
 
-                    # 10. Update / Record routine question state
+                    # 10. Update / Record routine question state & Goal Progression (Stage 2)
                     turn_question_id: Optional[str] = None
                     turn_routine_status: Optional[str] = None
                     turn_reminders_count: Optional[int] = None
 
-                    # 10. Update / Record routine question state
-                    turn_question_id: Optional[str] = None
-                    turn_routine_status: Optional[str] = None
-                    turn_reminders_count: Optional[int] = None
+                    from app.services.athena_weekly_plan_service import AthenaWeeklyPlanService
+                    from app.schemas.chat import AthenaGoalStatus
+
+                    plan_svc = AthenaWeeklyPlanService(
+                        db=self.db, gateway=self.gateway, now_provider=self.now_provider
+                    )
+                    active_plan = plan_svc.get_active_weekly_plan(resolved_cycle_id)
 
                     has_patient_reply = bool(request.message and request.message.strip())
 
                     # If this turn contains a patient reply, mark previous outstanding question as answered
+                    prev_active_q = None
                     if request.event_type in ("routine_answer", "user_message") or (
                         request.event_type == "daily_pulse" and has_patient_reply
                     ):
@@ -558,37 +564,287 @@ class AthenaChatService:
                                 commit=False,
                             )
 
+                    # Stage 2 Goal Progression: if an active weekly plan exists and patient answered a routine question
+                    if active_plan is not None and (
+                        request.event_type == "routine_answer"
+                        or (request.event_type == "user_message" and prev_active_q is not None)
+                    ):
+                        prev_goal_id = prev_active_q.get("goal_id") if prev_active_q else None
+                        eval_goal_id = (parsed_prog.get("goal_id") if parsed_prog else None) or prev_goal_id
+                        target_goal = None
+                        if eval_goal_id:
+                            target_goal = next((g for g in active_plan.goals if g.goal_id == eval_goal_id), None)
+                        if target_goal is None:
+                            target_goal = plan_svc.get_current_active_goal(resolved_cycle_id)
+
+                        if target_goal is not None:
+                            raw_decision = (parsed_prog.get("decision") if parsed_prog else "completed") or "completed"
+                            is_sufficient = bool(parsed_prog.get("is_sufficient", True)) if parsed_prog else True
+                            reasoning = str((parsed_prog.get("reasoning") if parsed_prog else "") or "Response evaluated against sufficiency criteria.")
+                            unresolved_pts = list((parsed_prog.get("unresolved_points") if parsed_prog else []) or [])
+                            next_act = str((parsed_prog.get("next_action") if parsed_prog else "conclude_day") or "conclude_day")
+
+                            daily_questions_count = plan_svc.get_daily_planned_questions_count(
+                                resolved_cycle_id, as_of=turn_dt
+                            )
+                            budget_remaining = max(0, 3 - daily_questions_count)
+
+                            if raw_decision == "completed" or (is_sufficient and raw_decision not in ("deferred", "unresolved")):
+                                plan_svc.mark_goal_completed(
+                                    resolved_cycle_id, target_goal.goal_id, notes=reasoning, commit=False
+                                )
+                                if next_act == "ask_next_goal" and budget_remaining > 0:
+                                    next_g = plan_svc.get_next_active_goal(resolved_cycle_id, current_goal_id=target_goal.goal_id)
+                                    if next_g is not None:
+                                        turn_question_id = f"rq_{resolved_cycle_id}_s{effective_sprint_number or 1}_d{effective_sprint_day or 1}_{uuid.uuid4().hex[:8]}"
+                                        turn_routine_status = "unanswered"
+                                        turn_reminders_count = 0
+                                        new_routine_q = {
+                                            "question_id": turn_question_id,
+                                            "goal_id": next_g.goal_id,
+                                            "cycle_id": resolved_cycle_id,
+                                            "patient_id": clean_patient_id,
+                                            "sprint_number": effective_sprint_number or 1,
+                                            "sprint_day": effective_sprint_day or 1,
+                                            "status": "unanswered",
+                                            "question_text": clean_reply,
+                                            "message_id": message_id,
+                                            "asked_at_utc": turn_now_iso,
+                                            "reminders_count": 0,
+                                            "max_reminders": DEFAULT_MAX_ROUTINE_REMINDERS,
+                                            "last_reminded_at_utc": None,
+                                            "answered_at_utc": None,
+                                            "answer_text": None,
+                                            "answer_message_id": None,
+                                        }
+                                        self.report_repo.create_next_version(
+                                            cycle_id=resolved_cycle_id,
+                                            sprint_id=active_sprint_id,
+                                            model=self.gateway.flash_model,
+                                            report_type=ATHENA_ROUTINE_QUESTION_REPORT_TYPE,
+                                            privacy_level=PrivacyLevel.SERVER_ONLY,
+                                            content=new_routine_q,
+                                            commit=False,
+                                        )
+                                        plan_svc.record_goal_question_asked(resolved_cycle_id, next_g.goal_id, commit=False)
+                                        plan_svc.record_plan_execution_log(
+                                            cycle_id=resolved_cycle_id,
+                                            goal_id=target_goal.goal_id,
+                                            goal_title=target_goal.title,
+                                            goal_status=AthenaGoalStatus.COMPLETED,
+                                            questions_asked_count=target_goal.questions_asked_count,
+                                            transition_reason=reasoning,
+                                            unresolved_points=unresolved_pts,
+                                            next_action="ask_next_goal",
+                                            sprint_number=effective_sprint_number or 1,
+                                            sprint_day=effective_sprint_day or 1,
+                                            as_of=turn_dt,
+                                            commit=False,
+                                        )
+                                    else:
+                                        plan_svc.record_plan_execution_log(
+                                            cycle_id=resolved_cycle_id,
+                                            goal_id=target_goal.goal_id,
+                                            goal_title=target_goal.title,
+                                            goal_status=AthenaGoalStatus.COMPLETED,
+                                            questions_asked_count=target_goal.questions_asked_count,
+                                            transition_reason=reasoning,
+                                            unresolved_points=unresolved_pts,
+                                            next_action="no_active_goals",
+                                            sprint_number=effective_sprint_number or 1,
+                                            sprint_day=effective_sprint_day or 1,
+                                            as_of=turn_dt,
+                                            commit=False,
+                                        )
+                                else:
+                                    plan_svc.record_plan_execution_log(
+                                        cycle_id=resolved_cycle_id,
+                                        goal_id=target_goal.goal_id,
+                                        goal_title=target_goal.title,
+                                        goal_status=AthenaGoalStatus.COMPLETED,
+                                        questions_asked_count=target_goal.questions_asked_count,
+                                        transition_reason=reasoning,
+                                        unresolved_points=unresolved_pts,
+                                        next_action="conclude_day",
+                                        sprint_number=effective_sprint_number or 1,
+                                        sprint_day=effective_sprint_day or 1,
+                                        as_of=turn_dt,
+                                        commit=False,
+                                    )
+
+                            elif raw_decision == "clarify":
+                                # Enforce invariants: max 1 clarification (<2 questions asked) and daily budget (>0 remaining)
+                                if target_goal.questions_asked_count < 2 and budget_remaining > 0:
+                                    turn_question_id = f"rq_{resolved_cycle_id}_s{effective_sprint_number or 1}_d{effective_sprint_day or 1}_{uuid.uuid4().hex[:8]}"
+                                    turn_routine_status = "unanswered"
+                                    turn_reminders_count = 0
+                                    new_routine_q = {
+                                        "question_id": turn_question_id,
+                                        "goal_id": target_goal.goal_id,
+                                        "cycle_id": resolved_cycle_id,
+                                        "patient_id": clean_patient_id,
+                                        "sprint_number": effective_sprint_number or 1,
+                                        "sprint_day": effective_sprint_day or 1,
+                                        "status": "unanswered",
+                                        "question_text": clean_reply,
+                                        "message_id": message_id,
+                                        "asked_at_utc": turn_now_iso,
+                                        "reminders_count": 0,
+                                        "max_reminders": DEFAULT_MAX_ROUTINE_REMINDERS,
+                                        "last_reminded_at_utc": None,
+                                        "answered_at_utc": None,
+                                        "answer_text": None,
+                                        "answer_message_id": None,
+                                    }
+                                    self.report_repo.create_next_version(
+                                        cycle_id=resolved_cycle_id,
+                                        sprint_id=active_sprint_id,
+                                        model=self.gateway.flash_model,
+                                        report_type=ATHENA_ROUTINE_QUESTION_REPORT_TYPE,
+                                        privacy_level=PrivacyLevel.SERVER_ONLY,
+                                        content=new_routine_q,
+                                        commit=False,
+                                    )
+                                    up_g = plan_svc.record_goal_question_asked(
+                                        resolved_cycle_id, target_goal.goal_id, commit=False
+                                    )
+                                    plan_svc.record_plan_execution_log(
+                                        cycle_id=resolved_cycle_id,
+                                        goal_id=target_goal.goal_id,
+                                        goal_title=target_goal.title,
+                                        goal_status=AthenaGoalStatus.ACTIVE,
+                                        questions_asked_count=up_g.questions_asked_count if up_g else target_goal.questions_asked_count + 1,
+                                        transition_reason=reasoning or "Clarification requested for active goal.",
+                                        unresolved_points=unresolved_pts,
+                                        next_action="ask_clarification",
+                                        sprint_number=effective_sprint_number or 1,
+                                        sprint_day=effective_sprint_day or 1,
+                                        as_of=turn_dt,
+                                        commit=False,
+                                    )
+                                elif budget_remaining <= 0:
+                                    plan_svc.defer_goal(
+                                        resolved_cycle_id,
+                                        target_goal.goal_id,
+                                        reason="Daily planned question limit (3) reached; deferred to next observation day.",
+                                        commit=False,
+                                    )
+                                    plan_svc.record_plan_execution_log(
+                                        cycle_id=resolved_cycle_id,
+                                        goal_id=target_goal.goal_id,
+                                        goal_title=target_goal.title,
+                                        goal_status=AthenaGoalStatus.DEFERRED,
+                                        questions_asked_count=target_goal.questions_asked_count,
+                                        transition_reason="Daily planned question limit (3) reached; deferred to next observation day.",
+                                        unresolved_points=unresolved_pts,
+                                        next_action="conclude_day",
+                                        sprint_number=effective_sprint_number or 1,
+                                        sprint_day=effective_sprint_day or 1,
+                                        as_of=turn_dt,
+                                        commit=False,
+                                    )
+                                else:
+                                    plan_svc.mark_goal_unresolved(
+                                        resolved_cycle_id,
+                                        target_goal.goal_id,
+                                        reason="Maximum clarification attempts reached without meeting sufficiency criteria.",
+                                        commit=False,
+                                    )
+                                    plan_svc.record_plan_execution_log(
+                                        cycle_id=resolved_cycle_id,
+                                        goal_id=target_goal.goal_id,
+                                        goal_title=target_goal.title,
+                                        goal_status=AthenaGoalStatus.UNRESOLVED,
+                                        questions_asked_count=target_goal.questions_asked_count,
+                                        transition_reason="Maximum clarification attempts reached without meeting sufficiency criteria.",
+                                        unresolved_points=unresolved_pts,
+                                        next_action="conclude_day",
+                                        sprint_number=effective_sprint_number or 1,
+                                        sprint_day=effective_sprint_day or 1,
+                                        as_of=turn_dt,
+                                        commit=False,
+                                    )
+
+                            elif raw_decision == "deferred":
+                                plan_svc.defer_goal(resolved_cycle_id, target_goal.goal_id, reason=reasoning, commit=False)
+                                plan_svc.record_plan_execution_log(
+                                    cycle_id=resolved_cycle_id,
+                                    goal_id=target_goal.goal_id,
+                                    goal_title=target_goal.title,
+                                    goal_status=AthenaGoalStatus.DEFERRED,
+                                    questions_asked_count=target_goal.questions_asked_count,
+                                    transition_reason=reasoning or "Goal deferred to next day.",
+                                    unresolved_points=unresolved_pts,
+                                    next_action="conclude_day",
+                                    sprint_number=effective_sprint_number or 1,
+                                    sprint_day=effective_sprint_day or 1,
+                                    as_of=turn_dt,
+                                    commit=False,
+                                )
+
+                            elif raw_decision == "unresolved":
+                                plan_svc.mark_goal_unresolved(resolved_cycle_id, target_goal.goal_id, reason=reasoning, commit=False)
+                                plan_svc.record_plan_execution_log(
+                                    cycle_id=resolved_cycle_id,
+                                    goal_id=target_goal.goal_id,
+                                    goal_title=target_goal.title,
+                                    goal_status=AthenaGoalStatus.UNRESOLVED,
+                                    questions_asked_count=target_goal.questions_asked_count,
+                                    transition_reason=reasoning or "Goal marked unresolved.",
+                                    unresolved_points=unresolved_pts,
+                                    next_action="conclude_day",
+                                    sprint_number=effective_sprint_number or 1,
+                                    sprint_day=effective_sprint_day or 1,
+                                    as_of=turn_dt,
+                                    commit=False,
+                                )
+
                     # If this turn formulates a new routine question, record it as unanswered
-                    if request.event_type in ("initial_greeting", "daily_pulse"):
-                        turn_question_id = f"rq_{resolved_cycle_id}_s{effective_sprint_number or 1}_d{effective_sprint_day or 1}_{uuid.uuid4().hex[:8]}"
-                        turn_routine_status = "unanswered"
-                        turn_reminders_count = 0
-                        new_routine_q = {
-                            "question_id": turn_question_id,
-                            "cycle_id": resolved_cycle_id,
-                            "patient_id": clean_patient_id,
-                            "sprint_number": effective_sprint_number or 1,
-                            "sprint_day": effective_sprint_day or 1,
-                            "status": "unanswered",
-                            "question_text": clean_reply,
-                            "message_id": message_id,
-                            "asked_at_utc": turn_now_iso,
-                            "reminders_count": 0,
-                            "max_reminders": DEFAULT_MAX_ROUTINE_REMINDERS,
-                            "last_reminded_at_utc": None,
-                            "answered_at_utc": None,
-                            "answer_text": None,
-                            "answer_message_id": None,
-                        }
-                        self.report_repo.create_next_version(
-                            cycle_id=resolved_cycle_id,
-                            sprint_id=active_sprint_id,
-                            model=self.gateway.flash_model,
-                            report_type=ATHENA_ROUTINE_QUESTION_REPORT_TYPE,
-                            privacy_level=PrivacyLevel.SERVER_ONLY,
-                            content=new_routine_q,
-                            commit=False,
+                    if request.event_type in ("first_planned_question", "daily_pulse"):
+                        all_goals_done = (
+                            active_plan is not None
+                            and plan_svc.are_all_goals_completed(resolved_cycle_id)
                         )
+                        if request.event_type == "daily_pulse" and all_goals_done:
+                            turn_question_id = None
+                            turn_routine_status = None
+                            turn_reminders_count = 0
+                        else:
+                            cur_g = plan_svc.get_current_active_goal(resolved_cycle_id) if active_plan else None
+                            turn_question_id = f"rq_{resolved_cycle_id}_s{effective_sprint_number or 1}_d{effective_sprint_day or 1}_{uuid.uuid4().hex[:8]}"
+                            turn_routine_status = "unanswered"
+                            turn_reminders_count = 0
+                            new_routine_q = {
+                                "question_id": turn_question_id,
+                                "goal_id": cur_g.goal_id if cur_g else None,
+                                "cycle_id": resolved_cycle_id,
+                                "patient_id": clean_patient_id,
+                                "sprint_number": effective_sprint_number or 1,
+                                "sprint_day": effective_sprint_day or 1,
+                                "status": "unanswered",
+                                "question_text": clean_reply,
+                                "message_id": message_id,
+                                "asked_at_utc": turn_now_iso,
+                                "reminders_count": 0,
+                                "max_reminders": DEFAULT_MAX_ROUTINE_REMINDERS,
+                                "last_reminded_at_utc": None,
+                                "answered_at_utc": None,
+                                "answer_text": None,
+                                "answer_message_id": None,
+                            }
+                            self.report_repo.create_next_version(
+                                cycle_id=resolved_cycle_id,
+                                sprint_id=active_sprint_id,
+                                model=self.gateway.flash_model,
+                                report_type=ATHENA_ROUTINE_QUESTION_REPORT_TYPE,
+                                privacy_level=PrivacyLevel.SERVER_ONLY,
+                                content=new_routine_q,
+                                commit=False,
+                            )
+                            if cur_g is not None:
+                                plan_svc.record_goal_question_asked(
+                                    resolved_cycle_id, cur_g.goal_id, commit=False
+                                )
                     elif request.event_type not in ("routine_answer", "user_message"):
                         # vitals_alert, wearable_event, out_of_turn_message
                         active_q = self.get_active_routine_question(resolved_cycle_id)
@@ -1106,9 +1362,10 @@ class AthenaChatService:
             chat_history = self.weekly_service.get_athena_chat_history(cycle_id)
             return system_prompt, chat_history, None
 
-    @staticmethod
     def _build_turn_prompt_and_record(
+        self,
         request: AthenaChatRequest,
+        cycle_id: str,
         effective_sprint_day: Optional[int] = None,
     ) -> Tuple[str, str]:
         event_type = request.event_type
@@ -1190,6 +1447,44 @@ YOUR INSTRUCTION:
                 )
             s_day = effective_sprint_day or request.sprint_day or 1
             is_sprint_end = (s_day == 7)
+
+            from app.services.athena_weekly_plan_service import AthenaWeeklyPlanService
+            from app.services.consilium_prompts import build_athena_routine_answer_progression_prompt
+
+            plan_service = AthenaWeeklyPlanService(
+                db=self.db, gateway=self.gateway, now_provider=self.now_provider
+            )
+            active_plan = plan_service.get_active_weekly_plan(cycle_id)
+            if active_plan is not None:
+                active_q = self.get_active_routine_question(cycle_id)
+                target_goal = None
+                if active_q and active_q.get("goal_id"):
+                    target_goal = next((g for g in active_plan.goals if g.goal_id == active_q.get("goal_id")), None)
+                if target_goal is None:
+                    target_goal = plan_service.get_current_active_goal(cycle_id)
+
+                if target_goal is not None:
+                    daily_count = plan_service.get_daily_planned_questions_count(cycle_id)
+                    budget_rem = max(0, 3 - daily_count)
+                    next_g = plan_service.get_next_active_goal(cycle_id, current_goal_id=target_goal.goal_id)
+
+                    prompt = build_athena_routine_answer_progression_prompt(
+                        patient_answer=msg,
+                        goal_id=target_goal.goal_id,
+                        goal_title=target_goal.title,
+                        target_clarification=target_goal.target_clarification,
+                        clinical_rationale=target_goal.clinical_rationale,
+                        sufficiency_criteria=target_goal.sufficiency_criteria,
+                        known_facts=target_goal.known_facts,
+                        questions_asked_for_goal=target_goal.questions_asked_count,
+                        questions_asked_today=daily_count,
+                        daily_budget_remaining=budget_rem,
+                        has_next_goal=(next_g is not None),
+                        next_goal_title=next_g.title if next_g else None,
+                        is_sprint_end=is_sprint_end,
+                    )
+                    return prompt, msg
+
             teaser_phrase = (
                 '- SINCE TODAY IS DAY 7 OF THE SPRINT: At the very end of the response on a new line, '
                 'add a natural teaser phrase: "By the way, wait a minute, let me show you how you spent this week!"\n'
@@ -1201,7 +1496,7 @@ YOUR INSTRUCTION:
 1. If the response is ordinary and routine:
    - Briefly comment on the response with empathy.
    - Confirm data recording.
-   - Say goodbye until tomorrow.
+   - If daily check-in is complete, say goodbye until tomorrow; if asking a clarifying question, do not say goodbye.
    {teaser_phrase}   - Fill in [CLINICAL_REPORT] with "NORMAL" or "ALERT" status (depending on plan adherence).
 
 2. If the user reported POOR WELL-BEING (pain, weakness, nausea, anxiety):
@@ -1214,6 +1509,20 @@ YOUR INSTRUCTION:
 
         if event_type == "daily_pulse":
             s_day = effective_sprint_day or request.sprint_day or 1
+            from app.services.athena_weekly_plan_service import AthenaWeeklyPlanService
+            from app.services.consilium_prompts import build_athena_daily_pulse_all_completed_prompt
+
+            plan_service = AthenaWeeklyPlanService(
+                db=self.db, gateway=self.gateway, now_provider=self.now_provider
+            )
+            if plan_service.get_active_weekly_plan(cycle_id) and plan_service.are_all_goals_completed(cycle_id):
+                prompt = build_athena_daily_pulse_all_completed_prompt(
+                    cycle_id=cycle_id,
+                    sprint_day=s_day,
+                )
+                user_record = f"[Daily Pulse]: Day {s_day} check-in (all goals completed)"
+                return prompt, user_record
+
             prompt = f"""Service pulse: A NEW DAY HAS COME (ROUTINE MODE). Current sprint day: {s_day} of 7.
 Study the history of past answers and the current step of the Pro route.
 1. Gently greet the user.
@@ -1224,12 +1533,48 @@ Study the history of past answers and the current step of the Pro route.
             return prompt, user_record
 
         if event_type == "initial_greeting":
-            prompt = """Service pulse: FIRST INTRODUCTION.
-Briefly and sincerely introduce yourself (Athena), say that you will help follow the route.
-Formulate the first targeted guiding question on the first step of the Pro route with 2-3 everyday response options.
-Don't forget to generate the initial [CLINICAL_REPORT].
-"""
+            from app.services.consilium_prompts import build_athena_initial_greeting_prompt
+            prompt = build_athena_initial_greeting_prompt()
             user_record = "[Initialization]: First introduction"
+            return prompt, user_record
+
+        if event_type == "first_planned_question":
+            from app.services.athena_weekly_plan_service import AthenaWeeklyPlanService
+            from app.services.consilium_prompts import build_athena_first_question_prompt
+
+            plan_service = AthenaWeeklyPlanService(
+                db=self.db, gateway=self.gateway, now_provider=self.now_provider
+            )
+            active_goal = plan_service.get_current_active_goal(cycle_id)
+            if active_goal is not None:
+                goal_title = active_goal.title
+                target_clarification = active_goal.target_clarification
+                clinical_rationale = active_goal.clinical_rationale
+                known_facts = active_goal.known_facts
+                goal_id = active_goal.goal_id
+            else:
+                goal_title = "Самочувствие и адаптация к режиму"
+                target_clarification = "Уточнить общее утреннее самочувствие и уровень энергии"
+                clinical_rationale = "Первичное установление базового самочувствия"
+                known_facts = []
+                goal_id = "goal_1"
+
+            pro_focus = "Адаптация к режиму наблюдения и базовое самочувствие"
+            try:
+                ctx = self.weekly_service.get_active_athena_context(cycle_id)
+                if ctx and ctx.active_strategy_text:
+                    pro_focus = ctx.active_strategy_text[:300]
+            except Exception:
+                pass
+
+            prompt = build_athena_first_question_prompt(
+                goal_title=goal_title,
+                target_clarification=target_clarification,
+                clinical_rationale=clinical_rationale,
+                known_facts=known_facts,
+                pro_strategy_focus=pro_focus,
+            )
+            user_record = f"[First Question]: Goal {goal_id}"
             return prompt, user_record
 
         # Default: user_message
@@ -1241,6 +1586,45 @@ Don't forget to generate the initial [CLINICAL_REPORT].
             )
         s_day = effective_sprint_day or request.sprint_day or 1
         is_sprint_end = (s_day == 7)
+
+        # If user_message is answering an outstanding routine question and weekly plan is active
+        active_q = self.get_active_routine_question(cycle_id)
+        if active_q is not None and active_q.get("status") == "unanswered":
+            from app.services.athena_weekly_plan_service import AthenaWeeklyPlanService
+            from app.services.consilium_prompts import build_athena_routine_answer_progression_prompt
+
+            plan_service = AthenaWeeklyPlanService(
+                db=self.db, gateway=self.gateway, now_provider=self.now_provider
+            )
+            active_plan = plan_service.get_active_weekly_plan(cycle_id)
+            if active_plan is not None:
+                target_goal = None
+                if active_q.get("goal_id"):
+                    target_goal = next((g for g in active_plan.goals if g.goal_id == active_q.get("goal_id")), None)
+                if target_goal is None:
+                    target_goal = plan_service.get_current_active_goal(cycle_id)
+
+                if target_goal is not None:
+                    daily_count = plan_service.get_daily_planned_questions_count(cycle_id)
+                    budget_rem = max(0, 3 - daily_count)
+                    next_g = plan_service.get_next_active_goal(cycle_id, current_goal_id=target_goal.goal_id)
+
+                    prompt = build_athena_routine_answer_progression_prompt(
+                        patient_answer=msg,
+                        goal_id=target_goal.goal_id,
+                        goal_title=target_goal.title,
+                        target_clarification=target_goal.target_clarification,
+                        clinical_rationale=target_goal.clinical_rationale,
+                        sufficiency_criteria=target_goal.sufficiency_criteria,
+                        known_facts=target_goal.known_facts,
+                        questions_asked_for_goal=target_goal.questions_asked_count,
+                        questions_asked_today=daily_count,
+                        daily_budget_remaining=budget_rem,
+                        has_next_goal=(next_g is not None),
+                        next_goal_title=next_g.title if next_g else None,
+                        is_sprint_end=is_sprint_end,
+                    )
+                    return prompt, msg
 
         teaser_phrase = (
             '- SINCE TODAY IS DAY 7 OF THE SPRINT: At the very end of the response on a new line, '
@@ -1254,7 +1638,7 @@ YOUR INSTRUCTION:
 1. If the response is ordinary and routine:
    - Briefly comment on the response with empathy.
    - Confirm data recording.
-   - Say goodbye until tomorrow.
+   - If daily check-in is complete, say goodbye until tomorrow; if asking a clarifying question, do not say goodbye.
    {teaser_phrase}   - Fill in [CLINICAL_REPORT] with "NORMAL" or "ALERT" status (depending on plan adherence).
 
 2. If the user reported POOR WELL-BEING (pain, weakness, nausea, anxiety):
@@ -1354,7 +1738,7 @@ YOUR INSTRUCTION:
         event_type: Optional[str] = None,
         as_of: Optional[datetime] = None,
         commit: bool = True,
-    ) -> Tuple[str, bool, Optional[str]]:
+    ) -> Tuple[str, bool, Optional[str], Optional[Dict[str, Any]]]:
         working_text = raw_response
 
         # 1. Detect and strip [EMERGENCY_TRIGGER]
@@ -1399,9 +1783,27 @@ YOUR INSTRUCTION:
             # Completely strip [CLINICAL_REPORT] from client text
             working_text = CLINICAL_REPORT_REGEX.sub("", working_text).strip()
 
-        # Extra defense-in-depth: strip unclosed clinical report blocks, emergency trigger tags, or internal headers
+        # 3. Extract and parse [GOAL_PROGRESSION] JSON
+        prog_match = GOAL_PROGRESSION_REGEX.search(working_text)
+        parsed_prog: Optional[Dict[str, Any]] = None
+
+        if prog_match:
+            raw_prog_json = prog_match.group(1).strip()
+            raw_prog_json = re.sub(r"^```json\s*", "", raw_prog_json, flags=re.IGNORECASE)
+            raw_prog_json = re.sub(r"^```\s*", "", raw_prog_json)
+            raw_prog_json = re.sub(r"\s*```$", "", raw_prog_json)
+            try:
+                parsed_prog = json.loads(raw_prog_json)
+            except Exception as prog_err:
+                logger.warning(f"Failed to parse Athena hidden [GOAL_PROGRESSION]: {prog_err}")
+
+            working_text = GOAL_PROGRESSION_REGEX.sub("", working_text).strip()
+
+        # Extra defense-in-depth: strip unclosed clinical report blocks, goal progression blocks, emergency trigger tags, or internal headers
         working_text = re.sub(r"\[CLINICAL_REPORT\][\s\S]*$", "", working_text, flags=re.IGNORECASE).strip()
         working_text = re.sub(r"\[/?CLINICAL_REPORT\]", "", working_text, flags=re.IGNORECASE).strip()
+        working_text = re.sub(r"\[GOAL_PROGRESSION\][\s\S]*$", "", working_text, flags=re.IGNORECASE).strip()
+        working_text = re.sub(r"\[/?GOAL_PROGRESSION\]", "", working_text, flags=re.IGNORECASE).strip()
         working_text = EMERGENCY_TRIGGER_REGEX.sub("", working_text).strip()
         working_text = re.sub(
             r"=== (?:AUTHORITATIVE PATIENT MEDICAL CONTEXT|GUIDELINES AND CLINICAL ROUTE|DEEP CLINICAL ANALYSIS|PRIMARY SYNTHESIS|INSTRUCTIONS AND ROUTE)[\s\S]*?===\n?",
@@ -1428,4 +1830,4 @@ YOUR INSTRUCTION:
                     else "CRITICAL_STATUS: Clinical indicators require immediate medical attention.")
             )
 
-        return clean_reply, final_emergency, final_notice
+        return clean_reply, final_emergency, final_notice, parsed_prog
