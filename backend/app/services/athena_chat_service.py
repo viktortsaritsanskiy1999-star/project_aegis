@@ -25,13 +25,17 @@ from app.schemas.chat import (
     AthenaChatMessageItem,
     AthenaChatHistoryResponse,
     AthenaVitalsAlertContext,
+    AthenaWeeklyWrapupOutput,
 )
 from app.schemas.consilium import (
     AegisAgentRole,
     AthenaClinicalLogEntry,
 )
 from app.schemas.privacy import PrivacyLevel
-from app.services.consilium_prompts import build_athena_system_prompt
+from app.services.consilium_prompts import (
+    build_athena_system_prompt,
+    build_athena_weekly_wrapup_prompt,
+)
 from app.services.gemini_gateway import GeminiGateway, GeminiModelRole
 from app.services.primary_consilium_service import (
     ConsiliumContextMissingError,
@@ -41,6 +45,7 @@ from app.services.primary_consilium_service import (
 from app.services.weekly_consilium_service import (
     WeeklyConsiliumService,
     ATHENA_CHAT_HISTORY_REPORT_TYPE,
+    WEEKLY_OVERALL_CLIENT_REPORT_TYPE,
 )
 
 logger = logging.getLogger("aegis.athena_chat")
@@ -933,6 +938,148 @@ class AthenaChatService:
                 question_id=final_question_id,
                 routine_question_status=final_routine_status,
                 reminders_count=final_reminders_count,
+            )
+
+
+    def _now_utc(self) -> datetime:
+        if self.now_provider:
+            dt = self.now_provider()
+            return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt.astimezone(timezone.utc)
+        return datetime.now(timezone.utc)
+
+    async def send_weekly_wrapup_message(
+        self,
+        *,
+        cycle_id: str,
+        sprint_number: int,
+        idempotency_key: Optional[str] = None,
+    ) -> AthenaChatResponse:
+        """
+        Stage 4 Step C: Sends Athena's weekly summary wrap-up message to the patient chat.
+        Invariants:
+        1. Sourced strictly from the published user-facing weekly overall report (CLIENT_FACING).
+           NEVER uses Pro internal conclusions, strategies, or SERVER_ONLY reports.
+        2. Friendly Athena persona inviting the user to view detailed reports by tapping
+           the human silhouette / medical vault.
+        3. Informational only: does NOT ask a routine question, does NOT decrement daily question limits,
+           does NOT create a daily journal, does NOT modify T0.
+        4. Fully idempotent: retrying with the same idempotency_key returns the saved message without Gemini calls.
+        """
+        clean_cycle_id = cycle_id.strip()
+        cycle = self.cycle_repo.get(clean_cycle_id)
+        if cycle is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Medical cycle '{clean_cycle_id}' not found.",
+            )
+
+        clean_idem = (
+            idempotency_key.strip()
+            if (idempotency_key and idempotency_key.strip())
+            else f"athena_weekly_wrapup_{clean_cycle_id}_w{sprint_number}"
+        )
+
+        async with self._get_cycle_lock(clean_cycle_id):
+            # Check idempotency
+            existing_turn = self._find_idempotent_turn(clean_cycle_id, clean_idem)
+            if existing_turn is not None:
+                return existing_turn
+
+            turn_dt = self._now_utc()
+            turn_now_iso = turn_dt.isoformat()
+
+            # 1. Fetch published client-facing weekly overall report
+            overall_reports = self.report_repo.list_client_facing(
+                cycle_id=clean_cycle_id,
+                report_type=WEEKLY_OVERALL_CLIENT_REPORT_TYPE,
+            )
+            target_report = None
+            for r in overall_reports:
+                c = r.content or {}
+                metrics = c.get("metrics") or {}
+                if metrics.get("sprint_number") == sprint_number:
+                    target_report = r
+                    break
+            if target_report is None and overall_reports:
+                target_report = overall_reports[-1]
+
+            if target_report is not None and target_report.content:
+                user_summary = (
+                    target_report.content.get("summary")
+                    or target_report.content.get("title")
+                    or "Итоги недели подведены."
+                )
+                highlights = target_report.content.get("highlights") or []
+            else:
+                user_summary = (
+                    f"Семидневная неделя сопровождения (Неделя №{sprint_number}) завершена. "
+                    "Доступные объективные показатели обработаны и зафиксированы в медицинском сейфе."
+                )
+                highlights = []
+
+            # 2. Build prompt for Gemini Flash
+            prompt = build_athena_weekly_wrapup_prompt(
+                user_overall_summary=user_summary,
+                highlights=highlights,
+                week_number=sprint_number,
+            )
+
+            # 3. Call Gemini Flash
+            wrapup_output: AthenaWeeklyWrapupOutput = await self.gateway.generate_structured(
+                prompt=prompt,
+                response_schema=AthenaWeeklyWrapupOutput,
+                model=GeminiModelRole.FLASH,
+            )
+            clean_reply = wrapup_output.message.strip()
+
+            message_id = f"msg_{uuid.uuid4().hex[:16]}"
+            target_sprint_id = f"sprint_{clean_cycle_id}_w{sprint_number}"
+            eff_sprint_id = target_sprint_id if self.weekly_service.sprint_repo.get(target_sprint_id) is not None else None
+
+            # 4. Save dialogue turn to Server Chat History
+            self.weekly_service.save_athena_chat_message(
+                cycle_id=clean_cycle_id,
+                sender="curator",
+                text=clean_reply,
+                sprint_id=eff_sprint_id,
+                timestamp=turn_now_iso,
+                commit=False,
+            )
+
+            # 5. Flush Idempotency Turn Record
+            self._save_idempotency_turn(
+                cycle_id=clean_cycle_id,
+                sprint_id=eff_sprint_id,
+                idempotency_key=clean_idem,
+                message_id=message_id,
+                reply=clean_reply,
+                emergency_trigger=False,
+                emergency_notice=None,
+                created_at=turn_now_iso,
+                sprint_day=7,
+                sprint_number=sprint_number,
+                event_type="weekly_wrapup",
+                question_id=None,
+                routine_question_status=None,
+                reminders_count=0,
+                expected_version=None,
+                commit=False,
+            )
+
+            self.db.commit()
+
+            return AthenaChatResponse(
+                reply=clean_reply,
+                emergency_trigger=False,
+                emergency_notice=None,
+                cycle_id=clean_cycle_id,
+                sprint_day=7,
+                sprint_number=sprint_number,
+                message_id=message_id,
+                created_at=turn_now_iso,
+                question_id=None,
+                routine_question_status=None,
+                reminders_count=0,
             )
 
     def get_sanitized_history(

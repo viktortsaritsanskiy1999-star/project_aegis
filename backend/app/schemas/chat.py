@@ -127,6 +127,7 @@ class AthenaChatRequest(BaseModel):
             "wearable_event",
             "routine_reminder",
             "reminder",
+            "weekly_wrapup",
         }
         if clean not in allowed:
             raise ValueError(f"event_type must be one of: {', '.join(sorted(allowed))}")
@@ -334,3 +335,15 @@ class AthenaDailyJournalRecord(BaseModel):
     wellness_evidence: WellnessEvidence
     exceptional_events: List[ExceptionalEventEntry] = Field(default_factory=list)
     athena_clinical_assessment: AthenaClinicalAssessment
+
+
+class AthenaWeeklyWrapupOutput(BaseModel):
+    """
+    Stage 4 Step C: Structured output from Gemini Flash for Athena weekly summary message.
+    """
+    model_config = ConfigDict(extra="ignore")
+
+    message: str = Field(
+        ...,
+        description="Понятное, дружелюбное итоговое сообщение от Афины пользователю с приглашением открыть силуэт человека",
+    )

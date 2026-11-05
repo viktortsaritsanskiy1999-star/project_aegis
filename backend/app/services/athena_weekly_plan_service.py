@@ -9,6 +9,7 @@ from sqlalchemy.orm import Session
 from app.models.health_measurement import HealthMeasurement
 from app.models.model_report import ModelReport
 from app.repositories.report_repository import ModelReportRepository
+from app.repositories.sprint_repository import WeeklySprintRepository
 from app.schemas.chat import (
     AthenaGoalItem,
     AthenaGoalProgressionDecision,
@@ -56,6 +57,7 @@ class AthenaWeeklyPlanService:
         self.gateway = gateway or GeminiGateway()
         self.now_provider = now_provider or (lambda: datetime.now(timezone.utc))
         self.report_repo = ModelReportRepository(db)
+        self.sprint_repo = WeeklySprintRepository(db)
 
     def _now_utc(self) -> datetime:
         dt = self.now_provider()
@@ -216,6 +218,20 @@ class AthenaWeeklyPlanService:
         if not measurements_summary or "отсутствуют" in measurements_summary:
             identified_gaps.append("Нет исходных данных пульса в покое и динамики АД")
 
+        prev_goals_summary = None
+        if week_number > 1:
+            prev_plan = self.get_active_weekly_plan(clean_cycle, week_number=week_number - 1)
+            if prev_plan and prev_plan.goals:
+                summary_lines = []
+                for g in prev_plan.goals:
+                    status_desc = "Завершена" if g.status == "completed" else "В процессе / Не завершена"
+                    clar_count = getattr(g, "clarifications_asked_count", 0)
+                    clar_info = f", уточнений {clar_count}" if clar_count else ""
+                    summary_lines.append(
+                        f"- [ID: {g.goal_id}] {g.title} ({status_desc}): вопросов задано {g.questions_asked_count}{clar_info}"
+                    )
+                prev_goals_summary = "\n".join(summary_lines)
+
         prompt = build_athena_weekly_plan_prompt(
             cycle_id=clean_cycle,
             week_number=week_number,
@@ -223,6 +239,7 @@ class AthenaWeeklyPlanService:
             known_anamnesis_facts=known_facts,
             objective_measurements_summary=measurements_summary,
             identified_gaps=identified_gaps,
+            previous_goals_summary=prev_goals_summary,
         )
 
         plan = await self.gateway.generate_structured(
@@ -249,8 +266,11 @@ class AthenaWeeklyPlanService:
             raise GeminiValidationError("Athena weekly plan must contain at least 1 goal.")
 
         # Persist safely under SERVER_ONLY
+        cand_sprint = f"sprint_{clean_cycle}_w{week_number}"
+        eff_sprint_id = cand_sprint if self.sprint_repo.get(cand_sprint) is not None else None
         self.report_repo.create_next_version(
             cycle_id=clean_cycle,
+            sprint_id=eff_sprint_id,
             model=self.gateway.flash_model,
             report_type=ATHENA_WEEKLY_PLAN_REPORT_TYPE,
             privacy_level=PrivacyLevel.SERVER_ONLY,

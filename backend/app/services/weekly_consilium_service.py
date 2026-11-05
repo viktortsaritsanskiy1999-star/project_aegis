@@ -447,6 +447,12 @@ class WeeklyConsiliumService:
         except Exception:
             pass
 
+
+    def is_weekly_consilium_completed(self, cycle_id: str, sprint_number: int) -> bool:
+        """Checks if Weekly Consilium Step A is completed and valid for sprint_number."""
+        sprint_id = f"sprint_{cycle_id}_w{sprint_number}"
+        return self.recover_completed_response(cycle_id, sprint_id=sprint_id) is not None
+
     def recover_completed_response(
         self, cycle_id: str, sprint_id: Optional[str] = None
     ) -> Optional[WeeklyConsiliumClientResponse]:
@@ -1880,7 +1886,9 @@ class WeeklyConsiliumService:
                     db=self.db, now_provider=self.now_provider
                 )
                 journals_diary = journal_service.format_seven_day_journals_for_consilium(
-                    cycle_id=cycle_id, sprint_number=resolved_sprint_number
+                    cycle_id=cycle_id,
+                    sprint_number=resolved_sprint_number,
+                    sprint_end_dt=window_end,
                 )
                 if journals_diary:
                     athena_diary_str = journals_diary

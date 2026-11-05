@@ -67,6 +67,9 @@ class AutomationJobType(str, Enum):
     FIRST_PLANNED_QUESTION = "first_planned_question"
     DAILY_JOURNAL_CLOSURE = "daily_journal_closure"
     WELLNESS_DAILY = "wellness_daily"
+    WEEKLY_CONSILIUM_A = "weekly_consilium_step_a"
+    WEEKLY_CONSILIUM_B = "weekly_consilium_step_b"
+    WEEKLY_CONSILIUM_C = "weekly_consilium_step_c"
 
 
 class AutomationJobStatus(str, Enum):
@@ -128,6 +131,7 @@ class ClinicalAutomationService:
         enable_daily_journal: bool = False,
         enable_weekly_plan: bool = False,
         enable_wellness_daily: bool = False,
+        enable_automatic_weekly: bool = False,
     ):
         self.db = db
         self.gateway = gateway or GeminiGateway()
@@ -139,6 +143,7 @@ class ClinicalAutomationService:
         self.enable_daily_journal = enable_daily_journal
         self.enable_weekly_plan = enable_weekly_plan
         self.enable_wellness_daily = enable_wellness_daily
+        self.enable_automatic_weekly = enable_automatic_weekly
 
         self.cycle_repo = MedicalCycleRepository(db)
         self.report_repo = ModelReportRepository(db)
@@ -206,6 +211,12 @@ class ClinicalAutomationService:
             return f"athena_daily_journal_{clean_cycle}_w1_d1"
         if resolved_type == AutomationJobType.WELLNESS_DAILY:
             return f"wellness_daily_{clean_cycle}_w1_d1"
+        if resolved_type == AutomationJobType.WEEKLY_CONSILIUM_A:
+            return f"weekly_consilium_step_a_{clean_cycle}_w1"
+        if resolved_type == AutomationJobType.WEEKLY_CONSILIUM_B:
+            return f"weekly_consilium_step_b_{clean_cycle}_w1"
+        if resolved_type == AutomationJobType.WEEKLY_CONSILIUM_C:
+            return f"weekly_consilium_step_c_{clean_cycle}_w1"
         return f"auto_{resolved_type.value}_{clean_cycle}"
 
     @staticmethod
@@ -296,6 +307,21 @@ class ClinicalAutomationService:
             if self.weekly_service.find_schedule_anchor_timestamp(clean_cycle) is None:
                 raise ConsiliumContextMissingError(
                     f"Cannot enqueue daily wellness processing for cycle '{clean_cycle}': "
+                    "schedule anchor T0 has not been established yet."
+                )
+        elif resolved_type in (
+            AutomationJobType.WEEKLY_CONSILIUM_A,
+            AutomationJobType.WEEKLY_CONSILIUM_B,
+            AutomationJobType.WEEKLY_CONSILIUM_C,
+        ):
+            if not self.primary_service.is_primary_consilium_completed(clean_cycle):
+                raise ConsiliumContextMissingError(
+                    f"Cannot enqueue {resolved_type.value} for cycle '{clean_cycle}': "
+                    "manual Primary Consilium has not been completed yet."
+                )
+            if self.weekly_service.find_schedule_anchor_timestamp(clean_cycle) is None:
+                raise ConsiliumContextMissingError(
+                    f"Cannot enqueue {resolved_type.value} for cycle '{clean_cycle}': "
                     "schedule anchor T0 has not been established yet."
                 )
 
@@ -517,6 +543,121 @@ class ClinicalAutomationService:
             next_attempt_at_utc=next_attempt_at_utc,
         )
 
+    def enqueue_weekly_consilium_a(
+        self,
+        *,
+        cycle_id: str,
+        patient_id: Optional[str] = None,
+        sprint_number: int = 1,
+        available_at_utc: Optional[datetime] = None,
+        max_attempts: int = DEFAULT_JOB_MAX_ATTEMPTS,
+    ) -> Optional[AutomationJobRecord]:
+        """
+        Enqueues Stage 4 Step A: Automatic Weekly Consilium execution.
+        Targeted to become claimable strictly at T0 + 168 * sprint_number hours.
+        """
+        clean_cycle = (cycle_id or "").strip()
+        if not clean_cycle:
+            return None
+        cycle = self.cycle_repo.get(clean_cycle)
+        if cycle is None:
+            return None
+        effective_patient_id = (patient_id or cycle.patient_id or "").strip()
+        if not effective_patient_id:
+            return None
+        if not self.primary_service.is_primary_consilium_completed(clean_cycle):
+            return None
+        anchor_dt = self.weekly_service.find_schedule_anchor_timestamp(clean_cycle)
+        if anchor_dt is None:
+            return None
+
+        eff_due_at = available_at_utc or (anchor_dt + timedelta(hours=168 * sprint_number))
+        idempotency_key = f"weekly_consilium_step_a_{clean_cycle}_w{sprint_number}"
+        return self.enqueue_or_get_job(
+            patient_id=effective_patient_id,
+            cycle_id=clean_cycle,
+            job_type=AutomationJobType.WEEKLY_CONSILIUM_A,
+            idempotency_key=idempotency_key,
+            max_attempts=max_attempts,
+            next_attempt_at_utc=eff_due_at.isoformat(),
+        )
+
+    def enqueue_weekly_consilium_b(
+        self,
+        *,
+        cycle_id: str,
+        patient_id: Optional[str] = None,
+        sprint_number: int = 1,
+        available_at_utc: Optional[datetime] = None,
+        max_attempts: int = DEFAULT_JOB_MAX_ATTEMPTS,
+    ) -> Optional[AutomationJobRecord]:
+        """
+        Enqueues Stage 4 Step B: Athena's autonomous weekly goal plan generation for week N+1.
+        Triggered immediately upon completion of Step A.
+        """
+        clean_cycle = (cycle_id or "").strip()
+        if not clean_cycle:
+            return None
+        cycle = self.cycle_repo.get(clean_cycle)
+        if cycle is None:
+            return None
+        effective_patient_id = (patient_id or cycle.patient_id or "").strip()
+        if not effective_patient_id:
+            return None
+        if not self.primary_service.is_primary_consilium_completed(clean_cycle):
+            return None
+        if self.weekly_service.find_schedule_anchor_timestamp(clean_cycle) is None:
+            return None
+
+        eff_available = (available_at_utc or self._now_utc()).isoformat()
+        idempotency_key = f"weekly_consilium_step_b_{clean_cycle}_w{sprint_number}"
+        return self.enqueue_or_get_job(
+            patient_id=effective_patient_id,
+            cycle_id=clean_cycle,
+            job_type=AutomationJobType.WEEKLY_CONSILIUM_B,
+            idempotency_key=idempotency_key,
+            max_attempts=max_attempts,
+            next_attempt_at_utc=eff_available,
+        )
+
+    def enqueue_weekly_consilium_c(
+        self,
+        *,
+        cycle_id: str,
+        patient_id: Optional[str] = None,
+        sprint_number: int = 1,
+        available_at_utc: Optional[datetime] = None,
+        max_attempts: int = DEFAULT_JOB_MAX_ATTEMPTS,
+    ) -> Optional[AutomationJobRecord]:
+        """
+        Enqueues Stage 4 Step C: Athena's separate weekly wrap-up chat message to the patient.
+        Triggered immediately upon completion of Step B.
+        """
+        clean_cycle = (cycle_id or "").strip()
+        if not clean_cycle:
+            return None
+        cycle = self.cycle_repo.get(clean_cycle)
+        if cycle is None:
+            return None
+        effective_patient_id = (patient_id or cycle.patient_id or "").strip()
+        if not effective_patient_id:
+            return None
+        if not self.primary_service.is_primary_consilium_completed(clean_cycle):
+            return None
+        if self.weekly_service.find_schedule_anchor_timestamp(clean_cycle) is None:
+            return None
+
+        eff_available = (available_at_utc or self._now_utc()).isoformat()
+        idempotency_key = f"weekly_consilium_step_c_{clean_cycle}_w{sprint_number}"
+        return self.enqueue_or_get_job(
+            patient_id=effective_patient_id,
+            cycle_id=clean_cycle,
+            job_type=AutomationJobType.WEEKLY_CONSILIUM_C,
+            idempotency_key=idempotency_key,
+            max_attempts=max_attempts,
+            next_attempt_at_utc=eff_available,
+        )
+
     def get_job_by_id(self, job_id: str) -> Optional[AutomationJobRecord]:
         row = (
             self.db.query(ModelReport)
@@ -704,6 +845,78 @@ class ClinicalAutomationService:
                             )
                             if w_job is not None:
                                 discovered.append(w_job)
+            # Discover automatic weekly consilium (Steps A, B, C) if enabled
+            if self.enable_automatic_weekly:
+                anchor_dt = self.weekly_service.find_schedule_anchor_timestamp(cycle.cycle_id)
+                if anchor_dt is not None:
+                    n = 1
+                    while True:
+                        due_at = anchor_dt + timedelta(hours=168 * n)
+                        step_a_key = f"weekly_consilium_step_a_{cycle.cycle_id}_w{n}"
+                        step_a_job = self.get_job(cycle.cycle_id, AutomationJobType.WEEKLY_CONSILIUM_A, step_a_key)
+
+                        is_step_a_done = (
+                            (step_a_job is not None and step_a_job.status == AutomationJobStatus.COMPLETED)
+                            or self.weekly_service.recover_completed_response(cycle.cycle_id, sprint_id=f"sprint_{cycle.cycle_id}_w{n}") is not None
+                        )
+
+                        if not is_step_a_done:
+                            if step_a_job is None:
+                                job = self.enqueue_weekly_consilium_a(
+                                    cycle_id=cycle.cycle_id,
+                                    patient_id=cycle.patient_id,
+                                    sprint_number=n,
+                                    available_at_utc=due_at,
+                                )
+                                if job is not None:
+                                    discovered.append(job)
+                            break
+                        else:
+                            step_b_key = f"weekly_consilium_step_b_{cycle.cycle_id}_w{n}"
+                            step_b_job = self.get_job(cycle.cycle_id, AutomationJobType.WEEKLY_CONSILIUM_B, step_b_key)
+                            from app.services.athena_weekly_plan_service import AthenaWeeklyPlanService
+                            plan_svc = AthenaWeeklyPlanService(db=self.db, gateway=self.gateway, now_provider=self.now_provider)
+                            has_next_plan = plan_svc.get_active_weekly_plan(cycle.cycle_id, week_number=n + 1) is not None
+                            is_step_b_done = (
+                                (step_b_job is not None and step_b_job.status == AutomationJobStatus.COMPLETED)
+                                or has_next_plan
+                            )
+
+                            if not is_step_b_done:
+                                if step_b_job is None:
+                                    job = self.enqueue_weekly_consilium_b(
+                                        cycle_id=cycle.cycle_id,
+                                        patient_id=cycle.patient_id,
+                                        sprint_number=n,
+                                    )
+                                    if job is not None:
+                                        discovered.append(job)
+                                break
+                            else:
+                                step_c_key = f"weekly_consilium_step_c_{cycle.cycle_id}_w{n}"
+                                step_c_job = self.get_job(cycle.cycle_id, AutomationJobType.WEEKLY_CONSILIUM_C, step_c_key)
+                                has_wrapup = self.athena_service._find_idempotent_turn(
+                                    cycle.cycle_id, f"athena_weekly_wrapup_{cycle.cycle_id}_w{n}"
+                                ) is not None
+                                is_step_c_done = (
+                                    (step_c_job is not None and step_c_job.status == AutomationJobStatus.COMPLETED)
+                                    or has_wrapup
+                                )
+
+                                if not is_step_c_done:
+                                    if step_c_job is None:
+                                        job = self.enqueue_weekly_consilium_c(
+                                            cycle_id=cycle.cycle_id,
+                                            patient_id=cycle.patient_id,
+                                            sprint_number=n,
+                                        )
+                                        if job is not None:
+                                            discovered.append(job)
+                                    break
+                                else:
+                                    n += 1
+                                    if n > 52:
+                                        break
         return discovered
 
     # ==========================================================================
@@ -1378,6 +1591,165 @@ class ClinicalAutomationService:
             "has_interpretation": report.interpretation is not None,
         }
 
+    async def _execute_weekly_consilium_a(
+        self, job: AutomationJobRecord
+    ) -> Dict[str, Any]:
+        """
+        Executes Stage 4 Step A: Automatic Weekly Consilium:
+        1. Validates cycle, patient ownership, Primary Consilium completion, and anchor T0.
+        2. Enforces fixed schedule: refuses execution if as_of < T0 + 168 * sprint_number.
+        3. Executes WeeklyConsiliumService.run_weekly_consilium (Flash -> Pro cascade).
+        4. Validates structured responses and publishes 8 system reports + overall user report.
+        5. Automatically enqueues Step B upon successful completion.
+        """
+        cycle = self.cycle_repo.get(job.cycle_id)
+        if cycle is None or cycle.patient_id != job.patient_id:
+            raise ConsiliumCycleNotFoundError(
+                f"Active cycle '{job.cycle_id}' not found for patient '{job.patient_id}'."
+            )
+        if not self.primary_service.is_primary_consilium_completed(job.cycle_id):
+            raise ConsiliumContextMissingError(
+                f"Cannot execute weekly consilium for cycle '{job.cycle_id}': "
+                "manual Primary Consilium is not completed."
+            )
+        anchor_dt = self.weekly_service.find_schedule_anchor_timestamp(job.cycle_id)
+        if anchor_dt is None:
+            raise ConsiliumContextMissingError(
+                f"Cannot execute weekly consilium for cycle '{job.cycle_id}': "
+                "schedule anchor T0 has not been established yet."
+            )
+
+        m = re.search(r'_w(\d+)$', job.idempotency_key)
+        week_num = int(m.group(1)) if m else 1
+        due_at = anchor_dt + timedelta(hours=168 * week_num)
+        if self._now_utc() < due_at:
+            raise ConsiliumError(
+                f"Cannot execute weekly consilium for week {week_num} before scheduled time {due_at.isoformat()}."
+            )
+
+        sprint_id = f"sprint_{job.cycle_id}_w{week_num}"
+        core_idem = f"weekly_consilium_core_{job.cycle_id}_w{week_num}"
+        client_resp = await self.weekly_service.run_weekly_consilium(
+            cycle_id=job.cycle_id,
+            sprint_id=sprint_id,
+            idempotency_key=core_idem,
+        )
+
+        # Enqueue Step B immediately
+        self.enqueue_weekly_consilium_b(
+            cycle_id=job.cycle_id,
+            patient_id=job.patient_id,
+            sprint_number=week_num,
+        )
+
+        return {
+            "sprint_id": client_resp.sprint_id,
+            "sprint_number": client_resp.sprint_number,
+            "overall_report_id": client_resp.overall_report.report_id,
+            "overall_report_version": client_resp.overall_report.version,
+            "system_reports_count": len(client_resp.system_reports),
+            "completed_at_utc": self._now_utc().isoformat(),
+        }
+
+    async def _execute_weekly_consilium_b(
+        self, job: AutomationJobRecord
+    ) -> Dict[str, Any]:
+        """
+        Executes Stage 4 Step B: Athena's Weekly Goal Plan Formulation:
+        1. Verifies Step A completion.
+        2. Retrieves updated Pro strategy from Step A.
+        3. Invokes AthenaWeeklyPlanService.create_or_get_weekly_plan for week N+1.
+        4. Saves plan under SERVER_ONLY, linked to sprint N+1 and Pro strategy version.
+        5. Does NOT alter global T0.
+        6. Automatically enqueues Step C upon successful completion.
+        """
+        cycle = self.cycle_repo.get(job.cycle_id)
+        if cycle is None or cycle.patient_id != job.patient_id:
+            raise ConsiliumCycleNotFoundError(
+                f"Active cycle '{job.cycle_id}' not found for patient '{job.patient_id}'."
+            )
+
+        m = re.search(r'_w(\d+)$', job.idempotency_key)
+        week_num = int(m.group(1)) if m else 1
+
+        sprint_id = f"sprint_{job.cycle_id}_w{week_num}"
+        completed_a = self.weekly_service.recover_completed_response(job.cycle_id, sprint_id=sprint_id)
+        if completed_a is None:
+            step_a_job = self.get_job(
+                job.cycle_id,
+                AutomationJobType.WEEKLY_CONSILIUM_A,
+                f"weekly_consilium_step_a_{job.cycle_id}_w{week_num}",
+            )
+            if step_a_job is None or step_a_job.status != AutomationJobStatus.COMPLETED:
+                raise ConsiliumContextMissingError(
+                    f"Cannot execute Step B: Weekly Consilium Step A not completed for week {week_num}."
+                )
+
+        from app.services.athena_weekly_plan_service import AthenaWeeklyPlanService
+        plan_svc = AthenaWeeklyPlanService(
+            db=self.db, gateway=self.gateway, now_provider=self.now_provider
+        )
+        next_week = week_num + 1
+        plan = await plan_svc.create_or_get_weekly_plan(
+            cycle_id=job.cycle_id,
+            week_number=next_week,
+        )
+
+        # Enqueue Step C immediately
+        self.enqueue_weekly_consilium_c(
+            cycle_id=job.cycle_id,
+            patient_id=job.patient_id,
+            sprint_number=week_num,
+        )
+
+        return {
+            "next_week_plan_id": plan.plan_id,
+            "week_number": next_week,
+            "source_strategy_report_id": plan.source_strategy_report_id,
+            "source_strategy_version": plan.source_strategy_version,
+            "goals_count": len(plan.goals),
+        }
+
+    async def _execute_weekly_consilium_c(
+        self, job: AutomationJobRecord
+    ) -> Dict[str, Any]:
+        """
+        Executes Stage 4 Step C: Athena's Weekly Summary Chat Message:
+        1. Verifies Step A and Step B completion.
+        2. Generates friendly wrap-up message based strictly on published client overall report.
+        3. Invites user to view human silhouette / medical vault.
+        4. Does NOT ask routine questions or decrement question limits.
+        5. Does NOT create daily journals or alter T0.
+        """
+        cycle = self.cycle_repo.get(job.cycle_id)
+        if cycle is None or cycle.patient_id != job.patient_id:
+            raise ConsiliumCycleNotFoundError(
+                f"Active cycle '{job.cycle_id}' not found for patient '{job.patient_id}'."
+            )
+
+        m = re.search(r'_w(\d+)$', job.idempotency_key)
+        week_num = int(m.group(1)) if m else 1
+
+        sprint_id = f"sprint_{job.cycle_id}_w{week_num}"
+        completed_a = self.weekly_service.recover_completed_response(job.cycle_id, sprint_id=sprint_id)
+        if completed_a is None:
+            raise ConsiliumContextMissingError(
+                f"Cannot execute Step C: Weekly Consilium Step A not completed for week {week_num}."
+            )
+
+        chat_resp = await self.athena_service.send_weekly_wrapup_message(
+            cycle_id=job.cycle_id,
+            sprint_number=week_num,
+            idempotency_key=f"athena_weekly_wrapup_{job.cycle_id}_w{week_num}",
+        )
+
+        return {
+            "message_id": chat_resp.message_id,
+            "sprint_number": week_num,
+            "reply": chat_resp.reply,
+            "created_at_utc": chat_resp.created_at,
+        }
+
     async def execute_claimed_job(self, claimed: AutomationJobRecord) -> AutomationJobRecord:
         if not claimed.lease_owner_id:
             raise ConsiliumConcurrencyConflictError(
@@ -1409,6 +1781,24 @@ class ClinicalAutomationService:
                     claimed.job_id,
                     lease_owner_id,
                     lambda: self._execute_wellness_daily(claimed),
+                )
+            elif claimed.job_type == AutomationJobType.WEEKLY_CONSILIUM_A:
+                result_meta = await self._execute_with_job_lease_renewal(
+                    claimed.job_id,
+                    lease_owner_id,
+                    lambda: self._execute_weekly_consilium_a(claimed),
+                )
+            elif claimed.job_type == AutomationJobType.WEEKLY_CONSILIUM_B:
+                result_meta = await self._execute_with_job_lease_renewal(
+                    claimed.job_id,
+                    lease_owner_id,
+                    lambda: self._execute_weekly_consilium_b(claimed),
+                )
+            elif claimed.job_type == AutomationJobType.WEEKLY_CONSILIUM_C:
+                result_meta = await self._execute_with_job_lease_renewal(
+                    claimed.job_id,
+                    lease_owner_id,
+                    lambda: self._execute_weekly_consilium_c(claimed),
                 )
             else:
                 raise ValueError(f"Unsupported automation job_type '{claimed.job_type}'.")
@@ -1480,6 +1870,7 @@ class ClinicalAutomationWorker:
         enable_daily_journal: bool = False,
         enable_weekly_plan: bool = False,
         enable_wellness_daily: bool = False,
+        enable_automatic_weekly: bool = False,
     ):
         self.session_factory = session_factory
         self.gateway_factory = gateway_factory or GeminiGateway
@@ -1492,6 +1883,7 @@ class ClinicalAutomationWorker:
         self.enable_daily_journal = enable_daily_journal
         self.enable_weekly_plan = enable_weekly_plan
         self.enable_wellness_daily = enable_wellness_daily
+        self.enable_automatic_weekly = enable_automatic_weekly
 
         self._wake_event: Optional[asyncio.Event] = None
         self._stop_event: Optional[asyncio.Event] = None
@@ -1526,6 +1918,7 @@ class ClinicalAutomationWorker:
                 enable_daily_journal=self.enable_daily_journal,
                 enable_weekly_plan=self.enable_weekly_plan,
                 enable_wellness_daily=self.enable_wellness_daily,
+                enable_automatic_weekly=self.enable_automatic_weekly,
             )
             return await service.process_due_jobs(
                 discover=discover,

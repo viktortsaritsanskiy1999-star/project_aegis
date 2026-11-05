@@ -50,6 +50,7 @@ async def lifespan(app: FastAPI):
             enable_weekly_plan=settings.enable_weekly_plan,
             enable_daily_journal=settings.enable_daily_journal,
             enable_wellness_daily=settings.enable_wellness_daily,
+            enable_automatic_weekly=settings.enable_automatic_weekly,
         )
         app.state.automation_worker = worker
         await worker.start()

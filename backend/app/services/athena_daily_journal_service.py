@@ -1482,23 +1482,109 @@ class AthenaDailyJournalService:
     # 4. WEEKLY CONSILIUM TWO-LAYER FORMATTER
     # ==========================================================================
 
+    def get_unjournaled_patient_evidence(
+        self,
+        cycle_id: str,
+        sprint_number: int,
+        sprint_end_dt: Optional[datetime] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        Collects genuine user responses and out-of-turn messages within the sprint window
+        that have NOT yet been captured in any closed daily journal for this sprint.
+        Guarantees that events strictly >= sprint_end_dt are NEVER included.
+        """
+        journals_list = self.get_seven_day_daily_journals(cycle_id, sprint_number)
+        used_timestamps: Set[str] = set()
+        used_source_ids: Set[str] = set()
+        for _, j in journals_list:
+            if j is None:
+                continue
+            pe = j.patient_reported_evidence
+            for ans in pe.patient_answers:
+                used_timestamps.add(ans.timestamp_utc)
+                if ans.source_event_id:
+                    used_source_ids.add(ans.source_event_id)
+            for oot in pe.out_of_turn_messages:
+                used_timestamps.add(oot.timestamp_utc)
+                if oot.source_event_id:
+                    used_source_ids.add(oot.source_event_id)
+
+        anchor_dt = self.weekly_service.find_schedule_anchor_timestamp(cycle_id)
+        if anchor_dt is not None:
+            if sprint_number == 1:
+                sprint_start = anchor_dt - timedelta(minutes=10)
+                nominal_end = anchor_dt + timedelta(hours=168)
+            else:
+                sprint_start = anchor_dt + timedelta(hours=168 * (sprint_number - 1))
+                nominal_end = anchor_dt + timedelta(hours=168 * sprint_number)
+        else:
+            now_dt = self._now_utc()
+            sprint_start = now_dt - timedelta(days=7)
+            nominal_end = now_dt
+
+        effective_end = sprint_end_dt or nominal_end
+
+        chat_history = self.weekly_service.get_athena_chat_history(cycle_id)
+        unjournaled_msgs: List[Dict[str, Any]] = []
+        for msg in chat_history:
+            if not isinstance(msg, dict) or msg.get("sender") != "user":
+                continue
+            ts_dt = self._parse_iso_utc(msg.get("timestamp"))
+            if ts_dt is None or not (sprint_start <= ts_dt < effective_end):
+                continue
+            raw_text = str(msg.get("text") or "").strip()
+            if not raw_text or raw_text.startswith((
+                "[Initialization]:",
+                "[Daily Pulse",
+                "[First Question]:",
+                "[Reminder]:",
+                "[Vitals Alert]:",
+                "[Wearable Event]:",
+            )):
+                continue
+            clean_text = raw_text
+            is_oot = False
+            if clean_text.startswith("[Out-of-turn]:"):
+                is_oot = True
+                clean_text = clean_text[len("[Out-of-turn]:"):].strip()
+            ts_iso = str(msg.get("timestamp") or ts_dt.isoformat())
+            if ts_iso in used_timestamps:
+                continue
+            unjournaled_msgs.append({
+                "text": clean_text,
+                "timestamp": ts_iso,
+                "is_oot": is_oot,
+                "event_type": "out_of_turn_message" if is_oot else "user_message",
+            })
+
+        return unjournaled_msgs
+
     def format_seven_day_journals_for_consilium(
         self,
         cycle_id: str,
         sprint_number: int,
+        sprint_end_dt: Optional[datetime] = None,
+        allow_empty: bool = False,
     ) -> Optional[str]:
         """
         Formats the 7-day diary for Weekly Consilium with both Layer 1 and Layer 2:
         LAYER 1: Original structured evidence (verbatim statements, wellness findings,
                  exceptional events, missing declarations).
         LAYER 2: Athena's separately labeled clinical assessment.
+        UNJOURNALED EVIDENCE: Verbatim meaningful patient answers prior to sprint cutoff
+                              not captured in any closed daily journal.
 
-        Returns None if NO daily journals exist for sprint_number, allowing the caller
-        to fall back to legacy format for backwards compatibility with pre-A2.2 tests.
+        Returns None if NO daily journals and NO unjournaled evidence exist for sprint_number,
+        allowing the caller to fall back to legacy format for backwards compatibility with pre-A2.2 tests.
         """
         journals_list = self.get_seven_day_daily_journals(cycle_id, sprint_number)
+        unjournaled = self.get_unjournaled_patient_evidence(
+            cycle_id=cycle_id,
+            sprint_number=sprint_number,
+            sprint_end_dt=sprint_end_dt,
+        )
         has_any_journal = any(j is not None for _, j in journals_list)
-        if not has_any_journal:
+        if not has_any_journal and not unjournaled and not allow_empty:
             return None
 
         lines: List[str] = [
@@ -1596,6 +1682,13 @@ class AthenaDailyJournalService:
                 lines.append("  • Status: ASSESSMENT_UNAVAILABLE")
                 lines.append(f"  • Assessment: None ({aa.absence_reason})")
 
+            lines.append("--------------------------------------------------")
+
+        if unjournaled:
+            lines.append("=== UNJOURNALED PATIENT RESPONSES (PRIOR TO WEEKLY BOUNDARY) ===")
+            lines.append("Source: Direct Chat Turn (prior to Weekly cutoff, not yet captured in a closed daily journal)")
+            for u in unjournaled:
+                lines.append(f"  • \"{u['text']}\" (timestamp: {u['timestamp']}, event: {u['event_type']})")
             lines.append("--------------------------------------------------")
 
         return "\n".join(lines)

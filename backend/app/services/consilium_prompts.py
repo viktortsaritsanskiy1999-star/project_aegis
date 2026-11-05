@@ -999,6 +999,7 @@ def build_athena_weekly_plan_prompt(
     known_anamnesis_facts: List[str],
     objective_measurements_summary: str,
     identified_gaps: List[str],
+    previous_goals_summary: Optional[str] = None,
 ) -> str:
     """
     Constructs the prompt for autonomous 7-day goal plan generation by Athena (Gemini Flash).
@@ -1014,6 +1015,11 @@ def build_athena_weekly_plan_prompt(
         "\n".join(f"- {g}" for g in identified_gaps)
         if identified_gaps
         else "- Пробелы не выделены"
+    )
+    prev_goals_block = (
+        f"\n5. ИТОГИ ПРЕДЫДУЩЕГО НЕДЕЛЬНОГО ПЛАНА (ЗАВЕРШЁННЫЕ И НЕЗАВЕРШЁННЫЕ ЦЕЛИ):\n{previous_goals_summary}\n"
+        if previous_goals_summary and previous_goals_summary.strip()
+        else ""
     )
 
     return f"""[Internal Weekly Plan Formulation Scenario]:
@@ -1032,7 +1038,7 @@ def build_athena_weekly_plan_prompt(
 {objective_measurements_summary}
 
 4. ВЫЯВЛЕННЫЕ ПРОБЕЛЫ И ЗОНЫ НЕОПРЕДЕЛЁННОСТИ:
-{gaps_block}
+{gaps_block}{prev_goals_block}
 
 ОБЯЗАТЕЛЬНЫЕ ПРАВИЛА И ОГРАНИЧЕНИЯ ПРИ ФОРМИРОВАНИИ ПЛАНА:
 1. ЦЕЛИ ВМЕСТО РАСПИСАНИЯ ВОПРОСОВ:
@@ -1330,3 +1336,54 @@ def build_wellness_daily_analysis_prompt(
         "}"
     )
     return system_instruction, user_prompt
+
+
+def build_athena_weekly_wrapup_prompt(
+    user_overall_summary: str,
+    highlights: Optional[List[str]] = None,
+    week_number: int = 1,
+) -> str:
+    """
+    Stage 4 Step C: Constructs the prompt for Athena's weekly summary wrap-up message.
+    Strictly uses ONLY the published user-facing weekly overall report (CLIENT_FACING).
+    Never includes Pro internal materials or SERVER_ONLY reports.
+    Instructs Athena to invite the user to view the full report by clicking the human silhouette.
+    Does NOT ask a routine question or touch question limits.
+    """
+    hl_block = (
+        "\n".join(f"- {h}" for h in highlights)
+        if highlights
+        else "- Ключевые показатели недели зафиксированы в отчётах сейфа."
+    )
+
+    return f"""[Internal Athena Weekly Wrap-up Message Formulation]:
+Вы — Афина (Athena), персональный заботливый AI-помощник в приложении Aegis.
+Завершилась семидневная неделя сопровождения (Неделя №{week_number}).
+Вам необходимо составить тёплое, понятное и краткое итоговое сообщение пользователю в чат.
+
+ОСНОВА ДЛЯ СООБЩЕНИЯ (ОФИЦИАЛЬНОЕ ПОЛЬЗОВАТЕЛЬСКОЕ РЕЗЮМЕ НЕДЕЛИ ИЗ СЕЙФА):
+{user_overall_summary}
+
+КЛЮЧЕВЫЕ МОМЕНТЫ (HIGHLIGHTS):
+{hl_block}
+
+СТРОЖАЙШИЕ ПРАВИЛА:
+1. ОБРАЗ АФИНЫ:
+   - Тёплый, дружелюбный, поддерживающий тон персонального AI-ассистента.
+   - Запрещено использовать медицинские титулы («я врач», «я доктор», «я консилиум», «врачебная комиссия»).
+2. СОДЕРЖАНИЕ И КЛИНИЧЕСКАЯ ДОСТОВЕРНОСТЬ:
+   - Кратко и доступным языком расскажите, как прошла прошедшая неделя СТРОГО на основе предоставленного резюме из сейфа.
+   - КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО утверждать о стабильности, положительной динамике или улучшении показателей, если этого прямо нет в предоставленном резюме сейфа!
+   - Если в резюме указано на нехватку данных, пропуски дней, статус NO_DATA или результаты неопределённы — честно, бережно и открыто отразите эти ограничения (например, отметьте, что данных за неделю поступило немного или зафиксированы пропуски, но мы продолжим наблюдение на следующей неделе).
+   - Обязательно предложите пользователю нажать на силуэт человека на главном экране Aegis и посмотреть подробные обновлённые отчёты по 8 системам организма в медицинском сейфе.
+3. КОНФИДЕНЦИАЛЬНОСТЬ:
+   - Не упоминайте внутренние термины («стратегия Pro», «серверный консилиум», «Flash», «SERVER_ONLY», технические логи).
+4. БЕЗ НОВЫХ ВОПРОСОВ:
+   - Это чисто информационное завершающее сообщение недели. ЗАПРЕЩЕНО задавать обязательные диагностические вопросы.
+   - Не ставьте диагнозов и не назначайте лекарств.
+5. ФОРМАТ:
+   - Ответ должен быть строго в формате JSON, соответствующем схеме AthenaWeeklyWrapupOutput:
+   {{
+     "message": "Текст сообщения Афины пользователю..."
+   }}
+"""

@@ -134,6 +134,11 @@ class Settings(BaseSettings):
         default=False,
         alias="AEGIS_ENABLE_WELLNESS_DAILY",
     )
+    # Stage 4 Automatic Weekly Consilium automation flag (disabled by default in production)
+    enable_automatic_weekly: bool = Field(
+        default=False,
+        alias="AEGIS_ENABLE_AUTOMATIC_WEEKLY",
+    )
 
 
 settings = Settings()
