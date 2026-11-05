@@ -239,6 +239,48 @@ class AthenaDailyJournalService:
                 windows.append((w, d, start_dt, end_dt))
         return windows
 
+    def get_previous_daily_journal(
+        self,
+        cycle_id: str,
+        calendar_week: int,
+        calendar_day: int,
+    ) -> Optional[AthenaDailyJournalRecord]:
+        """
+        Finds the most recent daily journal that preceded (calendar_week, calendar_day).
+        For Week 1 Day 1, returns None.
+        For Day > 1, checks (week, day - 1).
+        For Day 1 (week > 1), checks (week - 1, 7).
+        Falls back to any earlier completed journal if intermediate days are missing.
+        """
+        if calendar_day > 1:
+            prev_w = calendar_week
+            prev_d = calendar_day - 1
+        else:
+            if calendar_week > 1:
+                prev_w = calendar_week - 1
+                prev_d = 7
+            else:
+                return None
+
+        immediate_prev = self.get_daily_journal(cycle_id, prev_w, prev_d)
+        if immediate_prev is not None:
+            return immediate_prev
+
+        # Backward search within same week
+        for d in range(prev_d - 1, 0, -1):
+            cand = self.get_daily_journal(cycle_id, prev_w, d)
+            if cand is not None:
+                return cand
+
+        # Backward search in previous week
+        if prev_w > 1:
+            for d in range(7, 0, -1):
+                cand = self.get_daily_journal(cycle_id, prev_w - 1, d)
+                if cand is not None:
+                    return cand
+
+        return None
+
     # ==========================================================================
     # 2. EVIDENCE GATHERING & SECTION BUILDERS
     # ==========================================================================
@@ -443,6 +485,7 @@ class AthenaDailyJournalService:
         calendar_day: int,
         window_start: datetime,
         window_end: datetime,
+        calendar_week: int = 1,
     ) -> WellnessEvidence:
         missing_declarations: List[str] = []
 
@@ -455,6 +498,15 @@ class AthenaDailyJournalService:
             if "wellness" in r_type and r_type not in (
                 ATHENA_DAILY_JOURNAL_REPORT_TYPE,
             ):
+                c = r.content or {}
+                rep_w = c.get("calendar_week")
+                rep_d = c.get("calendar_day")
+                if rep_w is not None and rep_d is not None:
+                    if rep_w == calendar_week and rep_d == calendar_day:
+                        wellness_report_match = r
+                        break
+                    continue
+
                 created_dt = self._parse_iso_utc(r.created_at)
                 if created_dt is not None and window_start <= created_dt < window_end:
                     wellness_report_match = r
@@ -462,20 +514,27 @@ class AthenaDailyJournalService:
 
         if wellness_report_match is not None:
             c = wellness_report_match.content or {}
+            is_no_data = (c.get("status") == "no_data")
             ref = WellnessReportReference(
                 report_id=wellness_report_match.report_id,
                 report_type=wellness_report_match.report_type,
                 version=wellness_report_match.version,
                 timestamp_utc=(wellness_report_match.created_at or window_start).isoformat(),
                 is_available=True,
-                missing_reason=None,
+                missing_reason="NO_DATA" if is_no_data else None,
             )
-            assessment = str(
-                c.get("assessment")
-                or c.get("summary")
-                or c.get("wellness_assessment")
-                or ""
-            ).strip() or None
+            if is_no_data:
+                assessment = None
+                missing_declarations.append(
+                    f"Independent wellness report reported NO_DATA for Day {calendar_day}."
+                )
+            else:
+                assessment = str(
+                    c.get("assessment")
+                    or c.get("summary")
+                    or c.get("wellness_assessment")
+                    or ""
+                ).strip() or None
         else:
             ref = WellnessReportReference(
                 report_id=None,
@@ -797,7 +856,10 @@ class AthenaDailyJournalService:
         """
         if journal.patient_reported_evidence.has_patient_interaction:
             return True
-        if journal.wellness_evidence.report_reference.is_available:
+        if (
+            journal.wellness_evidence.report_reference.is_available
+            and journal.wellness_evidence.wellness_assessment
+        ):
             return True
         if journal.wellness_evidence.biometrics.raw_records_count > 0:
             return True
@@ -996,7 +1058,6 @@ class AthenaDailyJournalService:
                 prompt=prompt,
                 response_schema=AthenaDailyAssessmentModelOutput,
                 model=GeminiModelRole.FLASH,
-                temperature=0.2,
                 system_instruction=system_prompt,
             )
         )
@@ -1055,10 +1116,35 @@ class AthenaDailyJournalService:
         if not cycle.patient_id:
             raise ValueError(f"Medical cycle '{cycle_id}' has no associated patient_id.")
 
-        window_start, window_end = self.resolve_daily_window(
+        nominal_start, nominal_end = self.resolve_daily_window(
             cycle_id, calendar_week, calendar_day
         )
         effective_now = as_of or self._now_utc()
+        if effective_now.tzinfo is None:
+            effective_now = effective_now.replace(tzinfo=timezone.utc)
+        else:
+            effective_now = effective_now.astimezone(timezone.utc)
+
+        # 1. Observation window start: after previous daily journal if one exists
+        prev_journal = self.get_previous_daily_journal(
+            cycle_id, calendar_week, calendar_day
+        )
+        if prev_journal is not None:
+            prev_end = self._parse_iso_utc(prev_journal.window_end_utc)
+            window_start = prev_end if prev_end is not None else nominal_start
+        else:
+            window_start = nominal_start
+
+        # 2. Observation window end:
+        # If running early (before nominal_end), window_end is effective_now (as_of).
+        # If running after nominal_end, window_end is nominal_end (or effective_now if nominal_end <= window_start).
+        if effective_now < nominal_end:
+            window_end = max(effective_now, window_start + timedelta(seconds=1))
+            closure_type = "wellness_triggered"
+        else:
+            window_end = max(nominal_end, window_start + timedelta(seconds=1))
+            closure_type = "deterministic_utc_fallback"
+
         closure_ts = effective_now.isoformat()
 
         # Section A: Patient-Reported Evidence
@@ -1075,6 +1161,7 @@ class AthenaDailyJournalService:
             calendar_day=calendar_day,
             window_start=window_start,
             window_end=window_end,
+            calendar_week=calendar_week,
         )
 
         # Section C: Exceptional Events
@@ -1105,7 +1192,7 @@ class AthenaDailyJournalService:
             window_start_utc=window_start.isoformat(),
             window_end_utc=window_end.isoformat(),
             closure_timestamp_utc=closure_ts,
-            closure_type="deterministic_utc_fallback",
+            closure_type=closure_type,
             patient_reported_evidence=patient_evidence,
             wellness_evidence=wellness_evidence,
             exceptional_events=exceptional_events,

@@ -4,7 +4,7 @@ from enum import Enum
 import hashlib
 import logging
 import re
-from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Set, Tuple
 import uuid
 
 from fastapi import HTTPException
@@ -22,6 +22,7 @@ from app.repositories.report_repository import (
 )
 from app.schemas.chat import AthenaChatRequest
 from app.schemas.privacy import PrivacyLevel
+from app.schemas.wellness import WellnessTriggerType
 from app.services.athena_chat_service import (
     AthenaChatService,
     POST_PRIMARY_INIT_IDEMPOTENCY_PREFIX,
@@ -36,6 +37,7 @@ from app.services.primary_consilium_service import (
     ConsiliumConcurrencyConflictError,
 )
 from app.services.weekly_consilium_service import WeeklyConsiliumService
+from app.services.wellness_daily_service import WellnessDailyService
 
 logger = logging.getLogger("aegis.clinical_automation")
 
@@ -64,6 +66,7 @@ class AutomationJobType(str, Enum):
     POST_PRIMARY_INIT = "post_primary_init"
     FIRST_PLANNED_QUESTION = "first_planned_question"
     DAILY_JOURNAL_CLOSURE = "daily_journal_closure"
+    WELLNESS_DAILY = "wellness_daily"
 
 
 class AutomationJobStatus(str, Enum):
@@ -124,6 +127,7 @@ class ClinicalAutomationService:
         max_backoff_seconds: int = DEFAULT_MAX_BACKOFF_SECONDS,
         enable_daily_journal: bool = False,
         enable_weekly_plan: bool = False,
+        enable_wellness_daily: bool = False,
     ):
         self.db = db
         self.gateway = gateway or GeminiGateway()
@@ -134,6 +138,7 @@ class ClinicalAutomationService:
         self.max_backoff_seconds = max(self.base_backoff_seconds, int(max_backoff_seconds))
         self.enable_daily_journal = enable_daily_journal
         self.enable_weekly_plan = enable_weekly_plan
+        self.enable_wellness_daily = enable_wellness_daily
 
         self.cycle_repo = MedicalCycleRepository(db)
         self.report_repo = ModelReportRepository(db)
@@ -148,6 +153,9 @@ class ClinicalAutomationService:
         )
         self.journal_service = AthenaDailyJournalService(
             db=db, now_provider=self.now_provider, gateway=self.gateway
+        )
+        self.wellness_service = WellnessDailyService(
+            db=db, gateway=self.gateway, now_provider=self.now_provider
         )
 
     def _now_utc(self) -> datetime:
@@ -196,6 +204,8 @@ class ClinicalAutomationService:
             return f"{POST_PRIMARY_INIT_IDEMPOTENCY_PREFIX}{clean_cycle}"
         if resolved_type == AutomationJobType.DAILY_JOURNAL_CLOSURE:
             return f"athena_daily_journal_{clean_cycle}_w1_d1"
+        if resolved_type == AutomationJobType.WELLNESS_DAILY:
+            return f"wellness_daily_{clean_cycle}_w1_d1"
         return f"auto_{resolved_type.value}_{clean_cycle}"
 
     @staticmethod
@@ -275,6 +285,17 @@ class ClinicalAutomationService:
             if self.weekly_service.find_schedule_anchor_timestamp(clean_cycle) is None:
                 raise ConsiliumContextMissingError(
                     f"Cannot enqueue daily journal closure for cycle '{clean_cycle}': "
+                    "schedule anchor T0 has not been established yet."
+                )
+        elif resolved_type == AutomationJobType.WELLNESS_DAILY:
+            if not self.primary_service.is_primary_consilium_completed(clean_cycle):
+                raise ConsiliumContextMissingError(
+                    f"Cannot enqueue daily wellness processing for cycle '{clean_cycle}': "
+                    "manual Primary Consilium has not been completed yet."
+                )
+            if self.weekly_service.find_schedule_anchor_timestamp(clean_cycle) is None:
+                raise ConsiliumContextMissingError(
+                    f"Cannot enqueue daily wellness processing for cycle '{clean_cycle}': "
                     "schedule anchor T0 has not been established yet."
                 )
 
@@ -457,6 +478,45 @@ class ClinicalAutomationService:
             max_attempts=max_attempts,
         )
 
+    def enqueue_wellness_daily(
+        self,
+        *,
+        cycle_id: str,
+        patient_id: Optional[str] = None,
+        calendar_week: int,
+        calendar_day: int,
+        trigger: Optional[WellnessTriggerType] = None,
+        next_attempt_at_utc: Optional[str] = None,
+        max_attempts: int = DEFAULT_JOB_MAX_ATTEMPTS,
+    ) -> Optional[AutomationJobRecord]:
+        """
+        Enqueues daily Wellness processing for an observation day.
+        Requires manual Primary Consilium completed and anchor T0 established.
+        """
+        clean_cycle = (cycle_id or "").strip()
+        if not clean_cycle:
+            return None
+        cycle = self.cycle_repo.get(clean_cycle)
+        if cycle is None:
+            return None
+        effective_patient_id = (patient_id or cycle.patient_id or "").strip()
+        if not effective_patient_id:
+            return None
+        if not self.primary_service.is_primary_consilium_completed(clean_cycle):
+            return None
+        if self.weekly_service.find_schedule_anchor_timestamp(clean_cycle) is None:
+            return None
+
+        idempotency_key = f"wellness_daily_{clean_cycle}_w{calendar_week}_d{calendar_day}"
+        return self.enqueue_or_get_job(
+            patient_id=effective_patient_id,
+            cycle_id=clean_cycle,
+            job_type=AutomationJobType.WELLNESS_DAILY,
+            idempotency_key=idempotency_key,
+            max_attempts=max_attempts,
+            next_attempt_at_utc=next_attempt_at_utc,
+        )
+
     def get_job_by_id(self, job_id: str) -> Optional[AutomationJobRecord]:
         row = (
             self.db.query(ModelReport)
@@ -588,10 +648,22 @@ class ClinicalAutomationService:
             if should_discover_dj:
                 anchor_dt = self.weekly_service.find_schedule_anchor_timestamp(cycle.cycle_id)
                 if anchor_dt is not None:
+                    candidate_pairs: Set[Tuple[int, int]] = set()
+
+                    # 1. Nominal completed 24h windows
                     completed_windows = self.journal_service.get_completed_daily_windows(
                         cycle.cycle_id, as_of=self._now_utc()
                     )
                     for w, d, _, _ in completed_windows:
+                        candidate_pairs.add((w, d))
+
+                    # 2. Days with existing Wellness reports (READY or NO_DATA)
+                    if self.wellness_service is not None:
+                        wellness_reports = self.wellness_service.list_wellness_reports(cycle.cycle_id)
+                        for w_rep in wellness_reports:
+                            candidate_pairs.add((w_rep.calendar_week, w_rep.calendar_day))
+
+                    for w, d in sorted(candidate_pairs):
                         existing_journal = self.journal_service.get_daily_journal(
                             cycle.cycle_id, w, d
                         )
@@ -610,6 +682,28 @@ class ClinicalAutomationService:
                             )
                             if dj_job is not None:
                                 discovered.append(dj_job)
+
+            # Discover pending daily wellness analysis if enabled
+            if self.enable_wellness_daily:
+                anchor_dt = self.weekly_service.find_schedule_anchor_timestamp(cycle.cycle_id)
+                if anchor_dt is not None:
+                    pending_wellness = self.wellness_service.get_pending_wellness_windows(
+                        cycle.cycle_id, as_of=self._now_utc()
+                    )
+                    for w, d, trig in pending_wellness:
+                        existing_wellness = self.wellness_service.get_daily_wellness_report(
+                            cycle.cycle_id, w, d
+                        )
+                        if existing_wellness is None:
+                            w_job = self.enqueue_wellness_daily(
+                                cycle_id=cycle.cycle_id,
+                                patient_id=cycle.patient_id,
+                                calendar_week=w,
+                                calendar_day=d,
+                                trigger=trig,
+                            )
+                            if w_job is not None:
+                                discovered.append(w_job)
         return discovered
 
     # ==========================================================================
@@ -1224,6 +1318,66 @@ class ClinicalAutomationService:
             "assessment_available": journal_rec.athena_clinical_assessment.is_available,
         }
 
+    async def _execute_wellness_daily(
+        self, job: AutomationJobRecord
+    ) -> Dict[str, Any]:
+        """
+        Executes Stage 3 daily Wellness processing (`wellness_daily`):
+        1. Verifies patient/cycle ownership, Primary completion, and anchor T0 existence.
+        2. Parses calendar_week and calendar_day from idempotency_key.
+        3. Invokes WellnessDailyService.process_wellness_for_day.
+        """
+        cycle = self.cycle_repo.get(job.cycle_id)
+        if cycle is None or cycle.patient_id != job.patient_id:
+            raise ConsiliumCycleNotFoundError(
+                f"Active cycle '{job.cycle_id}' not found for patient '{job.patient_id}'."
+            )
+
+        if not self.primary_service.is_primary_consilium_completed(job.cycle_id):
+            raise ConsiliumContextMissingError(
+                f"Cannot execute daily wellness processing for cycle '{job.cycle_id}': "
+                "manual Primary Consilium is not completed."
+            )
+
+        if self.weekly_service.find_schedule_anchor_timestamp(job.cycle_id) is None:
+            raise ConsiliumContextMissingError(
+                f"Cannot execute daily wellness processing for cycle '{job.cycle_id}': "
+                "schedule anchor T0 has not been established yet."
+            )
+
+        m = re.search(r'_w(\d+)_d(\d+)$', job.idempotency_key)
+        if not m:
+            raise ValueError(
+                f"Invalid wellness daily idempotency key format '{job.idempotency_key}'."
+            )
+        cal_week = int(m.group(1))
+        cal_day = int(m.group(2))
+
+        report, is_new = await self.wellness_service.process_wellness_for_day(
+            cycle_id=job.cycle_id,
+            calendar_week=cal_week,
+            calendar_day=cal_day,
+            as_of=self._now_utc(),
+        )
+
+        # Immediate trigger of Athena Daily Journal upon saving Wellness report
+        if self.enable_daily_journal:
+            self.enqueue_daily_journal_closure(
+                cycle_id=job.cycle_id,
+                patient_id=job.patient_id,
+                calendar_week=cal_week,
+                calendar_day=cal_day,
+            )
+
+        return {
+            "reused_existing": not is_new,
+            "report_id": report.report_id,
+            "status": report.status.value,
+            "calendar_week": cal_week,
+            "calendar_day": cal_day,
+            "has_interpretation": report.interpretation is not None,
+        }
+
     async def execute_claimed_job(self, claimed: AutomationJobRecord) -> AutomationJobRecord:
         if not claimed.lease_owner_id:
             raise ConsiliumConcurrencyConflictError(
@@ -1249,6 +1403,12 @@ class ClinicalAutomationService:
                     claimed.job_id,
                     lease_owner_id,
                     lambda: self._execute_daily_journal_closure(claimed),
+                )
+            elif claimed.job_type == AutomationJobType.WELLNESS_DAILY:
+                result_meta = await self._execute_with_job_lease_renewal(
+                    claimed.job_id,
+                    lease_owner_id,
+                    lambda: self._execute_wellness_daily(claimed),
                 )
             else:
                 raise ValueError(f"Unsupported automation job_type '{claimed.job_type}'.")
@@ -1319,6 +1479,7 @@ class ClinicalAutomationWorker:
         max_backoff_seconds: int = DEFAULT_MAX_BACKOFF_SECONDS,
         enable_daily_journal: bool = False,
         enable_weekly_plan: bool = False,
+        enable_wellness_daily: bool = False,
     ):
         self.session_factory = session_factory
         self.gateway_factory = gateway_factory or GeminiGateway
@@ -1330,6 +1491,7 @@ class ClinicalAutomationWorker:
         self.max_backoff_seconds = max_backoff_seconds
         self.enable_daily_journal = enable_daily_journal
         self.enable_weekly_plan = enable_weekly_plan
+        self.enable_wellness_daily = enable_wellness_daily
 
         self._wake_event: Optional[asyncio.Event] = None
         self._stop_event: Optional[asyncio.Event] = None
@@ -1363,6 +1525,7 @@ class ClinicalAutomationWorker:
                 max_backoff_seconds=self.max_backoff_seconds,
                 enable_daily_journal=self.enable_daily_journal,
                 enable_weekly_plan=self.enable_weekly_plan,
+                enable_wellness_daily=self.enable_wellness_daily,
             )
             return await service.process_due_jobs(
                 discover=discover,

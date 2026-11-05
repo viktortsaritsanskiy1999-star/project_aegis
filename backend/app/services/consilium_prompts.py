@@ -1,5 +1,5 @@
 import json
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from app.schemas.consilium import SYSTEM_KEYS, AnamnesisQuestionnaireAnswers
 
 # ==============================================================================
@@ -1290,3 +1290,43 @@ def build_athena_daily_pulse_all_completed_prompt(
   "summary_for_master": "Все цели недели завершены досрочно; плановые вопросы не задавались."
 }}
 [/CLINICAL_REPORT]"""
+
+
+
+def build_wellness_daily_analysis_prompt(
+    biometrics_summary: Dict[str, Any],
+    calendar_week: int,
+    calendar_day: int,
+) -> Tuple[str, str]:
+    """
+    Constructs system instruction and user prompt for Gemini Flash to perform
+    objective biometrics and recovery analysis for WellnessDailyService.
+    Separates measured facts from clinical interpretation.
+    """
+    system_instruction = (
+        "You are the Aegis Wellness Daily Analyzer, an objective biometrics analysis engine for Project Aegis.\n"
+        "Your task is to analyze verified physiological telemetry (heart rate, blood pressure, SpO2, sleep, activity) "
+        "and manual measurements for a specific observation day.\n\n"
+        "STRICT CLINICAL INVARIANTS:\n"
+        "1. NEVER invent, fabricate, or extrapolate missing metrics not present in the input.\n"
+        "2. Absence of data is NEVER treated as normal or healthy state.\n"
+        "3. Strictly separate verified numerical measurements from clinical interpretation.\n"
+        "4. Identify real trends, notable limitations/gaps in coverage, and questionable artifact values.\n"
+        "5. Formulate a concise internal summary (summary_for_athena) designed for Section B (Wellness Findings) "
+        "of Athena's daily clinical journal. Do not assume medical doctor titles.\n"
+        "6. Return strictly valid JSON conforming to the requested schema, with no markdown fences or extra text."
+    )
+
+    user_prompt = (
+        f"DAILY WELLNESS ANALYSIS REQUEST — WEEK {calendar_week}, DAY {calendar_day}\n"
+        f"MEASURED BIOMETRIC SUMMARY:\n"
+        f"{json.dumps(biometrics_summary, ensure_ascii=False, indent=2)}\n\n"
+        "Analyze the data and output JSON with the following structure:\n"
+        "{\n"
+        '  "observed_trends": ["trend 1", "trend 2"],\n'
+        '  "limitations_and_gaps": ["gap 1", ...],\n'
+        '  "questionable_measurements": ["artifact 1", ...],\n'
+        '  "summary_for_athena": "Concise factual & physiological summary for Athena clinical journal"\n'
+        "}"
+    )
+    return system_instruction, user_prompt

@@ -49,6 +49,7 @@ async def lifespan(app: FastAPI):
             session_factory=worker_session_factory,
             enable_weekly_plan=settings.enable_weekly_plan,
             enable_daily_journal=settings.enable_daily_journal,
+            enable_wellness_daily=settings.enable_wellness_daily,
         )
         app.state.automation_worker = worker
         await worker.start()

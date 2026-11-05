@@ -129,6 +129,11 @@ class Settings(BaseSettings):
         default=False,
         alias="AEGIS_ENABLE_DAILY_JOURNAL",
     )
+    # Stage 3 Wellness Daily automation flag (disabled by default in production)
+    enable_wellness_daily: bool = Field(
+        default=False,
+        alias="AEGIS_ENABLE_WELLNESS_DAILY",
+    )
 
 
 settings = Settings()
