@@ -139,6 +139,11 @@ class Settings(BaseSettings):
         default=False,
         alias="AEGIS_ENABLE_AUTOMATIC_WEEKLY",
     )
+    # Stage 5.1 Mode 2 Vitals Monitoring automation flag (disabled by default in production)
+    enable_mode2_monitoring: bool = Field(
+        default=False,
+        alias="AEGIS_ENABLE_MODE2_MONITORING",
+    )
 
 
 settings = Settings()

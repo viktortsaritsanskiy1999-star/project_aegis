@@ -33,6 +33,7 @@ from app.schemas.chat import (
 from app.schemas.consilium import (
     AthenaClinicalLogEntry,
 )
+from app.schemas.wellness import Mode2EpisodeWellnessSummary
 from app.schemas.privacy import PrivacyLevel
 from app.services.athena_chat_service import (
     ATHENA_CHAT_HISTORY_REPORT_TYPE,
@@ -663,12 +664,79 @@ class AthenaDailyJournalService:
                 f"No wearable or manual biometric measurements recorded for Day {calendar_day}."
             )
 
+        # Mode 2 episodes discovery
+        mode2_episodes_map: Dict[str, Mode2EpisodeWellnessSummary] = {}
+        if wellness_report_match is not None:
+            c = wellness_report_match.content or {}
+            fact_sum = c.get("factual_summary") or {}
+            raw_eps = fact_sum.get("mode2_episodes") or c.get("mode2_episodes") or []
+            for ep_data in raw_eps:
+                try:
+                    if isinstance(ep_data, dict):
+                        ep_obj = Mode2EpisodeWellnessSummary.model_validate(ep_data)
+                        mode2_episodes_map[ep_obj.episode_id] = ep_obj
+                except Exception:
+                    pass
+
+        try:
+            from app.services.mode2_vitals_service import Mode2VitalsMonitoringService
+            mode2_svc = Mode2VitalsMonitoringService(db=self.db, now_provider=self.now_provider)
+            direct_eps = mode2_svc.get_wellness_episodes_for_window(cycle_id, window_start, window_end)
+            for ep_obj in direct_eps:
+                if ep_obj.episode_id not in mode2_episodes_map:
+                    mode2_episodes_map[ep_obj.episode_id] = ep_obj
+        except Exception:
+            pass
+
+        final_mode2_episodes = list(mode2_episodes_map.values())
+        final_mode2_episodes.sort(key=lambda x: x.started_at_utc)
+
+        for ep_obj in final_mode2_episodes:
+            if ep_obj.objective_metrics.spo2_min is None:
+                decl = f"Mode 2 episode {ep_obj.episode_id}: SpO2 telemetry not available (pulse-only monitoring)."
+                if decl not in missing_declarations:
+                    missing_declarations.append(decl)
+
+        # Activity summary (routine workouts & steps)
+        activity_summary_data = None
+        if wellness_report_match is not None:
+            fact_sum = (wellness_report_match.content or {}).get("factual_summary") or {}
+            act = fact_sum.get("activity")
+            if act and isinstance(act, dict):
+                activity_summary_data = act
+
+        if activity_summary_data is None:
+            workout_pulses: List[int] = []
+            recovery_pulses: List[int] = []
+            detected_types: List[str] = []
+            for m in records_in_window:
+                m_phase = str(m.phase or "").lower()
+                meta = m.raw_metadata or {}
+                meta_phase = str(meta.get("phase") or "").lower() if isinstance(meta, dict) else ""
+                w_t = meta.get("workout_type") or meta.get("sport") if isinstance(meta, dict) else None
+                if w_t and str(w_t) not in detected_types:
+                    detected_types.append(str(w_t))
+                if m.pulse is not None:
+                    if m_phase == "workout" or meta_phase == "workout":
+                        workout_pulses.append(m.pulse)
+                    elif m_phase in ("recovery_0_10", "recovery_10_50", "recovery") or "recovery" in meta_phase:
+                        recovery_pulses.append(m.pulse)
+            if workout_pulses or recovery_pulses or step_records:
+                activity_summary_data = {
+                    "step_count": step_records[-1].get("steps") or step_records[-1].get("step_count") if step_records else None,
+                    "workout_type": detected_types[0] if detected_types else ("workout" if (workout_pulses or recovery_pulses) else None),
+                    "workout_avg_bpm": round(sum(workout_pulses) / len(workout_pulses), 1) if workout_pulses else None,
+                    "workout_max_bpm": max(workout_pulses) if workout_pulses else None,
+                    "recovery_min_bpm": min(recovery_pulses) if recovery_pulses else None,
+                }
+
         biometrics = BiometricsSummary(
             heart_rate_summary=heart_rate_summary,
             blood_pressure_summary=blood_pressure_summary,
             spo2_summary=spo2_summary,
             sleep_summary=sleep_summary,
             steps_summary=steps_summary,
+            activity_summary=activity_summary_data,
             raw_records_count=len(measurement_points),
             records=measurement_points,
         )
@@ -678,6 +746,7 @@ class AthenaDailyJournalService:
             wellness_assessment=assessment,
             biometrics=biometrics,
             missing_data_declarations=missing_declarations,
+            mode2_episodes=final_mode2_episodes,
         )
 
     def _gather_exceptional_events(
@@ -757,6 +826,35 @@ class AthenaDailyJournalService:
                     )
                 )
 
+        # 3. From Mode 2 episodes
+        try:
+            from app.services.mode2_vitals_service import Mode2VitalsMonitoringService
+            mode2_svc = Mode2VitalsMonitoringService(db=self.db, now_provider=self.now_provider)
+            mode2_eps = mode2_svc.get_wellness_episodes_for_window(cycle_id, window_start, window_end)
+            seen_event_ids = {e.event_id for e in events}
+            for ep in mode2_eps:
+                if ep.episode_id not in seen_event_ids:
+                    symptom_str = ", ".join(ep.user_facts.confirmed_symptoms) if ep.user_facts.confirmed_symptoms else "none"
+                    events.append(
+                        ExceptionalEventEntry(
+                            event_type="mode2_episode",
+                            event_id=ep.episode_id,
+                            timestamp_utc=ep.started_at_utc,
+                            source=ep.measurement_source,
+                            description=(
+                                f"Mode 2 vitals episode: trigger={ep.objective_metrics.trigger_pulse} bpm, "
+                                f"range={ep.objective_metrics.min_pulse}-{ep.objective_metrics.max_pulse} bpm, "
+                                f"workout={ep.user_facts.workout_context}, "
+                                f"symptoms={symptom_str}"
+                            ),
+                            clinical_event_identity=f"mode2_{ep.episode_id}",
+                            safety_tier="Mode 2",
+                        )
+                    )
+                    seen_event_ids.add(ep.episode_id)
+        except Exception:
+            pass
+
         events.sort(key=lambda item: item.timestamp_utc)
         return events
 
@@ -802,7 +900,10 @@ class AthenaDailyJournalService:
         has_feeling_fine_claim = any(kw in patient_text_combined for kw in _FEELING_FINE_KEYWORDS)
         has_critical_spike = (
             hr_sum is not None and hr_sum.get("max_bpm", 0) >= 130
-        ) or any(e.event_type in ("vitals_alert", "wearable_alert", "wearable_event") for e in exceptional_events)
+        ) or any(
+            e.event_type in ("vitals_alert", "wearable_alert", "wearable_event", "mode2_episode")
+            for e in exceptional_events
+        )
 
         if has_feeling_fine_claim and has_critical_spike:
             contradictions.append(
@@ -906,6 +1007,8 @@ class AthenaDailyJournalService:
             refs.append(f"biometric:{pt.source}:{pt.timestamp_utc}")
         for ee in journal.exceptional_events:
             refs.append(f"exceptional_event:{ee.event_id}")
+        for ep in journal.wellness_evidence.mode2_episodes:
+            refs.append(f"mode2_episode:{ep.episode_id}")
 
         window_start = self._parse_iso_utc(journal.window_start_utc)
         window_end = self._parse_iso_utc(journal.window_end_utc)
@@ -1559,6 +1662,136 @@ class AthenaDailyJournalService:
 
         return unjournaled_msgs
 
+    def get_unjournaled_mode2_episodes(
+        self,
+        cycle_id: str,
+        sprint_number: int,
+        sprint_end_dt: Optional[datetime] = None,
+        already_journaled_ids: Optional[set] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        Collects Mode 2 episodes within the sprint window that have NOT yet been captured
+        in any closed daily journal for this sprint.
+        Guarantees that events strictly >= sprint_end_dt are NEVER included.
+        If an episode crosses the sprint cutoff boundary, annotates it as [BOUNDARY-CROSSING],
+        filters telemetry up to sprint_end_dt, and preserves the original episode_id.
+        """
+        anchor_dt = self.weekly_service.find_schedule_anchor_timestamp(cycle_id)
+        if anchor_dt is not None:
+            if sprint_number == 1:
+                sprint_start = anchor_dt - timedelta(minutes=10)
+                nominal_end = anchor_dt + timedelta(hours=168)
+            else:
+                sprint_start = anchor_dt + timedelta(hours=168 * (sprint_number - 1))
+                nominal_end = anchor_dt + timedelta(hours=168 * sprint_number)
+        else:
+            now_dt = self._now_utc()
+            sprint_start = now_dt - timedelta(days=7)
+            nominal_end = now_dt
+
+        effective_end = sprint_end_dt or nominal_end
+        journaled_ids = already_journaled_ids or set()
+
+        from app.services.mode2_vitals_service import Mode2VitalsMonitoringService
+        mode2_svc = Mode2VitalsMonitoringService(db=self.db, now_provider=self.now_provider)
+        all_episodes = mode2_svc.get_episode_history(cycle_id)
+
+        unjournaled_results: List[Dict[str, Any]] = []
+
+        for ep in all_episodes:
+            ep_start = self._parse_iso_utc(ep.started_at_utc)
+            if ep_start is None:
+                continue
+
+            if ep_start > effective_end or ep_start < sprint_start:
+                continue
+
+            if ep.episode_id in journaled_ids:
+                continue
+
+            ep_closed = self._parse_iso_utc(ep.closed_at_utc) if ep.closed_at_utc else None
+            is_boundary_crossing = (ep_closed is None or ep_closed > effective_end)
+
+            summary = mode2_svc.build_wellness_summary(ep)
+            om = summary.objective_metrics
+            uf = summary.user_facts
+            mc = summary.model_context
+
+            effective_pulse_dyn = []
+            for p in om.pulse_dynamics:
+                p_ts = self._parse_iso_utc(p.get("timestamp_utc"))
+                if p_ts is not None and p_ts <= effective_end:
+                    effective_pulse_dyn.append(p)
+                elif p_ts is None:
+                    effective_pulse_dyn.append(p)
+
+            effective_spo2_hist = []
+            for s in om.spo2_history:
+                s_ts = self._parse_iso_utc(s.get("timestamp_utc"))
+                if s_ts is not None and s_ts <= effective_end:
+                    effective_spo2_hist.append(s)
+                elif s_ts is None:
+                    effective_spo2_hist.append(s)
+
+            pulse_values = [p.get("pulse") for p in effective_pulse_dyn if p.get("pulse") is not None]
+            if not pulse_values:
+                pulse_values = [om.trigger_pulse, om.max_pulse]
+
+            spo2_values = [s.get("spo2") for s in effective_spo2_hist if s.get("spo2") is not None]
+
+            if is_boundary_crossing:
+                duration_min = round(max((effective_end - ep_start).total_seconds() / 60.0, 0.0), 1)
+            else:
+                duration_min = om.duration_minutes
+
+            obj_metrics = {
+                "min_pulse": min(pulse_values),
+                "max_pulse": max(pulse_values),
+                "trigger_pulse": om.trigger_pulse,
+                "baseline_pulse": om.baseline_pulse,
+                "duration_minutes": duration_min,
+                "spo2_min": min(spo2_values) if spo2_values else None,
+                "spo2_max": max(spo2_values) if spo2_values else None,
+                "telemetry_samples_count": len(effective_pulse_dyn),
+            }
+
+            unjournaled_results.append({
+                "episode_id": ep.episode_id,
+                "started_at_utc": ep.started_at_utc,
+                "closed_at_utc": ep.closed_at_utc if not is_boundary_crossing else None,
+                "is_boundary_crossing": is_boundary_crossing,
+                "cutoff_utc": effective_end.isoformat(),
+                "objective_metrics": obj_metrics,
+                "user_facts": {
+                    "workout_context": uf.workout_context,
+                    "user_statements": list(uf.user_statements),
+                    "confirmed_symptoms": list(uf.confirmed_symptoms),
+                },
+                "model_context": {
+                    "athena_events_count": mc.athena_events_count,
+                    "is_normalized": mc.is_normalized,
+                    "model_notes": mc.model_notes,
+                },
+            })
+
+        unjournaled_results.sort(key=lambda x: x["started_at_utc"])
+        return unjournaled_results
+
+    @staticmethod
+    def get_unique_mode2_episode_ids(journal: AthenaDailyJournalRecord) -> set[str]:
+        """
+        Deduplicates Mode 2 episodes across Section B (wellness_evidence.mode2_episodes)
+        and Section C (exceptional_events) by episode_id.
+        """
+        unique_ids: set[str] = set()
+        for ep in journal.wellness_evidence.mode2_episodes:
+            if ep.episode_id:
+                unique_ids.add(ep.episode_id)
+        for ee in journal.exceptional_events:
+            if ee.event_type == "mode2_episode" and ee.event_id:
+                unique_ids.add(ee.event_id)
+        return unique_ids
+
     def format_seven_day_journals_for_consilium(
         self,
         cycle_id: str,
@@ -1583,14 +1816,32 @@ class AthenaDailyJournalService:
             sprint_number=sprint_number,
             sprint_end_dt=sprint_end_dt,
         )
+
+        journaled_mode2_ids: set[str] = set()
+        for _, j in journals_list:
+            if j is not None:
+                for ep in j.wellness_evidence.mode2_episodes:
+                    journaled_mode2_ids.add(ep.episode_id)
+                for ee in j.exceptional_events:
+                    if ee.event_type == "mode2_episode":
+                        journaled_mode2_ids.add(ee.event_id)
+
+        unjournaled_mode2 = self.get_unjournaled_mode2_episodes(
+            cycle_id=cycle_id,
+            sprint_number=sprint_number,
+            sprint_end_dt=sprint_end_dt,
+            already_journaled_ids=journaled_mode2_ids,
+        )
+
         has_any_journal = any(j is not None for _, j in journals_list)
-        if not has_any_journal and not unjournaled and not allow_empty:
+        if not has_any_journal and not unjournaled and not unjournaled_mode2 and not allow_empty:
             return None
 
         lines: List[str] = [
             f"=== SEVEN-DAY ATHENA CLINICAL JOURNALS (WEEK {sprint_number}, DAYS 1-7) ===",
             "NOTE FOR DEPUTY & CHIEF PHYSICIAN: Evidence (Layer 1) and Athena Interpretation (Layer 2) are separated.",
             "Do not turn Athena clinical hypotheses into raw physical facts.",
+            "DEDUPLICATION RULE: Mode 2 vitals episodes appear in Section B (telemetry details) and Section C (safety tier logging) with identical episode_id. They are the same single occurrence; deduplicate by episode_id and never count them as two distinct episodes.",
             "--------------------------------------------------",
         ]
 
@@ -1644,6 +1895,40 @@ class AthenaDailyJournalService:
                 spo2 = bio.spo2_summary
                 lines.append(f"    - SpO2: avg {spo2.get('avg_spo2')}% (min {spo2.get('min_spo2')}%)")
 
+            if we.mode2_episodes:
+                lines.append("    - Mode 2 Vitals Episodes:")
+                for ep in we.mode2_episodes:
+                    om = ep.objective_metrics
+                    uf = ep.user_facts
+                    symptoms_s = ", ".join(uf.confirmed_symptoms) if uf.confirmed_symptoms else "none"
+                    lines.append(f"      * [Episode {ep.episode_id}] Started: {ep.started_at_utc}, Closed: {ep.closed_at_utc or 'Ongoing'}")
+                    lines.append(f"        Trigger: {om.trigger_pulse} bpm, Range: {om.min_pulse}-{om.max_pulse} bpm, Duration: {om.duration_minutes:.1f}m")
+                    if om.spo2_min is not None:
+                        lines.append(f"        SpO2: min {om.spo2_min}%, max {om.spo2_max}%")
+                    else:
+                        lines.append("        SpO2: not measured (missing telemetry)")
+                    lines.append(f"        Workout context: {uf.workout_context}, Symptoms: {symptoms_s}")
+                    if uf.user_statements:
+                        lines.append(f"        Patient statements (verbatim): {'; '.join(uf.user_statements)}")
+                    if om.telemetry_gaps:
+                        lines.append(f"        Telemetry gaps: {'; '.join(om.telemetry_gaps)}")
+
+            if bio.activity_summary:
+                act = bio.activity_summary
+                act_parts = []
+                if act.get("workout_type"):
+                    act_parts.append(f"Workout: {act['workout_type']}")
+                if act.get("workout_avg_bpm") is not None:
+                    act_parts.append(f"avg {act['workout_avg_bpm']} bpm")
+                if act.get("workout_max_bpm") is not None:
+                    act_parts.append(f"max {act['workout_max_bpm']} bpm")
+                if act.get("recovery_min_bpm") is not None:
+                    act_parts.append(f"recovery min {act['recovery_min_bpm']} bpm")
+                if act.get("step_count") is not None:
+                    act_parts.append(f"steps: {act['step_count']}")
+                if act_parts:
+                    lines.append(f"    - Activity & Routine Workout: {', '.join(act_parts)}")
+
             if we.missing_data_declarations:
                 lines.append("    - Missing data declarations:")
                 for decl in we.missing_data_declarations:
@@ -1653,7 +1938,14 @@ class AthenaDailyJournalService:
             if journal.exceptional_events:
                 lines.append("  • Exceptional clinical events:")
                 for ee in journal.exceptional_events:
-                    lines.append(f"    - [{ee.event_type} | {ee.safety_tier or 'Standard'}] {ee.description} (source: {ee.source}, timestamp: {ee.timestamp_utc})")
+                    if ee.event_type == "mode2_episode" and ee.event_id:
+                        lines.append(
+                            f"    - [{ee.event_type} | {ee.safety_tier or 'Standard'} | episode_id: {ee.event_id}] "
+                            f"{ee.description} (source: {ee.source}, timestamp: {ee.timestamp_utc}) "
+                            f"[Cross-reference: Same clinical incident as Episode {ee.event_id} in Section B above; DO NOT count as a separate event]"
+                        )
+                    else:
+                        lines.append(f"    - [{ee.event_type} | {ee.safety_tier or 'Standard'}] {ee.description} (source: {ee.source}, timestamp: {ee.timestamp_utc})")
             else:
                 lines.append("  • Exceptional clinical events: None recorded.")
 
@@ -1689,6 +1981,26 @@ class AthenaDailyJournalService:
             lines.append("Source: Direct Chat Turn (prior to Weekly cutoff, not yet captured in a closed daily journal)")
             for u in unjournaled:
                 lines.append(f"  • \"{u['text']}\" (timestamp: {u['timestamp']}, event: {u['event_type']})")
+            lines.append("--------------------------------------------------")
+
+        if unjournaled_mode2:
+            lines.append("=== UNJOURNALED MODE 2 EPISODES (PRIOR TO WEEKLY BOUNDARY) ===")
+            lines.append("Source: Server Mode 2 Episode Log (prior to Weekly cutoff, not yet captured in a closed daily journal)")
+            for u in unjournaled_mode2:
+                om = u["objective_metrics"]
+                uf = u["user_facts"]
+                symptoms_s = ", ".join(uf["confirmed_symptoms"]) if uf.get("confirmed_symptoms") else "none"
+                lines.append(f"  • [Episode {u['episode_id']}] Started: {u['started_at_utc']}, Closed: {u.get('closed_at_utc') or 'Ongoing'}")
+                if u.get("is_boundary_crossing"):
+                    lines.append(f"    [BOUNDARY-CROSSING]: Started prior to cutoff ({u['cutoff_utc']}), telemetry evaluated up to cutoff.")
+                lines.append(f"    Trigger: {om['trigger_pulse']} bpm, Range: {om['min_pulse']}-{om['max_pulse']} bpm, Duration in sprint: {om['duration_minutes']:.1f}m")
+                if om.get("spo2_min") is not None:
+                    lines.append(f"    SpO2: min {om['spo2_min']}%, max {om['spo2_max']}%")
+                else:
+                    lines.append("    SpO2: not measured (missing telemetry)")
+                lines.append(f"    Workout context: {uf['workout_context']}, Symptoms: {symptoms_s}")
+                if uf.get("user_statements"):
+                    lines.append(f"    Patient statements (verbatim): {'; '.join(uf['user_statements'])}")
             lines.append("--------------------------------------------------")
 
         return "\n".join(lines)

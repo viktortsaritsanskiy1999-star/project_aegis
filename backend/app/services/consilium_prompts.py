@@ -1320,7 +1320,18 @@ def build_wellness_daily_analysis_prompt(
         "4. Identify real trends, notable limitations/gaps in coverage, and questionable artifact values.\n"
         "5. Formulate a concise internal summary (summary_for_athena) designed for Section B (Wellness Findings) "
         "of Athena's daily clinical journal. Do not assume medical doctor titles.\n"
-        "6. Return strictly valid JSON conforming to the requested schema, with no markdown fences or extra text."
+        "6. MODE 2 EPISODES AND HEART RATE DYNAMICS (CRITICAL):\n"
+        "   - If 'mode2_episodes' are present in the input, analyze each episode as a DISTINCT, SEPARATE physiological event. "
+        "NEVER combine or average multiple episodes (e.g. an unprovoked morning resting spike vs an evening exercise spike must remain distinct).\n"
+        "   - Analyze heart rate dynamics across 4 distinct physical exertion contexts:\n"
+        "     a) DURING CONFIRMED WORKOUT ('confirmed_workout'): evaluate peak effort and physiological appropriateness of pulse rise.\n"
+        "     b) POST-WORKOUT RECOVERY: evaluate rate and trajectory of recovery toward baseline, noting absence or presence of rebound spikes.\n"
+        "     c) OUTSIDE WORKOUT / NON-EXERCISE SPIKE ('not_working_out'): evaluate resting deviation, potential autonomic or stress etiology, and any reported symptoms.\n"
+        "     d) UNKNOWN PHYSICAL ACTIVITY CONTEXT ('unknown'): explicitly note the lack of user response as a gap/limitation without inventing confirmation of workout.\n"
+        "   - Strictly distinguish objective metrics from user statements and model hypotheses. Never treat model guesses as confirmed facts.\n"
+        "   - Note SpO2 values during episodes if present; if SpO2 was not measured, explicitly note absence of SpO2 without inventing values.\n"
+        "   - When 'mode2_episodes' exist, populate 'episode_evaluations' with individual assessments for each episode_id.\n"
+        "7. Return strictly valid JSON conforming to the requested schema, with no markdown fences or extra text."
     )
 
     user_prompt = (
@@ -1332,6 +1343,13 @@ def build_wellness_daily_analysis_prompt(
         '  "observed_trends": ["trend 1", "trend 2"],\n'
         '  "limitations_and_gaps": ["gap 1", ...],\n'
         '  "questionable_measurements": ["artifact 1", ...],\n'
+        '  "episode_evaluations": [\n'
+        '    {\n'
+        '      "episode_id": "ep_...",\n'
+        '      "workout_context": "confirmed_workout | not_working_out | unknown",\n'
+        '      "analysis": "Individual evaluation of this episode\'s heart rate dynamics and context"\n'
+        '    }\n'
+        '  ],\n'
         '  "summary_for_athena": "Concise factual & physiological summary for Athena clinical journal"\n'
         "}"
     )

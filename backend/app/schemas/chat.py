@@ -2,6 +2,7 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Dict, List, Literal, Optional
 from pydantic import BaseModel, ConfigDict, Field, field_validator
+from app.schemas.wellness import Mode2EpisodeWellnessSummary
 
 
 class AthenaGoalStatus(str, Enum):
@@ -128,6 +129,7 @@ class AthenaChatRequest(BaseModel):
             "routine_reminder",
             "reminder",
             "weekly_wrapup",
+            "mode2_update",
         }
         if clean not in allowed:
             raise ValueError(f"event_type must be one of: {', '.join(sorted(allowed))}")
@@ -251,6 +253,7 @@ class BiometricsSummary(BaseModel):
     spo2_summary: Optional[Dict[str, Any]] = None
     sleep_summary: Optional[Dict[str, Any]] = None
     steps_summary: Optional[Dict[str, Any]] = None
+    activity_summary: Optional[Dict[str, Any]] = None
     raw_records_count: int = 0
     records: List[BiometricMeasurementPoint] = Field(default_factory=list)
 
@@ -263,6 +266,7 @@ class WellnessEvidence(BaseModel):
     wellness_assessment: Optional[str] = None
     biometrics: BiometricsSummary
     missing_data_declarations: List[str] = Field(default_factory=list)
+    mode2_episodes: List[Mode2EpisodeWellnessSummary] = Field(default_factory=list)
 
 
 class ExceptionalEventEntry(BaseModel):

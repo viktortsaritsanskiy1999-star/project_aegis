@@ -1,8 +1,9 @@
-from datetime import datetime
-from typing import Optional
+from datetime import datetime, timezone
+from typing import Any, Callable, List, Optional
 from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from sqlalchemy.orm import Session
 
+from app.config import settings
 from app.database import get_db
 from app.repositories.measurement_repository import (
     HealthMeasurementRepository,
@@ -15,13 +16,49 @@ from app.schemas.health import (
     HealthMeasurementResponse,
     VitalsStreamResponse,
 )
+from app.schemas.mode2 import (
+    Mode2EpisodeSummaryResponse,
+    Mode2WorkoutResponseRequest,
+)
 from app.security.auth import (
     AuthSession,
     require_scopes,
     verify_cycle_access_for_session,
 )
+from app.services.gemini_gateway import GeminiGateway
+from app.services.mode2_vitals_service import Mode2VitalsMonitoringService
 
 router = APIRouter(prefix="/api/v1/vitals", tags=["Vitals Telemetry"])
+
+
+def get_gemini_gateway() -> GeminiGateway:
+    return GeminiGateway()
+
+
+def get_server_now_provider() -> Callable[[], datetime]:
+    return lambda: datetime.now(timezone.utc)
+
+
+def _build_mode2_summary_response(ep: Any) -> Mode2EpisodeSummaryResponse:
+    last_reply = ep.athena_events[-1].athena_reply if ep.athena_events else None
+    return Mode2EpisodeSummaryResponse(
+        episode_id=ep.episode_id,
+        cycle_id=ep.cycle_id,
+        status=ep.status.value if hasattr(ep.status, "value") else str(ep.status),
+        started_at_utc=ep.started_at_utc,
+        closed_at_utc=ep.closed_at_utc,
+        baseline_pulse=ep.baseline_pulse,
+        trigger_pulse=ep.trigger_pulse,
+        min_pulse=ep.min_pulse,
+        max_pulse=ep.max_pulse,
+        latest_pulse=ep.latest_pulse,
+        latest_spo2=ep.latest_spo2,
+        workout_context=ep.workout_context.value if hasattr(ep.workout_context, "value") else str(ep.workout_context),
+        samples_count=len(ep.telemetry_samples),
+        events_count=len(ep.athena_events),
+        user_statements_count=len(ep.user_statements),
+        last_athena_reply=last_reply,
+    )
 
 
 @router.post(
@@ -35,11 +72,13 @@ router = APIRouter(prefix="/api/v1/vitals", tags=["Vitals Telemetry"])
         "and enforces technical admissibility ranges without inventing artificial medical alarm thresholds."
     ),
 )
-def ingest_measurement_endpoint(
+async def ingest_measurement_endpoint(
     payload: HealthMeasurementCreate,
     response: Response,
     db: Session = Depends(get_db),
     session: AuthSession = Depends(require_scopes("vitals:write")),
+    gateway: GeminiGateway = Depends(get_gemini_gateway),
+    now_provider: Callable[[], datetime] = Depends(get_server_now_provider),
 ) -> HealthMeasurementResponse:
     if not payload.cycle_id:
         raise HTTPException(
@@ -67,6 +106,22 @@ def ingest_measurement_endpoint(
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=str(ve),
+        )
+
+    # Mode 2: Trigger operational vitals monitoring for new live measurements if enabled
+    if is_new and not rec.is_historical and settings.enable_mode2_monitoring:
+        mode2_svc = Mode2VitalsMonitoringService(db=db, gateway=gateway, now_provider=now_provider)
+        await mode2_svc.process_measurement(
+            cycle_id=rec.cycle_id or payload.cycle_id,
+            pulse=rec.pulse,
+            spo2=rec.spo2,
+            systolic=rec.systolic,
+            diastolic=rec.diastolic,
+            source=rec.source,
+            is_simulated=rec.is_simulated,
+            measured_at=rec.measured_at,
+            note=rec.note,
+            phase=rec.phase,
         )
 
     response.status_code = status.HTTP_201_CREATED if is_new else status.HTTP_200_OK
@@ -100,11 +155,13 @@ def ingest_measurement_endpoint(
         "deduplicates identical records, and atomically persists all fresh measurements."
     ),
 )
-def ingest_batch_endpoint(
+async def ingest_batch_endpoint(
     payload: HealthMeasurementCreateBatch,
     response: Response,
     db: Session = Depends(get_db),
     session: AuthSession = Depends(require_scopes("vitals:write")),
+    gateway: GeminiGateway = Depends(get_gemini_gateway),
+    now_provider: Callable[[], datetime] = Depends(get_server_now_provider),
 ) -> HealthMeasurementBatchResponse:
     # Verify cycle existence & patient ownership BEFORE inspecting cycle.status or batch items
     cycle = verify_cycle_access_for_session(db, session, payload.cycle_id)
@@ -158,6 +215,24 @@ def ingest_batch_endpoint(
 
     recorded_count = sum(1 for f in is_new_flags if f)
     deduplicated_count = len(is_new_flags) - recorded_count
+
+    # Mode 2: Trigger operational vitals monitoring for new live measurements if enabled
+    if settings.enable_mode2_monitoring:
+        mode2_svc = Mode2VitalsMonitoringService(db=db, gateway=gateway, now_provider=now_provider)
+        for rec, is_new in zip(records, is_new_flags):
+            if is_new and not rec.is_historical:
+                await mode2_svc.process_measurement(
+                    cycle_id=rec.cycle_id or payload.cycle_id,
+                    pulse=rec.pulse,
+                    spo2=rec.spo2,
+                    systolic=rec.systolic,
+                    diastolic=rec.diastolic,
+                    source=rec.source,
+                    is_simulated=rec.is_simulated,
+                    measured_at=rec.measured_at,
+                    note=rec.note,
+                    phase=rec.phase,
+                )
 
     response.status_code = status.HTTP_201_CREATED if recorded_count > 0 else status.HTTP_200_OK
 
@@ -265,3 +340,82 @@ def get_latest_vitals_stream_endpoint(
         is_live=None,
         recency_status="unknown",
     )
+
+
+# ==============================================================================
+# MODE 2: OPERATIONAL VITALS MONITORING ENDPOINTS
+# ==============================================================================
+
+@router.post(
+    "/mode2/workout-response",
+    response_model=Mode2EpisodeSummaryResponse,
+    summary="Submit user workout clarification and subjective symptoms for active Mode 2 episode",
+    description=(
+        "Registers patient response regarding physical exertion (training vs rest) "
+        "and subjective symptoms. Stores original answers verbatim with timestamps. "
+        "Triggers immediate Athena operational guidance without consuming daily planned question quota."
+    ),
+)
+async def submit_mode2_workout_response_endpoint(
+    payload: Mode2WorkoutResponseRequest,
+    db: Session = Depends(get_db),
+    session: AuthSession = Depends(require_scopes("vitals:write")),
+    gateway: GeminiGateway = Depends(get_gemini_gateway),
+    now_provider: Callable[[], datetime] = Depends(get_server_now_provider),
+) -> Mode2EpisodeSummaryResponse:
+    verify_cycle_access_for_session(db, session, payload.cycle_id)
+    mode2_svc = Mode2VitalsMonitoringService(db=db, gateway=gateway, now_provider=now_provider)
+    active_ep = mode2_svc.get_active_episode(payload.cycle_id)
+    if not active_ep:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"No active Mode 2 episode found for cycle '{payload.cycle_id}'.",
+        )
+    msg = payload.user_message or ("Да, тренируюсь" if payload.is_workout else "Нет, не тренируюсь")
+    updated_ep = await mode2_svc.handle_user_statement(
+        cycle_id=payload.cycle_id,
+        user_text=msg,
+        is_workout=payload.is_workout,
+        symptoms=payload.symptoms,
+    )
+    if not updated_ep:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to update Mode 2 episode with user statement.",
+        )
+    return _build_mode2_summary_response(updated_ep)
+
+
+@router.get(
+    "/mode2/active",
+    response_model=Optional[Mode2EpisodeSummaryResponse],
+    summary="Retrieve active Mode 2 episode for medical cycle",
+)
+def get_mode2_active_episode_endpoint(
+    cycle_id: str = Query(..., min_length=3, max_length=64),
+    db: Session = Depends(get_db),
+    session: AuthSession = Depends(require_scopes("vitals:read")),
+) -> Optional[Mode2EpisodeSummaryResponse]:
+    verify_cycle_access_for_session(db, session, cycle_id)
+    mode2_svc = Mode2VitalsMonitoringService(db=db)
+    active_ep = mode2_svc.get_active_episode(cycle_id)
+    if not active_ep:
+        return None
+    return _build_mode2_summary_response(active_ep)
+
+
+@router.get(
+    "/mode2/history",
+    response_model=List[Mode2EpisodeSummaryResponse],
+    summary="Retrieve full Mode 2 episode history for medical cycle",
+)
+def get_mode2_episode_history_endpoint(
+    cycle_id: str = Query(..., min_length=3, max_length=64),
+    db: Session = Depends(get_db),
+    session: AuthSession = Depends(require_scopes("vitals:read")),
+) -> List[Mode2EpisodeSummaryResponse]:
+    verify_cycle_access_for_session(db, session, cycle_id)
+    mode2_svc = Mode2VitalsMonitoringService(db=db)
+    episodes = mode2_svc.get_episode_history(cycle_id)
+    return [_build_mode2_summary_response(ep) for ep in episodes]
+

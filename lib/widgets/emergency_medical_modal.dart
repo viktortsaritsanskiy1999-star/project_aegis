@@ -77,7 +77,7 @@ class EmergencyMedicalModal extends StatelessWidget {
                       child: FittedBox( // Переносит/масштабирует текст под ширину
                         fit: BoxFit.scaleDown,
                         child: Text(
-                          "Emergency: 112 / 911",
+                          "Emergency: 911 / 119",
                           style: TextStyle(
                             color: Colors.redAccent,
                             fontSize: 16,

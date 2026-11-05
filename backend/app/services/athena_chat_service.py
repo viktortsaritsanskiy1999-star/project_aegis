@@ -140,6 +140,33 @@ class AthenaChatService:
             db, gateway=self.gateway, now_provider=now_provider
         )
 
+    def _is_mode2_active_for_cycle(self, cycle_id: str) -> bool:
+        """Checks if a Mode 2 pulse episode is currently active for this cycle."""
+        reports = self.report_repo.list_server_only(
+            cycle_id=cycle_id,
+            report_type="athena_mode2_episode",
+        )
+        seen_episodes = set()
+        for r in reports:
+            if not r.content or "episode_id" not in r.content:
+                continue
+            ep_id = r.content["episode_id"]
+            if ep_id in seen_episodes:
+                continue
+            seen_episodes.add(ep_id)
+            if r.content.get("status") == "active":
+                return True
+        return False
+
+    def _record_mode2_user_statement_sync(self, cycle_id: str, text: str, as_of: Optional[datetime] = None) -> None:
+        """Records user statement verbatim into active Mode 2 episode."""
+        try:
+            from app.services.mode2_vitals_service import Mode2VitalsMonitoringService
+            service = Mode2VitalsMonitoringService(db=self.db, gateway=self.gateway, now_provider=self.now_provider)
+            service.record_user_statement_sync(cycle_id=cycle_id, user_text=text, as_of=as_of)
+        except Exception:
+            pass
+
     def get_latest_routine_question_record(self, cycle_id: str) -> Optional[Dict[str, Any]]:
         """Retrieves the latest version of the routine question record for the cycle."""
         reports = self.report_repo.list_server_only(
@@ -543,11 +570,18 @@ class AthenaChatService:
                     active_plan = plan_svc.get_active_weekly_plan(resolved_cycle_id)
 
                     has_patient_reply = bool(request.message and request.message.strip())
+                    is_mode2_active = self._is_mode2_active_for_cycle(resolved_cycle_id)
 
-                    # If this turn contains a patient reply, mark previous outstanding question as answered
+                    # If Mode 2 is active, user messages are part of operational accompaniment, not routine daily check-in
+                    if is_mode2_active and request.message:
+                        self._record_mode2_user_statement_sync(resolved_cycle_id, request.message, as_of=turn_dt)
+
+                    # If this turn contains a patient reply, mark previous outstanding question as answered (ONLY outside Mode 2)
                     prev_active_q = None
-                    if request.event_type in ("routine_answer", "user_message") or (
-                        request.event_type == "daily_pulse" and has_patient_reply
+                    if not is_mode2_active and (
+                        request.event_type in ("routine_answer", "user_message") or (
+                            request.event_type == "daily_pulse" and has_patient_reply
+                        )
                     ):
                         prev_active_q = self.get_active_routine_question(resolved_cycle_id)
                         if prev_active_q is not None and prev_active_q.get("status") == "unanswered":
@@ -569,8 +603,8 @@ class AthenaChatService:
                                 commit=False,
                             )
 
-                    # Stage 2 Goal Progression: if an active weekly plan exists and patient answered a routine question
-                    if active_plan is not None and (
+                    # Stage 2 Goal Progression: if an active weekly plan exists and patient answered a routine question (strictly outside Mode 2)
+                    if not is_mode2_active and active_plan is not None and (
                         request.event_type == "routine_answer"
                         or (request.event_type == "user_message" and prev_active_q is not None)
                     ):
@@ -1281,7 +1315,7 @@ class AthenaChatService:
         - Critical pulse spike (>= 150 bpm or <= 40 bpm at rest)
         - Explicit acute medical symptoms in message text
         """
-        if request.event_type in ("vitals_alert", "wearable_event") and request.vitals_alert is not None:
+        if request.event_type in ("vitals_alert", "wearable_event", "mode2_update") and request.vitals_alert is not None:
             va = request.vitals_alert
             # Heart rate spike >= 150 bpm or severe bradycardia <= 40 bpm
             if va.current_pulse >= 150 or va.current_pulse <= 40:
@@ -1528,12 +1562,42 @@ class AthenaChatService:
 
 YOUR INSTRUCTION (MODE 2: ATTENTION AND SUPPORT):
 1. THE "GOODBYE UNTIL TOMORROW" RULE IS STRICTLY CANCELED!
-2. Speak warmly and calmly. Ask what happened, ask them to sit down, unbutton their collar, and breathe.
-3. Filter out "red flags" (chest pain, shortness of breath, lack of air, darkening in the eyes).
-4. Be sure to formulate [CLINICAL_REPORT] with "ALERT" (or "CRITICAL") status, specifying "red_flags" and a summary for the Chief Physician.
-5. If the condition is critical, add to the very end of the response (after [CLINICAL_REPORT]): [EMERGENCY_TRIGGER].
+2. Speak warmly, calmly, and empathetically in Russian.
+3. Ask what happened, clarify whether the user is currently working out / exercising or at rest, and inquire about their subjective well-being.
+4. Advise them to sit down comfortably, loosen tight clothing, and breathe evenly.
+5. Filter out "red flags" (chest pain, shortness of breath, lack of air, darkening in the eyes, dizziness, fainting).
+6. If the condition is critical, advise seeking urgent medical care (112 or emergency room). Do NOT give official medical diagnoses or prescribe medications.
+7. If an ambulance was mentioned, NEVER claim help has arrived without explicit confirmation from the user (Если упоминалась скорая, ЗАПРЕЩЕНО заявлять о прибытии помощи без подтверждения от пользователя).
+8. STRICTLY FORBIDDEN to claim complete medical recovery or that the cardiovascular system is fully restored upon normalization (ЗАПРЕЩЕНО заявлять о полном выздоровлении или восстановлении сердечно-сосудистой системы).
+9. Be sure to formulate [CLINICAL_REPORT] with "ALERT" (or "CRITICAL") status, specifying "red_flags" and a summary for the Chief Physician.
+10. If the condition is critical, add to the very end of the response (after [CLINICAL_REPORT]): [EMERGENCY_TRIGGER].
 """
             user_record = f"[Vitals Alert]: Heart rate peak {va.current_pulse} bpm (baseline {va.baseline_pulse} bpm)"
+            return prompt, user_record
+
+        if event_type == "mode2_update":
+            msg = (request.message or "Mode 2 telemetry update").strip()
+            prompt = f"""Service pulse: MODE 2 OPERATIONAL VITALS UPDATE:
+{msg}
+
+YOUR INSTRUCTION (MODE 2 OPERATIONAL ACCOMPANIMENT):
+1. THE "GOODBYE UNTIL TOMORROW" RULE IS STRICTLY CANCELED!
+2. Speak warmly, calmly, and empathetically in Russian.
+3. If pulse has returned to normal / stabilized:
+   - STRICTLY FORBIDDEN to claim complete medical recovery or that the cardiovascular system is fully cured ("сердечно-сосудистая система полностью восстановилась").
+   - Acknowledge that the heart rate is back within normal resting boundaries.
+   - Gently remind the user to listen to their body and continue observing their state.
+4. If pulse is deteriorating, severely elevated (>= 140-160 bpm), bradycardia (<= 40 bpm), SpO2 dropped, or dangerous symptoms are reported:
+   - Advise immediately stopping all physical exertion, sitting down, loosening tight clothing, and seeking urgent medical care (112 or emergency room).
+   - Filter red flags (chest pain, shortness of breath, lack of air, darkening in the eyes, fainting).
+   - If an ambulance was mentioned, NEVER claim help has arrived without explicit confirmation from the user.
+   - Do NOT give official medical diagnoses or prescribe medications.
+5. If workout was confirmed and vitals are within expected exercise ranges without red flags:
+   - Give supportive pacing and hydration advice.
+6. Formulate [CLINICAL_REPORT] with "ALERT", "CRITICAL", or "NORMAL" status and summary for the Chief Physician.
+7. If the condition is critical, add strictly at the very end on a new line: [EMERGENCY_TRIGGER].
+"""
+            user_record = f"[Mode 2 Update]: {msg}"
             return prompt, user_record
 
         if event_type == "wearable_event":

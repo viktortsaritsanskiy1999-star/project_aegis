@@ -89,6 +89,60 @@ class ActivitySummary(BaseModel):
     model_config = ConfigDict(extra="forbid")
     step_count: Optional[int] = None
     activity_minutes: Optional[int] = None
+    workout_type: Optional[str] = None
+    workout_avg_bpm: Optional[float] = None
+    workout_max_bpm: Optional[int] = None
+    recovery_min_bpm: Optional[int] = None
+
+
+class Mode2ObjectiveMetrics(BaseModel):
+    """Category 1: Strictly objective measurements & metrics during Mode 2 episode."""
+    model_config = ConfigDict(extra="forbid")
+
+    min_pulse: int = Field(..., ge=20, le=300)
+    max_pulse: int = Field(..., ge=20, le=300)
+    trigger_pulse: int = Field(..., ge=20, le=300)
+    baseline_pulse: int = Field(..., ge=20, le=250)
+    pulse_dynamics: List[Dict[str, Any]] = Field(default_factory=list)
+    spo2_min: Optional[int] = Field(default=None, ge=50, le=100)
+    spo2_max: Optional[int] = Field(default=None, ge=50, le=100)
+    spo2_history: List[Dict[str, Any]] = Field(default_factory=list)
+    duration_minutes: float = Field(default=0.0, ge=0.0)
+    telemetry_samples_count: int = Field(default=0, ge=0)
+    telemetry_gaps: List[str] = Field(default_factory=list)
+
+
+class Mode2UserFacts(BaseModel):
+    """Category 2: Verbatim user statements, confirmed workout context, and symptoms."""
+    model_config = ConfigDict(extra="forbid")
+
+    workout_context: str = Field(..., description="confirmed_workout, not_working_out, or unknown")
+    user_statements: List[str] = Field(default_factory=list)
+    confirmed_symptoms: List[str] = Field(default_factory=list)
+
+
+class Mode2ModelContext(BaseModel):
+    """Category 3: Model interpretations, significant changes, and Athena interactions."""
+    model_config = ConfigDict(extra="forbid")
+
+    athena_events_count: int = Field(default=0, ge=0)
+    significant_changes: List[str] = Field(default_factory=list)
+    is_normalized: bool = False
+    model_notes: Optional[str] = None
+
+
+class Mode2EpisodeWellnessSummary(BaseModel):
+    """Structured summary of a single Mode 2 episode for Wellness Daily analysis."""
+    model_config = ConfigDict(extra="forbid")
+
+    episode_id: str
+    started_at_utc: str
+    closed_at_utc: Optional[str] = None
+    event_type: str
+    measurement_source: str
+    objective_metrics: Mode2ObjectiveMetrics
+    user_facts: Mode2UserFacts
+    model_context: Mode2ModelContext
 
 
 class WellnessBiometricsSummary(BaseModel):
@@ -100,11 +154,21 @@ class WellnessBiometricsSummary(BaseModel):
     spo2: Optional[SpO2Summary] = None
     sleep: Optional[SleepSummary] = None
     activity: Optional[ActivitySummary] = None
+    mode2_episodes: List[Mode2EpisodeWellnessSummary] = Field(default_factory=list)
     sources_present: List[str] = Field(default_factory=list)
     has_manual_input: bool = False
     has_sensor_data: bool = False
     total_measurements: int = 0
     questionable_datapoints_count: int = 0
+
+
+class WellnessEpisodeEvaluation(BaseModel):
+    """Gemini Flash evaluation of an individual Mode 2 episode."""
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    episode_id: str
+    workout_context: str
+    analysis: str
 
 
 class WellnessModelOutput(BaseModel):
@@ -114,6 +178,7 @@ class WellnessModelOutput(BaseModel):
     observed_trends: List[str] = Field(default_factory=list)
     limitations_and_gaps: List[str] = Field(default_factory=list)
     questionable_measurements: List[str] = Field(default_factory=list)
+    episode_evaluations: List[WellnessEpisodeEvaluation] = Field(default_factory=list)
     summary_for_athena: str = Field(
         ...,
         description="Concise factual & clinical summary for ingest into Section B of Athena Daily Journal",

@@ -63,11 +63,13 @@ class WellnessDailyService:
         gateway: Optional[GeminiGateway] = None,
         now_provider: Optional[Callable[[], datetime]] = None,
         journal_service: Optional[Any] = None,
+        mode2_service: Optional[Any] = None,
     ):
         self.db = db
         self.gateway = gateway or GeminiGateway()
         self.now_provider = now_provider or (lambda: datetime.now(timezone.utc))
         self.journal_service = journal_service
+        self._mode2_service = mode2_service
 
         self.report_repo = ModelReportRepository(db)
         self.measurement_repo = HealthMeasurementRepository(db)
@@ -75,6 +77,19 @@ class WellnessDailyService:
         self.weekly_service = WeeklyConsiliumService(
             db=db, gateway=self.gateway, now_provider=self.now_provider
         )
+
+    @property
+    def mode2_service(self) -> Any:
+        if self._mode2_service is None:
+            from app.services.mode2_vitals_service import Mode2VitalsMonitoringService
+            self._mode2_service = Mode2VitalsMonitoringService(
+                db=self.db, gateway=self.gateway, now_provider=self.now_provider
+            )
+        return self._mode2_service
+
+    @mode2_service.setter
+    def mode2_service(self, service: Any) -> None:
+        self._mode2_service = service
 
     def _now_utc(self) -> datetime:
         dt = self.now_provider()
@@ -361,6 +376,7 @@ class WellnessDailyService:
     def build_factual_biometrics_summary(
         self,
         measurements: List[HealthMeasurement],
+        mode2_episodes: Optional[List[Any]] = None,
     ) -> WellnessBiometricsSummary:
         """
         Builds a strictly factual summary of measured numerical biometrics.
@@ -388,6 +404,9 @@ class WellnessDailyService:
         has_steps = False
         total_active_mins = 0
         has_activity = False
+        workout_pulses: List[int] = []
+        recovery_pulses: List[int] = []
+        detected_workout_types: List[str] = []
 
         for m in measurements:
             src = m.source or "unknown"
@@ -457,6 +476,21 @@ class WellnessDailyService:
                     except (ValueError, TypeError):
                         pass
 
+                w_type = meta.get("workout_type") or meta.get("sport")
+                if w_type and str(w_type) not in detected_workout_types:
+                    detected_workout_types.append(str(w_type))
+
+            m_phase = str(m.phase or "").lower()
+            meta_phase = str(meta.get("phase") or "").lower() if isinstance(meta, dict) else ""
+            if m.pulse is not None:
+                if m_phase == "workout" or meta_phase == "workout":
+                    workout_pulses.append(m.pulse)
+                elif (
+                    m_phase in ("recovery_0_10", "recovery_10_50", "recovery")
+                    or "recovery" in meta_phase
+                ):
+                    recovery_pulses.append(m.pulse)
+
         # Sub-summaries
         hr_summary = None
         if pulse_vals:
@@ -509,10 +543,20 @@ class WellnessDailyService:
             )
 
         activity_summary = None
-        if has_steps or has_activity:
+        has_workout_data = bool(workout_pulses or recovery_pulses)
+        if has_steps or has_activity or has_workout_data:
+            w_avg = round(sum(workout_pulses) / len(workout_pulses), 1) if workout_pulses else None
+            w_max = max(workout_pulses) if workout_pulses else None
+            r_min = min(recovery_pulses) if recovery_pulses else None
+            w_type_str = detected_workout_types[0] if detected_workout_types else ("workout" if has_workout_data else None)
+
             activity_summary = ActivitySummary(
                 step_count=total_steps if has_steps else None,
                 activity_minutes=total_active_mins if has_activity else None,
+                workout_type=w_type_str,
+                workout_avg_bpm=w_avg,
+                workout_max_bpm=w_max,
+                recovery_min_bpm=r_min,
             )
 
         return WellnessBiometricsSummary(
@@ -521,6 +565,7 @@ class WellnessDailyService:
             spo2=spo2_summary,
             sleep=sleep_summary,
             activity=activity_summary,
+            mode2_episodes=mode2_episodes or [],
             sources_present=sorted(list(sources_seen)),
             has_manual_input="manual_input" in sources_seen,
             has_sensor_data=bool(sources_seen - {"manual_input", "unknown"}),
@@ -667,11 +712,17 @@ class WellnessDailyService:
             end_dt=min(effective_now, window_end),
         )
 
+        mode2_episodes = self.mode2_service.get_wellness_episodes_for_window(
+            cycle_id=clean_cycle,
+            start_dt=window_start,
+            end_dt=min(effective_now, window_end),
+        )
+
         now_iso = effective_now.isoformat()
         report_id = f"rep_wellness_{clean_cycle}_w{calendar_week}_d{calendar_day}_{uuid.uuid4().hex[:8]}"
 
         # 3. Absence of data -> Deterministic NO_DATA report (0 Gemini calls!)
-        if not measurements:
+        if not measurements and not mode2_episodes:
             empty_summary = WellnessBiometricsSummary()
             no_data_report = WellnessDailyReport(
                 report_id=report_id,
@@ -705,7 +756,10 @@ class WellnessDailyService:
             return no_data_report, True
 
         # 4. Data present -> Factual summary + Gemini Flash clinical interpretation
-        factual_summary = self.build_factual_biometrics_summary(measurements)
+        factual_summary = self.build_factual_biometrics_summary(
+            measurements=measurements,
+            mode2_episodes=mode2_episodes,
+        )
         interpretation = await self._execute_gemini_wellness_analysis(
             summary=factual_summary,
             calendar_week=calendar_week,

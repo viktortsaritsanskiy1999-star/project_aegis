@@ -1062,6 +1062,7 @@ void main() {
       // EmergencyMedicalModal opened strictly by server emergency_trigger
       expect(find.byType(EmergencyMedicalModal), findsOneWidget);
       expect(find.text("Please stay safe and seek assistance"), findsOneWidget);
+      expect(find.text("Emergency: 911 / 119"), findsOneWidget);
     });
 
     // -------------------------------------------------------------------------
