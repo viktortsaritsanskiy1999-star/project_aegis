@@ -14,6 +14,7 @@ import 'package:aegis_health/services/vitals_monitor_service.dart';
 import 'package:aegis_health/widgets/vitals_activity_check_modal.dart';
 import 'widgets/workout_session_modal.dart';
 import 'widgets/emergency_medical_modal.dart';
+import 'widgets/lab_manual_edit_modal.dart';
 import 'services/health_data_provider.dart';
 import 'services/api/aegis_api_client.dart';
 import 'services/api/vitals_api_models.dart';
@@ -2480,23 +2481,41 @@ class AtlasScreenState extends State<AtlasScreen> {
 
                     String display = val is Map ? "${val['value'] ?? 'N/A'} ${val['unit'] ?? ''}" : val.toString();
                     return [
-                      Padding(
-                        padding: const EdgeInsets.symmetric(vertical: 4.0),
-                        child: Row(
-                          children: [
-                            Expanded(
-                              child: Text(
-                                "> ${key.toUpperCase()}:",
-                                style: const TextStyle(fontFamily: 'Courier', color: Colors.white70, fontSize: 11),
-                                overflow: TextOverflow.ellipsis,
+                      InkWell(
+                        onTap: () {
+                          Navigator.of(context).pop();
+                          final rawVal = val is Map ? "${val['value'] ?? ''}" : val.toString();
+                          final rawUnit = val is Map ? "${val['unit'] ?? ''}" : null;
+                          final rawDate = val is Map ? "${val['sample_date'] ?? ''}" : null;
+                          LabManualEditModal.show(
+                            context,
+                            markerKey: key,
+                            displayName: key.toUpperCase(),
+                            initialValue: rawVal,
+                            initialUnit: rawUnit,
+                            initialDate: rawDate,
+                          );
+                        },
+                        child: Padding(
+                          padding: const EdgeInsets.symmetric(vertical: 4.0),
+                          child: Row(
+                            children: [
+                              Expanded(
+                                child: Text(
+                                  "> ${key.toUpperCase()}:",
+                                  style: const TextStyle(fontFamily: 'Courier', color: Colors.white70, fontSize: 11),
+                                  overflow: TextOverflow.ellipsis,
+                                ),
                               ),
-                            ),
-                            const SizedBox(width: 8),
-                            Text(
-                              display,
-                              style: const TextStyle(fontFamily: 'Courier', color: Colors.greenAccent, fontSize: 11, fontWeight: FontWeight.bold),
-                            ),
-                          ],
+                              const SizedBox(width: 8),
+                              Text(
+                                display,
+                                style: const TextStyle(fontFamily: 'Courier', color: Colors.greenAccent, fontSize: 11, fontWeight: FontWeight.bold),
+                              ),
+                              const SizedBox(width: 6),
+                              const Icon(Icons.edit_note, size: 14, color: Colors.blueAccent),
+                            ],
+                          ),
                         ),
                       )
                     ];

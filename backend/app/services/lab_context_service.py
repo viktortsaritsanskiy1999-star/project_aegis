@@ -449,10 +449,19 @@ def _normalize_dt(dt: Optional[datetime]) -> Optional[datetime]:
     return dt.astimezone(timezone.utc)
 
 
-def get_last_evaluated_ledger_version(db: Session, cycle_id: str) -> int:
+def get_last_evaluated_ledger_version(
+    db: Session,
+    cycle_id: str,
+    as_of: Optional[datetime] = None,
+) -> int:
     report_repo = ModelReportRepository(db)
+    eff_as_of = (
+        as_of.replace(tzinfo=timezone.utc)
+        if (as_of is not None and as_of.tzinfo is None)
+        else as_of
+    )
 
-    # 1. Collect all authoritative laboratory_ledger versions actually present in storage
+    # 1. Collect all authoritative laboratory_ledger versions actually present in storage (up to as_of)
     ledger_versions = report_repo.list_versions(
         cycle_id=cycle_id,
         report_type=LABORATORY_LEDGER_REPORT_TYPE,
@@ -462,6 +471,19 @@ def get_last_evaluated_ledger_version(db: Session, cycle_id: str) -> int:
     for lv in ledger_versions:
         c = lv.content or {}
         v = c.get("ledger_version", lv.version)
+        lv_iso = c.get("recorded_at") or c.get("created_at_utc")
+        lv_dt = None
+        if lv_iso and isinstance(lv_iso, str):
+            try:
+                lv_dt = datetime.fromisoformat(lv_iso)
+            except Exception:
+                pass
+        if lv_dt is None:
+            lv_dt = lv.created_at
+        if lv_dt is not None:
+            eff_lv_dt = lv_dt.replace(tzinfo=timezone.utc) if lv_dt.tzinfo is None else lv_dt
+            if eff_as_of is not None and eff_lv_dt > eff_as_of:
+                continue
         try:
             parsed_v = int(v)
             if parsed_v > 0:
@@ -474,7 +496,7 @@ def get_last_evaluated_ledger_version(db: Session, cycle_id: str) -> int:
 
     confirmed_evaluations: List[tuple[datetime, int, int, str]] = []
 
-    # 2. Check Lab Revision execution logs
+    # 2. Check Lab Revision execution logs (up to as_of)
     exec_logs = report_repo.list_server_only(
         cycle_id=cycle_id,
         report_type="lab_revision_execution_log",
@@ -504,9 +526,11 @@ def get_last_evaluated_ledger_version(db: Session, cycle_id: str) -> int:
                 pass
 
         resolved_dt = dt or datetime.min.replace(tzinfo=timezone.utc)
+        if eff_as_of is not None and resolved_dt > eff_as_of:
+            continue
         confirmed_evaluations.append((resolved_dt, rep.version, eval_ver, "lab_revision_execution_log"))
 
-    # 3. Check Primary Consilium chief_physician_internal reports
+    # 3. Check Primary Consilium chief_physician_internal reports (up to as_of)
     pro_primary = report_repo.list_server_only(
         cycle_id=cycle_id,
         report_type="chief_physician_internal",
@@ -532,6 +556,8 @@ def get_last_evaluated_ledger_version(db: Session, cycle_id: str) -> int:
             continue
 
         resolved_dt = _normalize_dt(rep.created_at) or datetime.min.replace(tzinfo=timezone.utc)
+        if eff_as_of is not None and resolved_dt > eff_as_of:
+            continue
         confirmed_evaluations.append((resolved_dt, rep.version, eval_ver, "chief_physician_internal"))
 
     if not confirmed_evaluations:

@@ -46,10 +46,17 @@ from app.schemas.consilium import (
 )
 from app.schemas.privacy import PrivacyLevel
 from app.schemas.reports import ClientModelReportResponse
+from app.schemas.lab_scheduling import (
+    BackgroundLabRevisionChiefOutput,
+    BackgroundLabRevisionDeputyOutput,
+    BackgroundLabRevisionReportRecord,
+)
 from app.services.consilium_prompts import (
     build_lab_revision_system_agent_prompt,
     build_lab_revision_flash_master_prompt,
     build_lab_revision_pro_master_prompt,
+    build_background_lab_revision_deputy_prompt,
+    build_background_lab_revision_chief_prompt,
 )
 from app.services.gemini_gateway import GeminiGateway, GeminiModelRole
 from app.services.primary_consilium_service import (
@@ -73,6 +80,7 @@ from app.services.weekly_consilium_service import (
 LABORATORY_LEDGER_REPORT_TYPE = "laboratory_ledger"
 LABORATORY_DIFF_AUDIT_REPORT_TYPE = "laboratory_diff_audit"
 LAB_REVISION_EXECUTION_LOG_REPORT_TYPE = "lab_revision_execution_log"
+BACKGROUND_LAB_REVISION_REPORT_TYPE = "background_lab_revision_report"
 LAB_REVISION_IN_FLIGHT_LOCK_REPORT_TYPE = "lab_revision_in_flight_lock"
 LAB_REVISION_IN_FLIGHT_LOCK_TTL_SECONDS = 900
 LAB_REVISION_IN_FLIGHT_LOCK_HEARTBEAT_SECONDS = 300.0
@@ -375,6 +383,7 @@ class LabRevisionConsiliumService:
                 content={
                     "ledger_version": 1,
                     "source": "preparatory_vision_ocr",
+                    "recorded_at": self._now_utc().isoformat(),
                     "active_markers": active_markers,
                     "observations_history": observations_history,
                     "shared_labs_table": shared_labs_table,
@@ -453,12 +462,33 @@ class LabRevisionConsiliumService:
         raw_active = content.get("active_markers") or {}
         raw_history = content.get("observations_history") or []
 
-        active_markers = {
-            k: LabObservationEntry.model_validate(v) for k, v in raw_active.items()
-        }
-        observations_history = [
-            LabObservationEntry.model_validate(item) for item in raw_history
-        ]
+        active_markers = {}
+        for k, v in raw_active.items():
+            if isinstance(v, dict):
+                v_copy = dict(v)
+                v_copy.setdefault("observation_id", f"obs_{k}")
+                v_copy.setdefault("display_name", k)
+                v_copy.setdefault("recorded_at", content.get("recorded_at") or self._now_utc().isoformat())
+                try:
+                    active_markers[k] = LabObservationEntry.model_validate(v_copy)
+                except Exception:
+                    pass
+            elif isinstance(v, LabObservationEntry):
+                active_markers[k] = v
+
+        observations_history = []
+        for item in raw_history:
+            if isinstance(item, dict):
+                item_copy = dict(item)
+                item_copy.setdefault("observation_id", f"obs_hist_{len(observations_history)}")
+                item_copy.setdefault("display_name", item_copy.get("marker_key", "unknown"))
+                item_copy.setdefault("recorded_at", content.get("recorded_at") or self._now_utc().isoformat())
+                try:
+                    observations_history.append(LabObservationEntry.model_validate(item_copy))
+                except Exception:
+                    pass
+            elif isinstance(item, LabObservationEntry):
+                observations_history.append(item)
 
         has_unreviewed = ledger_version > last_evaluated_ver
         has_critical = any(obs.is_critical_flag for obs in active_markers.values())
@@ -812,6 +842,7 @@ class LabRevisionConsiliumService:
                                 is_recognition_ambiguous=mut.is_recognition_ambiguous,
                                 recorded_at=now_iso,
                                 study_id=mut.study_id,
+                                is_user_corrected=mut.is_user_corrected,
                             )
                             dumped_corr = corr_entry.model_dump()
                             history_list.append(dumped_corr)
@@ -872,6 +903,7 @@ class LabRevisionConsiliumService:
                             is_recognition_ambiguous=mut.is_recognition_ambiguous,
                             recorded_at=now_iso,
                             study_id=mut.study_id,
+                            is_user_corrected=mut.is_user_corrected,
                         )
                         dumped_new = new_entry.model_dump()
                         history_list.append(dumped_new)
@@ -896,6 +928,7 @@ class LabRevisionConsiliumService:
                         content={
                             "ledger_version": next_ledger_ver,
                             "source": "user_or_clinical_update",
+                            "recorded_at": self._now_utc().isoformat(),
                             "active_markers": active_map,
                             "observations_history": history_list,
                             "shared_labs_table": shared_labs_table,
@@ -1401,7 +1434,11 @@ class LabRevisionConsiliumService:
 
         return None
 
-    def _acquire_cross_process_lease(self, cycle_id: str) -> str:
+    def _acquire_cross_process_lease(
+        self,
+        cycle_id: str,
+        check_cooldown: bool = True,
+    ) -> str:
         """
         Acquires an atomic database-level execution lease backed by the SQLite PRIMARY KEY
         constraint on `model_reports.report_id` for both the master cycle coordination lock
@@ -1409,16 +1446,23 @@ class LabRevisionConsiliumService:
         (`report_id = lock_lab_rev_{cycle_id}`), tagged with a unique `lease_owner_id`
         fencing token. Guarantees zero cross-consilium race conditions with Primary and Weekly Consilium.
         """
-        cooldown_status = self.get_cooldown_status(cycle_id)
-        if not cooldown_status.is_allowed:
-            raise ConsiliumCooldownError(cooldown_status)
+        if check_cooldown:
+            cooldown_status = self.get_cooldown_status(cycle_id)
+            if not cooldown_status.is_allowed:
+                raise ConsiliumCooldownError(cooldown_status)
+        else:
+            active_in_flight = self._get_active_in_flight_lock(cycle_id)
+            if active_in_flight is not None:
+                raise ConsiliumConcurrencyConflictError(
+                    f"Consilium already in progress for cycle '{cycle_id}'."
+                )
 
         ledger_state = self.get_lab_ledger_state(cycle_id)
         if ledger_state.ledger_version == 0:
             raise ConsiliumContextMissingError(
                 f"Cannot run Lab-Revision Consilium for cycle '{cycle_id}': no laboratory data is stored."
             )
-        if not ledger_state.has_unreviewed_lab_changes:
+        if check_cooldown and not ledger_state.has_unreviewed_lab_changes:
             raise ConsiliumCooldownError(
                 cooldown_status.model_copy(
                     update={
@@ -2393,3 +2437,437 @@ class LabRevisionConsiliumService:
                 ),
                 cooldown=updated_cooldown,
             )
+
+    # ==========================================================================
+    # 6. STAGE 6B: AUTOMATIC TEN-MODEL BACKGROUND LAB REVISION
+    # ==========================================================================
+
+    def _load_continuity_context(self, cycle_id: str) -> Dict[str, Any]:
+        """
+        Loads previous conclusions for all 3 tiers with versions and timestamps:
+        - 8 organ specialists
+        - Deputy Chief Physician (Flash)
+        - Chief Physician (Pro)
+        - Active Pro Strategy (read-only baseline)
+        If any prior conclusion is absent, explicitly marks it as absent with clear notation.
+        """
+        specialists: Dict[str, Dict[str, Any]] = {}
+        for system_key in SYSTEM_KEYS:
+            role_val = AegisAgentRole.for_system_key(system_key).value
+            sys_reports = self.report_repo.list_server_only(
+                cycle_id=cycle_id,
+                report_type=role_val,
+            )
+            if sys_reports:
+                latest = sys_reports[0]
+                c = latest.content or {}
+                specialists[system_key] = {
+                    "status": "present",
+                    "report_id": latest.report_id,
+                    "version": latest.version,
+                    "created_at_utc": latest.created_at.isoformat() if latest.created_at else None,
+                    "summary": (c.get("system_logic") or {}).get("system_general_shelf") or c.get("summary") or "N/A",
+                    "system_view": c.get("system_view", {}),
+                    "system_logic": c.get("system_logic", {}),
+                    "training_sandbox": c.get("training_sandbox", {}),
+                }
+            else:
+                specialists[system_key] = {
+                    "status": "absent",
+                    "note": f"No previous specialist report available for '{system_key}'.",
+                    "summary": "N/A - No previous specialist report available",
+                }
+
+        # Deputy Flash
+        deputy_reports = self.report_repo.list_server_only(
+            cycle_id=cycle_id,
+            report_type="deputy_chief_physician_internal",
+        )
+        if not deputy_reports:
+            deputy_reports = self.report_repo.list_server_only(
+                cycle_id=cycle_id,
+                report_type="lab_revision_deputy_internal",
+            )
+        if deputy_reports:
+            latest_d = deputy_reports[0]
+            dc = latest_d.content or {}
+            prev_flash = {
+                "status": "present",
+                "report_id": latest_d.report_id,
+                "version": latest_d.version,
+                "created_at_utc": latest_d.created_at.isoformat() if latest_d.created_at else None,
+                "summary": dc.get("flash_general_shelf") or dc.get("deputy_synthesis") or "N/A",
+                "training_shelf": dc.get("flash_training_shelf") or "N/A",
+            }
+        else:
+            prev_flash = {
+                "status": "absent",
+                "note": "No previous deputy conclusion available.",
+                "summary": "N/A - No previous deputy conclusion available",
+            }
+
+        # Chief Pro
+        pro_reports = self.report_repo.list_server_only(
+            cycle_id=cycle_id,
+            report_type="chief_physician_internal",
+        )
+        if not pro_reports:
+            pro_reports = self.report_repo.list_server_only(
+                cycle_id=cycle_id,
+                report_type="lab_revision_chief_internal",
+            )
+        if pro_reports:
+            latest_p = pro_reports[0]
+            pc = latest_p.content or {}
+            prev_pro = {
+                "status": "present",
+                "report_id": latest_p.report_id,
+                "version": latest_p.version,
+                "created_at_utc": latest_p.created_at.isoformat() if latest_p.created_at else None,
+                "summary": pc.get("pro_general_shelf") or pc.get("analytical_summary") or "N/A",
+                "training_shelf": pc.get("pro_training_shelf") or "N/A",
+            }
+        else:
+            prev_pro = {
+                "status": "absent",
+                "note": "No previous chief physician report available.",
+                "summary": "N/A - No previous chief physician report available",
+            }
+
+        # Active Pro Strategy (read-only baseline)
+        strat_reports = self.report_repo.list_server_only(
+            cycle_id=cycle_id,
+            report_type=ATHENA_ACTIVE_STRATEGY_REPORT_TYPE,
+        )
+        if strat_reports:
+            latest_s = strat_reports[0]
+            sc = latest_s.content or {}
+            active_strat = {
+                "status": "present",
+                "report_id": latest_s.report_id,
+                "version": latest_s.version,
+                "created_at_utc": latest_s.created_at.isoformat() if latest_s.created_at else None,
+                "strategy_text": sc.get("active_strategy_text", "N/A"),
+                "summary": sc.get("active_strategy_text", "N/A"),
+            }
+        else:
+            active_strat = {
+                "status": "absent",
+                "note": "No active strategy available.",
+                "summary": "N/A - No active strategy available",
+            }
+
+        return {
+            "specialists": specialists,
+            "previous_flash": prev_flash,
+            "previous_pro": prev_pro,
+            "active_strategy": active_strat,
+        }
+
+    async def execute_lab_revision_consilium(
+        self,
+        cycle_id: str,
+        target_ledger_version: Optional[int] = None,
+        lease_owner_id: Optional[str] = None,
+        source_document_ids: Optional[List[str]] = None,
+    ) -> BackgroundLabRevisionReportRecord:
+        """
+        Executes the Stage 6B background Ten-Model Lab Revision Consilium:
+        8 Gemini Flash-Lite specialists -> Gemini Flash deputy -> Gemini Pro chief.
+        
+        Invariants:
+        1. Strictly analytical: does NOT update active Pro strategy, weekly plan, vitals thresholds,
+           or generate user-facing messages.
+        2. Preserves medical continuity: previous conclusions of all 3 tiers (with dates/versions)
+           are passed into the models. If absent, explicitly designated as absent.
+        3. Persisted SERVER_ONLY in ModelReportRepository under 'background_lab_revision_report'.
+        4. Fenced concurrency: protected by in-process asyncio.Lock and cross-process SQLite lease.
+        """
+        cycle = self.cycle_repo.get(cycle_id)
+        if not cycle:
+            raise ConsiliumCycleNotFoundError(f"Medical cycle '{cycle_id}' not found.")
+        if cycle.status != "active":
+            raise ConsiliumError(
+                f"Cannot run Lab-Revision Consilium on non-active cycle '{cycle_id}' (status='{cycle.status}')."
+            )
+
+        lock = self._get_cycle_lock(cycle_id)
+        async with lock:
+            own_lease = False
+            effective_lease = lease_owner_id
+            if effective_lease is None:
+                effective_lease = self._acquire_cross_process_lease(cycle_id, check_cooldown=False)
+                own_lease = True
+            else:
+                self._renew_cross_process_lease(cycle_id, effective_lease)
+
+            try:
+                started_at_iso = self._now_utc().isoformat()
+                ledger_state = self.get_lab_ledger_state(cycle_id)
+                eval_version = target_ledger_version if target_ledger_version is not None else ledger_state.ledger_version
+                baseline_version = ledger_state.last_evaluated_ledger_version
+
+                if eval_version <= baseline_version:
+                    raise ValueError(
+                        f"No unreviewed laboratory changes to evaluate: target ledger v{eval_version} "
+                        f"<= baseline evaluated v{baseline_version}."
+                    )
+
+                diff_report = self.compute_laboratory_diff(
+                    cycle_id=cycle_id,
+                    baseline_version=baseline_version,
+                    target_version=eval_version,
+                )
+                diff_summary_dict = diff_report.model_dump()
+
+                anamnesis_m1 = self._load_preparatory_anamnesis(cycle_id)
+                vitals_stream = self._load_preparatory_ecg_and_vitals(cycle_id)
+                ecg_context_dict = vitals_stream.get("ecg_context") or {}
+
+                active_markers_raw = {
+                    k: obs.model_dump() for k, obs in ledger_state.active_markers.items()
+                }
+                shared_labs_table = self._build_shared_labs_table_from_active(active_markers_raw)
+                continuity_ctx = self._load_continuity_context(cycle_id)
+
+                # 1. STAGE 1: 8 Organ Specialists (Gemini Flash-Lite)
+                specialist_outputs: Dict[str, SystemAgentOutput] = {}
+                for system_key in SYSTEM_KEYS:
+                    organ_fact = getattr(anamnesis_m1.system_logic, system_key)
+                    input_package = {
+                        "system_key": system_key,
+                        "facts": organ_fact.data,
+                        "first_model_short_summary": organ_fact.internal_comment,
+                        "shared_labs_table": shared_labs_table,
+                        "vitals_stream": vitals_stream,
+                        "ecg_context": ecg_context_dict,
+                    }
+                    prev_organ = continuity_ctx["specialists"].get(system_key, {})
+                    prev_consilium_summary = {
+                        "previous_deputy_flash_summary": continuity_ctx["previous_flash"].get("summary", "N/A"),
+                        "previous_chief_pro_summary": continuity_ctx["previous_pro"].get("summary", "N/A"),
+                        "active_pro_strategy": continuity_ctx["active_strategy"].get("summary", "N/A"),
+                    }
+                    system_prompt = build_lab_revision_system_agent_prompt(
+                        system_key=system_key,
+                        input_package=input_package,
+                        lab_diff_summary=diff_summary_dict,
+                        previous_organ_output=prev_organ,
+                        previous_consilium_summary=prev_consilium_summary,
+                    )
+                    organ_result: SystemAgentOutput = await self._execute_with_lease_renewal(
+                        cycle_id,
+                        effective_lease,
+                        lambda sp=system_prompt: self.gateway.generate_structured(
+                            prompt=sp,
+                            response_schema=SystemAgentOutput,
+                            model=GeminiModelRole.FLASH_LITE,
+                        ),
+                    )
+                    specialist_outputs[system_key] = organ_result
+
+                # 2. STAGE 2: Deputy Chief Physician (Gemini Flash)
+                comparative_flash_lines = [
+                    "=== ANAMNESIS AND LABORATORY DATA ===",
+                    json.dumps(
+                        {
+                            "user_view": anamnesis_m1.user_view.model_dump(),
+                            "training_sandbox": anamnesis_m1.training_sandbox.model_dump(),
+                            "shared_labs_shelf": shared_labs_table,
+                            "ecg_context": ecg_context_dict,
+                        },
+                        ensure_ascii=False,
+                    ),
+                    "",
+                    "=== DETERMINISTIC LABORATORY DIFF ===",
+                    json.dumps(diff_summary_dict, ensure_ascii=False),
+                    "",
+                    "=== VITALS STREAM ===",
+                    f"Blood pressure: {vitals_stream['blood_pressure']}",
+                    f"Heart rate: {vitals_stream['heart_rate']}",
+                    f"SpO2: {vitals_stream['spo2']}",
+                    f"ECG: {vitals_stream['ecg_summary']}",
+                    "",
+                    "=== PREVIOUS DEPUTY & CHIEF CONCLUSIONS ===",
+                    json.dumps(
+                        {
+                            "previous_deputy_flash": continuity_ctx["previous_flash"],
+                            "previous_chief_pro": continuity_ctx["previous_pro"],
+                            "active_pro_strategy": continuity_ctx["active_strategy"],
+                        },
+                        ensure_ascii=False,
+                    ),
+                    "",
+                    "=== 8 SPECIALIST REPORTS (CURRENT EVALUATION) ===",
+                ]
+                for key in SYSTEM_KEYS:
+                    prev_o = continuity_ctx["specialists"].get(key, {})
+                    new_o = specialist_outputs[key]
+                    comparative_flash_lines.append(f"--- SYSTEM: {key.upper()} ---")
+                    comparative_flash_lines.append(f"Previous conclusion: {prev_o.get('summary', 'N/A')}")
+                    comparative_flash_lines.append(f"Current conclusion: {new_o.system_logic.system_general_shelf}")
+                    comparative_flash_lines.append(f"Training/rationale: {new_o.training_sandbox.system_training_shelf}")
+                    comparative_flash_lines.append("")
+
+                deputy_context = "\n".join(comparative_flash_lines)
+                deputy_prompt = build_background_lab_revision_deputy_prompt(deputy_context)
+
+                deputy_output: BackgroundLabRevisionDeputyOutput = await self._execute_with_lease_renewal(
+                    cycle_id,
+                    effective_lease,
+                    lambda: self.gateway.generate_structured(
+                        prompt=deputy_prompt,
+                        response_schema=BackgroundLabRevisionDeputyOutput,
+                        model=GeminiModelRole.FLASH,
+                    ),
+                )
+
+                # 3. STAGE 3: Chief Physician (Gemini Pro)
+                pro_context_lines = [
+                    deputy_context,
+                    "",
+                    "=== DEPUTY CHIEF PHYSICIAN SYNTHESIS (GEMINI FLASH) ===",
+                    f"Deputy Synthesis: {deputy_output.deputy_synthesis}",
+                    f"Identified Discrepancies: {json.dumps(deputy_output.specialist_discrepancies, ensure_ascii=False)}",
+                    f"Clinical Correlations: {json.dumps(deputy_output.clinical_correlations, ensure_ascii=False)}",
+                    f"Data Limitations: {json.dumps(deputy_output.data_limitations, ensure_ascii=False)}",
+                    f"Draft Hypotheses: {json.dumps(deputy_output.draft_hypotheses, ensure_ascii=False)}",
+                ]
+                pro_context = "\n".join(pro_context_lines)
+                pro_prompt = build_background_lab_revision_chief_prompt(pro_context)
+
+                chief_output: BackgroundLabRevisionChiefOutput = await self._execute_with_lease_renewal(
+                    cycle_id,
+                    effective_lease,
+                    lambda: self.gateway.generate_structured(
+                        prompt=pro_prompt,
+                        response_schema=BackgroundLabRevisionChiefOutput,
+                        model=GeminiModelRole.PRO,
+                    ),
+                )
+
+                # 4. Atomic Single-Transaction Persistence (SERVER_ONLY)
+                completed_at_iso = self._now_utc().isoformat()
+                report_id = f"lab_rev_rep_{cycle_id}_v{eval_version}_{uuid.uuid4().hex[:8]}"
+
+                doc_ids = list(source_document_ids or [])
+                if not doc_ids:
+                    doc_ids = [
+                        item.new_observation_id
+                        for item in (diff_report.added_markers + diff_report.modified_values + diff_report.new_dated_studies)
+                        if item.new_observation_id
+                    ]
+
+                try:
+                    if own_lease:
+                        self._verify_and_delete_cross_process_lease_uncommitted(cycle_id, effective_lease)
+
+                    # 4.1 Save deterministic lab diff audit
+                    self.report_repo.create_next_version(
+                        cycle_id=cycle_id,
+                        model="aegis-lab-diff-engine",
+                        report_type=LABORATORY_DIFF_AUDIT_REPORT_TYPE,
+                        privacy_level=PrivacyLevel.SERVER_ONLY,
+                        content=diff_summary_dict,
+                        commit=False,
+                    )
+
+                    # 4.2 Save 8 Flash-Lite specialists
+                    specialist_summaries = {}
+                    for system_key in SYSTEM_KEYS:
+                        organ_out = specialist_outputs[system_key]
+                        agent_role = AegisAgentRole.for_system_key(system_key)
+                        saved_spec = self.report_repo.create_next_version(
+                            cycle_id=cycle_id,
+                            model=self.gateway.flash_lite_model,
+                            report_type=agent_role.value,
+                            privacy_level=PrivacyLevel.SERVER_ONLY,
+                            content={
+                                "agent_role": agent_role.value,
+                                "consilium_kind": "background_lab_revision",
+                                "evaluated_ledger_version": eval_version,
+                                "system_key": system_key,
+                                "system_view": organ_out.system_view.model_dump(),
+                                "system_logic": organ_out.system_logic.model_dump(),
+                                "training_sandbox": organ_out.training_sandbox.model_dump(),
+                            },
+                            commit=False,
+                        )
+                        specialist_summaries[system_key] = {
+                            "report_id": saved_spec.report_id,
+                            "version": saved_spec.version,
+                            "summary": organ_out.system_logic.system_general_shelf,
+                        }
+
+                    # 4.3 Save Deputy Flash
+                    saved_deputy = self.report_repo.create_next_version(
+                        cycle_id=cycle_id,
+                        model=self.gateway.flash_model,
+                        report_type="lab_revision_deputy_internal",
+                        privacy_level=PrivacyLevel.SERVER_ONLY,
+                        content={
+                            "agent_role": AegisAgentRole.DEPUTY_CHIEF_PHYSICIAN.value,
+                            "consilium_kind": "background_lab_revision",
+                            "evaluated_ledger_version": eval_version,
+                            **deputy_output.model_dump(),
+                        },
+                        commit=False,
+                    )
+
+                    # 4.4 Save Chief Pro
+                    saved_chief = self.report_repo.create_next_version(
+                        cycle_id=cycle_id,
+                        model=self.gateway.pro_model,
+                        report_type="lab_revision_chief_internal",
+                        privacy_level=PrivacyLevel.SERVER_ONLY,
+                        content={
+                            "agent_role": AegisAgentRole.CHIEF_PHYSICIAN.value,
+                            "consilium_kind": "background_lab_revision",
+                            "evaluated_ledger_version": eval_version,
+                            **chief_output.model_dump(),
+                        },
+                        commit=False,
+                    )
+
+                    # 4.5 Save Overall Background Lab Revision Report
+                    record = BackgroundLabRevisionReportRecord(
+                        report_id=report_id,
+                        cycle_id=cycle_id,
+                        patient_id=cycle.patient_id,
+                        evaluated_ledger_version=eval_version,
+                        baseline_ledger_version=baseline_version,
+                        source_document_ids=doc_ids,
+                        study_ids=[item.marker_key for item in diff_report.new_dated_studies],
+                        status="completed",
+                        started_at_utc=started_at_iso,
+                        completed_at_utc=completed_at_iso,
+                        specialist_reports=specialist_summaries,
+                        deputy_report={
+                            "report_id": saved_deputy.report_id,
+                            **deputy_output.model_dump(),
+                        },
+                        chief_report={
+                            "report_id": saved_chief.report_id,
+                            **chief_output.model_dump(),
+                        },
+                        summary=chief_output.analytical_summary,
+                    )
+
+                    self.report_repo.create_next_version(
+                        cycle_id=cycle_id,
+                        model=self.gateway.pro_model,
+                        report_type=BACKGROUND_LAB_REVISION_REPORT_TYPE,
+                        privacy_level=PrivacyLevel.SERVER_ONLY,
+                        content=record.model_dump(),
+                        commit=False,
+                    )
+
+                    self.db.commit()
+                    return record
+                except BaseException:
+                    self.db.rollback()
+                    raise
+            except BaseException:
+                if own_lease:
+                    self._release_cross_process_lease_safe(cycle_id, effective_lease)
+                raise

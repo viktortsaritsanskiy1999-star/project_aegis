@@ -872,6 +872,7 @@ class LabObservationEntry(BaseModel):
     is_recognition_ambiguous: bool = Field(default=False)
     recorded_at: str = Field(..., min_length=1, max_length=64)
     study_id: Optional[str] = Field(default=None, max_length=128)
+    is_user_corrected: bool = Field(default=False)
 
     @field_validator("marker_key", mode="before")
     @classmethod
@@ -886,7 +887,7 @@ class LabObservationEntry(BaseModel):
         norm_date, is_valid = normalize_lab_date(v)
         return norm_date if is_valid else None
 
-    @field_validator("is_uncertain", "is_recognition_ambiguous", "is_critical_flag", "is_active", mode="before")
+    @field_validator("is_uncertain", "is_recognition_ambiguous", "is_critical_flag", "is_active", "is_user_corrected", mode="before")
     @classmethod
     def parse_bool_fields(cls, v: Any) -> bool:
         return _parse_bool_strict(v)
@@ -914,6 +915,7 @@ class LabMarkerMutationItem(BaseModel):
     uncertainty_note: Optional[str] = Field(default=None, max_length=256)
     is_recognition_ambiguous: bool = Field(default=False)
     study_id: Optional[str] = Field(default=None, max_length=128)
+    is_user_corrected: bool = Field(default=False)
 
     @field_validator("marker_key", mode="before")
     @classmethod
@@ -928,7 +930,7 @@ class LabMarkerMutationItem(BaseModel):
         norm_date, is_valid = normalize_lab_date(v)
         return norm_date if is_valid else None
 
-    @field_validator("is_uncertain", "is_recognition_ambiguous", "is_critical_flag", mode="before")
+    @field_validator("is_uncertain", "is_recognition_ambiguous", "is_critical_flag", "is_user_corrected", mode="before")
     @classmethod
     def parse_bool_fields(cls, v: Any) -> bool:
         return _parse_bool_strict(v)

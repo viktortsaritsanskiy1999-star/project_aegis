@@ -70,6 +70,7 @@ class AutomationJobType(str, Enum):
     WEEKLY_CONSILIUM_A = "weekly_consilium_step_a"
     WEEKLY_CONSILIUM_B = "weekly_consilium_step_b"
     WEEKLY_CONSILIUM_C = "weekly_consilium_step_c"
+    LAB_REVISION = "lab_revision"
 
 
 class AutomationJobStatus(str, Enum):
@@ -132,6 +133,7 @@ class ClinicalAutomationService:
         enable_weekly_plan: bool = False,
         enable_wellness_daily: bool = False,
         enable_automatic_weekly: bool = False,
+        enable_lab_revision: bool = False,
     ):
         self.db = db
         self.gateway = gateway or GeminiGateway()
@@ -144,6 +146,7 @@ class ClinicalAutomationService:
         self.enable_weekly_plan = enable_weekly_plan
         self.enable_wellness_daily = enable_wellness_daily
         self.enable_automatic_weekly = enable_automatic_weekly
+        self.enable_lab_revision = enable_lab_revision
 
         self.cycle_repo = MedicalCycleRepository(db)
         self.report_repo = ModelReportRepository(db)
@@ -160,6 +163,15 @@ class ClinicalAutomationService:
             db=db, now_provider=self.now_provider, gateway=self.gateway
         )
         self.wellness_service = WellnessDailyService(
+            db=db, gateway=self.gateway, now_provider=self.now_provider
+        )
+        from app.services.lab_scheduling_service import LabSchedulingService
+        from app.services.lab_revision_consilium_service import LabRevisionConsiliumService
+
+        self.lab_scheduling_service = LabSchedulingService(
+            db=db, gateway=self.gateway, now_provider=self.now_provider
+        )
+        self.lab_revision_service = LabRevisionConsiliumService(
             db=db, gateway=self.gateway, now_provider=self.now_provider
         )
 
@@ -217,6 +229,8 @@ class ClinicalAutomationService:
             return f"weekly_consilium_step_b_{clean_cycle}_w1"
         if resolved_type == AutomationJobType.WEEKLY_CONSILIUM_C:
             return f"weekly_consilium_step_c_{clean_cycle}_w1"
+        if resolved_type == AutomationJobType.LAB_REVISION:
+            return f"lab_revision_{clean_cycle}"
         return f"auto_{resolved_type.value}_{clean_cycle}"
 
     @staticmethod
@@ -658,6 +672,40 @@ class ClinicalAutomationService:
             next_attempt_at_utc=eff_available,
         )
 
+    def enqueue_lab_revision(
+        self,
+        *,
+        cycle_id: str,
+        patient_id: Optional[str] = None,
+        target_ledger_version: int = 1,
+        available_at_utc: Optional[datetime] = None,
+        max_attempts: int = DEFAULT_JOB_MAX_ATTEMPTS,
+    ) -> Optional[AutomationJobRecord]:
+        """
+        Enqueues Stage 6B: background Ten-Model Lab Revision Consilium.
+        Triggered when a pending task passes debounce, cooldown, and OCR checks.
+        """
+        clean_cycle = (cycle_id or "").strip()
+        if not clean_cycle:
+            return None
+        cycle = self.cycle_repo.get(clean_cycle)
+        if cycle is None:
+            return None
+        effective_patient_id = (patient_id or cycle.patient_id or "").strip()
+        if not effective_patient_id:
+            return None
+
+        eff_available = (available_at_utc or self._now_utc()).isoformat()
+        idempotency_key = f"lab_revision_{clean_cycle}_v{target_ledger_version}"
+        return self.enqueue_or_get_job(
+            patient_id=effective_patient_id,
+            cycle_id=clean_cycle,
+            job_type=AutomationJobType.LAB_REVISION,
+            idempotency_key=idempotency_key,
+            max_attempts=max_attempts,
+            next_attempt_at_utc=eff_available,
+        )
+
     def get_job_by_id(self, job_id: str) -> Optional[AutomationJobRecord]:
         row = (
             self.db.query(ModelReport)
@@ -917,6 +965,17 @@ class ClinicalAutomationService:
                                     n += 1
                                     if n > 52:
                                         break
+            # Discover background Lab Revision tasks if enabled
+            if self.enable_lab_revision:
+                ready_tasks = self.lab_scheduling_service.get_ready_tasks_for_execution()
+                for t in ready_tasks:
+                    job = self.enqueue_lab_revision(
+                        cycle_id=t.cycle_id,
+                        patient_id=t.patient_id,
+                        target_ledger_version=t.target_ledger_version,
+                    )
+                    if job is not None:
+                        discovered.append(job)
         return discovered
 
     # ==========================================================================
@@ -1750,6 +1809,48 @@ class ClinicalAutomationService:
             "created_at_utc": chat_resp.created_at,
         }
 
+    async def _execute_lab_revision(
+        self, job: AutomationJobRecord
+    ) -> Dict[str, Any]:
+        """
+        Executes Stage 6B: background Ten-Model Lab Revision Consilium:
+        8 Flash-Lite specialists -> Gemini Flash deputy -> Gemini Pro chief.
+        1. Atomically captures the pending task and ledger version.
+        2. Executes the 10-model analytical cascade via LabRevisionConsiliumService.
+        3. Calls LabSchedulingService.complete_revision_task to establish the 72-hour cooldown.
+        4. If newer data arrived during run, task remains pending for the next revision.
+        """
+        cycle = self.cycle_repo.get(job.cycle_id)
+        if cycle is None or cycle.patient_id != job.patient_id:
+            raise ConsiliumCycleNotFoundError(
+                f"Active cycle '{job.cycle_id}' not found for patient '{job.patient_id}'."
+            )
+
+        pending_task = self.lab_scheduling_service.get_pending_task(job.cycle_id)
+        target_version = pending_task.target_ledger_version if pending_task else None
+        source_doc_ids = pending_task.pending_document_ids if pending_task else None
+
+        rev_record = await self.lab_revision_service.execute_lab_revision_consilium(
+            cycle_id=job.cycle_id,
+            target_ledger_version=target_version,
+            source_document_ids=source_doc_ids,
+        )
+
+        # Mark revision task completed in LabSchedulingService and initiate 72h cooldown
+        self.lab_scheduling_service.complete_revision_task(
+            cycle_id=job.cycle_id,
+            evaluated_ledger_version=rev_record.evaluated_ledger_version,
+        )
+
+        return {
+            "report_id": rev_record.report_id,
+            "evaluated_ledger_version": rev_record.evaluated_ledger_version,
+            "baseline_ledger_version": rev_record.baseline_ledger_version,
+            "status": "completed",
+            "completed_at_utc": rev_record.completed_at_utc,
+            "summary": rev_record.summary,
+        }
+
     async def execute_claimed_job(self, claimed: AutomationJobRecord) -> AutomationJobRecord:
         if not claimed.lease_owner_id:
             raise ConsiliumConcurrencyConflictError(
@@ -1799,6 +1900,12 @@ class ClinicalAutomationService:
                     claimed.job_id,
                     lease_owner_id,
                     lambda: self._execute_weekly_consilium_c(claimed),
+                )
+            elif claimed.job_type == AutomationJobType.LAB_REVISION:
+                result_meta = await self._execute_with_job_lease_renewal(
+                    claimed.job_id,
+                    lease_owner_id,
+                    lambda: self._execute_lab_revision(claimed),
                 )
             else:
                 raise ValueError(f"Unsupported automation job_type '{claimed.job_type}'.")
@@ -1871,6 +1978,7 @@ class ClinicalAutomationWorker:
         enable_weekly_plan: bool = False,
         enable_wellness_daily: bool = False,
         enable_automatic_weekly: bool = False,
+        enable_lab_revision: bool = False,
     ):
         self.session_factory = session_factory
         self.gateway_factory = gateway_factory or GeminiGateway
@@ -1884,6 +1992,7 @@ class ClinicalAutomationWorker:
         self.enable_weekly_plan = enable_weekly_plan
         self.enable_wellness_daily = enable_wellness_daily
         self.enable_automatic_weekly = enable_automatic_weekly
+        self.enable_lab_revision = enable_lab_revision
 
         self._wake_event: Optional[asyncio.Event] = None
         self._stop_event: Optional[asyncio.Event] = None
@@ -1919,6 +2028,7 @@ class ClinicalAutomationWorker:
                 enable_weekly_plan=self.enable_weekly_plan,
                 enable_wellness_daily=self.enable_wellness_daily,
                 enable_automatic_weekly=self.enable_automatic_weekly,
+                enable_lab_revision=self.enable_lab_revision,
             )
             return await service.process_due_jobs(
                 discover=discover,

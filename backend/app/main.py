@@ -51,6 +51,9 @@ async def lifespan(app: FastAPI):
             enable_daily_journal=settings.enable_daily_journal,
             enable_wellness_daily=settings.enable_wellness_daily,
             enable_automatic_weekly=settings.enable_automatic_weekly,
+            enable_lab_revision=getattr(
+                app.state, "enable_lab_revision", settings.enable_lab_revision
+            ),
         )
         app.state.automation_worker = worker
         await worker.start()

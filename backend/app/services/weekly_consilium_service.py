@@ -1445,10 +1445,300 @@ class WeeklyConsiliumService:
     # 3. INTERNAL CONTEXT LOADERS FOR WEEKLY CONSILIUM
     # ==========================================================================
 
-    def _load_previous_consilium_context(self, cycle_id: str) -> Dict[str, Any]:
+    @staticmethod
+    def _extract_ledger_recorded_dt(lr: ModelReport) -> Optional[datetime]:
+        lr_c = lr.content or {}
+        lr_iso = lr_c.get("recorded_at") or lr_c.get("created_at_utc")
+        if not lr_iso:
+            for h in (lr_c.get("observations_history") or []):
+                if isinstance(h, dict) and h.get("recorded_at"):
+                    lr_iso = h.get("recorded_at")
+                    break
+        if not lr_iso:
+            for m in (lr_c.get("active_markers") or {}).values():
+                if isinstance(m, dict) and m.get("recorded_at"):
+                    lr_iso = m.get("recorded_at")
+                    break
+        if lr_iso and isinstance(lr_iso, str):
+            try:
+                dt = datetime.fromisoformat(lr_iso)
+                return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt
+            except Exception:
+                pass
+        if lr.created_at is not None:
+            dt = lr.created_at
+            return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt
+        return None
+
+    def _load_lab_revision_context_for_weekly(
+        self,
+        cycle_id: str,
+        as_of: Optional[datetime] = None,
+    ) -> Dict[str, Any]:
+        """
+        Gathers completed background Lab Revision results, current laboratory ledger state,
+        cooldown / pending status, and OCR audit limitations as of the sprint cutoff `as_of`.
+        Does NOT launch the 10-model cascade or reset cooldowns.
+        """
+        eff_as_of = (
+            as_of.replace(tzinfo=timezone.utc)
+            if (as_of is not None and as_of.tzinfo is None)
+            else as_of
+        )
+
+        from app.services.lab_revision_consilium_service import BACKGROUND_LAB_REVISION_REPORT_TYPE
+        from app.services.lab_scheduling_service import LabSchedulingService
+        from app.schemas.lab_scheduling import LabDocumentStatus
+
+        # 1. Query all completed background Lab Revision reports up to as_of
+        all_rev_reports = self.report_repo.list_server_only(
+            cycle_id=cycle_id,
+            report_type=BACKGROUND_LAB_REVISION_REPORT_TYPE,
+        )
+        completed_revisions: List[ModelReport] = []
+        for r in all_rev_reports:
+            r_c = r.content or {}
+            r_iso = r_c.get("completed_at_utc") or r_c.get("created_at_utc")
+            r_dt = None
+            if r_iso and isinstance(r_iso, str):
+                try:
+                    r_dt = datetime.fromisoformat(r_iso)
+                except Exception:
+                    pass
+            if r_dt is None:
+                r_dt = r.created_at
+            if r_dt is not None:
+                eff_r_dt = r_dt.replace(tzinfo=timezone.utc) if r_dt.tzinfo is None else r_dt
+                if eff_as_of is not None and eff_r_dt > eff_as_of:
+                    continue
+            completed_revisions.append(r)
+
+        # Sort ascending by evaluated_ledger_version, then version
+        completed_revisions.sort(
+            key=lambda rep: (
+                int((rep.content or {}).get("evaluated_ledger_version", 0)),
+                rep.version,
+            )
+        )
+
+        latest_rev = completed_revisions[-1] if completed_revisions else None
+        latest_eval_ver = (
+            int((latest_rev.content or {}).get("evaluated_ledger_version", 0))
+            if latest_rev
+            else 0
+        )
+        latest_report_id = latest_rev.report_id if latest_rev else None
+        prior_revisions = completed_revisions[:-1] if len(completed_revisions) > 1 else []
+
+        # 2. Query laboratory ledger state as of as_of
+        ledger_rows = self.report_repo.list_server_only(
+            cycle_id=cycle_id,
+            report_type="laboratory_ledger",
+        )
+        valid_ledgers: List[ModelReport] = []
+        for lr in ledger_rows:
+            eff_lr_dt = self._extract_ledger_recorded_dt(lr)
+            if eff_as_of is not None and eff_lr_dt is not None and eff_lr_dt > eff_as_of:
+                continue
+            valid_ledgers.append(lr)
+
+        valid_ledgers.sort(key=lambda l: int((l.content or {}).get("ledger_version", l.version)))
+        latest_ledger_row = valid_ledgers[-1] if valid_ledgers else None
+        current_ledger_version = (
+            int((latest_ledger_row.content or {}).get("ledger_version", latest_ledger_row.version))
+            if latest_ledger_row
+            else 0
+        )
+        active_markers = (
+            (latest_ledger_row.content or {}).get("active_markers", {})
+            if latest_ledger_row
+            else {}
+        )
+        observations_history = (
+            (latest_ledger_row.content or {}).get("observations_history", [])
+            if latest_ledger_row
+            else []
+        )
+
+        # 3. Query scheduling service for pending tasks and cooldown
+        sched_svc = LabSchedulingService(
+            db=self.db, gateway=self.gateway, now_provider=self.now_provider
+        )
+        pending_task = sched_svc.get_pending_task(cycle_id)
+        sched_status = sched_svc.get_scheduling_status(cycle_id)
+
+        from app.services.lab_context_service import get_last_evaluated_ledger_version
+        last_eval_from_consilium = get_last_evaluated_ledger_version(self.db, cycle_id, as_of=as_of)
+        effective_eval_ver = max(latest_eval_ver, last_eval_from_consilium)
+
+        has_newer_labs = current_ledger_version > effective_eval_ver
+        unreviewed_markers: List[Dict[str, Any]] = []
+
+        if has_newer_labs:
+            eval_ledger_row = None
+            for lr in valid_ledgers:
+                ver_val = int((lr.content or {}).get("ledger_version", lr.version))
+                if ver_val == effective_eval_ver:
+                    eval_ledger_row = lr
+                    break
+            eval_active = (eval_ledger_row.content or {}).get("active_markers", {}) if eval_ledger_row else {}
+            eval_history_ids = {
+                obs.get("observation_id")
+                for obs in (eval_ledger_row.content or {}).get("observations_history", [])
+                if isinstance(obs, dict) and obs.get("observation_id")
+            } if eval_ledger_row else set()
+
+            for k, obs_dict in active_markers.items():
+                if (
+                    k not in eval_active
+                    or eval_active[k] != obs_dict
+                    or obs_dict.get("observation_id") not in eval_history_ids
+                ):
+                    unreviewed_markers.append(obs_dict)
+
+            for h_obs in observations_history:
+                if isinstance(h_obs, dict) and h_obs.get("observation_id") not in eval_history_ids:
+                    if not any(u.get("observation_id") == h_obs.get("observation_id") for u in unreviewed_markers):
+                        unreviewed_markers.append(h_obs)
+
+        # 4. Status determination
+        if has_newer_labs:
+            is_in_cooldown = bool(
+                sched_status.cooldown_until_utc or sched_status.debounce_until_utc or pending_task
+            )
+            if is_in_cooldown:
+                status_code = "pending_revision_in_cooldown"
+                status_text = "NEW LABORATORY MARKERS PENDING REVISION IN 72-HOUR COOLDOWN"
+                instruction_text = (
+                    f"Current laboratory ledger is at v{current_ledger_version}, whereas the latest completed "
+                    f"background Lab Revision evaluated only up to v{latest_eval_ver}. "
+                    f"New or modified laboratory markers ({len(unreviewed_markers)} item(s)) have arrived but the "
+                    f"10-model Lab Revision is currently pending in its 72-hour cooldown / 15-minute debounce window. "
+                    f"MANDATORY CLINICAL DIRECTIVE: This Weekly Consilium MUST evaluate all current laboratory markers directly "
+                    f"from the ledger. Prior Lab Revision conclusions evaluated ONLY up to ledger v{latest_eval_ver} and must NOT "
+                    f"be cited as evaluating the new markers. Do NOT reset the 72-hour cooldown or force-run Lab Revision out of order."
+                )
+            else:
+                status_code = "pending_revision"
+                status_text = "NEW LABORATORY MARKERS PENDING BACKGROUND REVISION"
+                instruction_text = (
+                    f"Current ledger is at v{current_ledger_version}, while latest Lab Revision evaluated up to v{latest_eval_ver}. "
+                    f"Evaluate the new markers directly in this Weekly Consilium."
+                )
+        elif latest_rev is not None or effective_eval_ver >= current_ledger_version:
+            status_code = "up_to_date"
+            status_text = "LAB REVISION UP TO DATE"
+            instruction_text = (
+                f"Current laboratory ledger v{current_ledger_version} is fully evaluated by previous consilium "
+                f"(report {latest_report_id or 'primary'})."
+            )
+        elif current_ledger_version > 0:
+            status_code = "no_prior_lab_revision"
+            status_text = "NO PRIOR LAB REVISION PERFORMED"
+            instruction_text = (
+                f"All laboratory markers in ledger v{current_ledger_version} must be evaluated directly "
+                f"by this Weekly Consilium."
+            )
+        else:
+            status_code = "no_labs"
+            status_text = "NO LABORATORY DATA"
+            instruction_text = "No laboratory data has been registered for this cycle."
+
+        # 5. Data limitations & OCR errors
+        all_docs = sched_svc.get_document_records(cycle_id)
+        ocr_limitations: List[str] = []
+        for doc in all_docs:
+            if doc.status == LabDocumentStatus.ERROR or doc.status == "error":
+                ocr_limitations.append(
+                    f"Document '{doc.filename}' uploaded {doc.created_at_utc}: OCR failed ({doc.error_message or 'Unreadable'}). "
+                    "Original file preserved securely in Safe; data not parsed into active ledger."
+                )
+
+        # 6. Build structured markdown text
+        lines = [
+            "=== BACKGROUND 10-MODEL LAB REVISION CONTEXT ===",
+            f"Status: {status_text} (code: {status_code})",
+            f"Directive: {instruction_text}",
+            f"Current Ledger Version: v{current_ledger_version}",
+            f"Evaluated Ledger Version by Lab Revision: v{latest_eval_ver}",
+        ]
+        if unreviewed_markers:
+            lines.append("")
+            lines.append("UNREVIEWED NEW LABORATORY MARKERS (Awaiting scheduled revision; evaluate directly now):")
+            for m in unreviewed_markers:
+                m_name = m.get("display_name") or m.get("marker_key", "unknown")
+                m_val = m.get("value")
+                m_unit = m.get("unit") or ""
+                m_date = m.get("sample_date") or "N/A"
+                m_ref = m.get("reference_range")
+                ref_str = f", ref: {m_ref}" if m_ref else ""
+                lines.append(f"- {m_name}: {m_val} {m_unit} (sample_date: {m_date}{ref_str})")
+
+        if latest_rev:
+            c = latest_rev.content or {}
+            chief = c.get("chief_report") or {}
+            deputy = c.get("deputy_report") or {}
+            lines.append("")
+            lines.append(f"LATEST COMPLETED LAB REVISION REPORT (ID: {latest_report_id}, evaluated v{latest_eval_ver}):")
+            lines.append(f"- Chief Analytical Summary: {chief.get('analytical_summary', c.get('summary', 'N/A'))}")
+            if chief.get("observed_facts"):
+                lines.append(f"- Observed Facts & Trends: {json.dumps(chief['observed_facts'], ensure_ascii=False)}")
+            if chief.get("clinical_hypotheses"):
+                lines.append(f"- Clinical Hypotheses: {json.dumps(chief['clinical_hypotheses'], ensure_ascii=False)}")
+            if chief.get("uncertainties_and_data_deficits"):
+                lines.append(f"- Data Uncertainties & Deficits: {json.dumps(chief['uncertainties_and_data_deficits'], ensure_ascii=False)}")
+            if chief.get("questions_for_weekly_consilium"):
+                lines.append(f"- Questions for Weekly Consilium: {json.dumps(chief['questions_for_weekly_consilium'], ensure_ascii=False)}")
+            if deputy.get("deputy_synthesis"):
+                lines.append(f"- Deputy Flash Synthesis: {deputy['deputy_synthesis']}")
+            if deputy.get("specialist_discrepancies"):
+                lines.append(f"- Specialist Discrepancies: {json.dumps(deputy['specialist_discrepancies'], ensure_ascii=False)}")
+            if deputy.get("clinical_correlations"):
+                lines.append(f"- Clinical Correlations: {json.dumps(deputy['clinical_correlations'], ensure_ascii=False)}")
+
+        if prior_revisions:
+            lines.append("")
+            lines.append("PREVIOUS COMPLETED LAB REVISIONS HISTORY:")
+            for pr in prior_revisions:
+                pr_c = pr.content or {}
+                pr_eval = pr_c.get("evaluated_ledger_version", 0)
+                pr_sum = (pr_c.get("chief_report") or {}).get("analytical_summary") or pr_c.get("summary") or "N/A"
+                lines.append(f"- Report {pr.report_id} (evaluated v{pr_eval}, completed {pr_c.get('completed_at_utc', 'N/A')}): {pr_sum}")
+
+        if ocr_limitations:
+            lines.append("")
+            lines.append("DATA LIMITATIONS & OCR AUDIT:")
+            for ocr_lim in ocr_limitations:
+                lines.append(f"- {ocr_lim}")
+
+        lines.append("")
+        lines.append("CRITICAL CONSILIUM POLICY:")
+        lines.append("1. Parallel Lab Revision reports are advisory analytical inputs and DO NOT replace the authoritative judgment of this Weekly Consilium.")
+        lines.append("2. Only the Chief Physician of the Weekly Consilium has the authority to update or continue the active patient strategy.")
+        lines.append("3. If new markers arrived during cooldown, evaluate them directly from the ledger without relying on outdated revision conclusions.")
+
+        formatted_text = "\n".join(lines)
+
+        return {
+            "status_code": status_code,
+            "status_text": status_text,
+            "current_ledger_version": current_ledger_version,
+            "latest_eval_ver": latest_eval_ver,
+            "latest_report_id": latest_report_id,
+            "has_newer_labs": has_newer_labs,
+            "unreviewed_markers": unreviewed_markers,
+            "completed_revisions_count": len(completed_revisions),
+            "ocr_limitations": ocr_limitations,
+            "formatted_text": formatted_text,
+        }
+
+    def _load_previous_consilium_context(
+        self, cycle_id: str, as_of: Optional[datetime] = None
+    ) -> Dict[str, Any]:
         """
         Loads the baseline Primary Consilium outputs and any prior Weekly Consilium
         outputs from server_only storage without re-running M1, Vision, or 8 Flash-Lite.
+        Respects observation cutoff `as_of` for lab records and measurements.
         """
         pro_primary_list = self.report_repo.list_server_only(
             cycle_id=cycle_id,
@@ -1552,15 +1842,48 @@ class WeeklyConsiliumService:
             else {}
         )
 
-        # Determine the latest laboratory state and distinguish data evaluated by the
+        # Determine the latest laboratory state as of cutoff and distinguish data evaluated by the
         # last Full Consilium (Primary or Lab-Revision) from new unreviewed lab changes.
-        from app.services.lab_context_service import assemble_consilium_laboratory_context
-
-        latest_lab_ctx = assemble_consilium_laboratory_context(self.db, cycle_id)
-
+        from app.services.lab_context_service import assemble_consilium_laboratory_context, LaboratoryConsiliumContext
         from app.services.lab_context_service import get_last_evaluated_ledger_version
 
-        last_evaluated_ver = get_last_evaluated_ledger_version(self.db, cycle_id)
+        target_as_of_ledger_ver = None
+        has_ledger_records = bool(
+            self.report_repo.list_server_only(cycle_id=cycle_id, report_type="laboratory_ledger")
+        )
+        if as_of is not None and has_ledger_records:
+            eff_as_of = as_of.replace(tzinfo=timezone.utc) if as_of.tzinfo is None else as_of
+            ledger_rows = self.report_repo.list_server_only(
+                cycle_id=cycle_id,
+                report_type="laboratory_ledger",
+            )
+            valid_ledgers: List[Any] = []
+            for lr in ledger_rows:
+                eff_lr_dt = self._extract_ledger_recorded_dt(lr)
+                if eff_lr_dt is not None and eff_lr_dt <= eff_as_of:
+                    valid_ledgers.append(lr)
+            if valid_ledgers:
+                valid_ledgers.sort(key=lambda l: int((l.content or {}).get("ledger_version", l.version)))
+                target_as_of_ledger_ver = int(
+                    (valid_ledgers[-1].content or {}).get("ledger_version", valid_ledgers[-1].version)
+                )
+            else:
+                # No ledger existed as of this cutoff date
+                target_as_of_ledger_ver = 0
+
+        if target_as_of_ledger_ver == 0:
+            latest_lab_ctx = LaboratoryConsiliumContext(
+                ledger_version=0,
+                shared_labs_table={},
+                laboratory_history=[],
+                source="empty",
+            )
+        else:
+            latest_lab_ctx = assemble_consilium_laboratory_context(
+                self.db, cycle_id, ledger_version=target_as_of_ledger_ver
+            )
+
+        last_evaluated_ver = get_last_evaluated_ledger_version(self.db, cycle_id, as_of=as_of)
 
         unreviewed_pending_labs: Dict[str, Any] = {}
         pending_removed_marker_keys: List[str] = []
@@ -1692,6 +2015,14 @@ class WeeklyConsiliumService:
             latest_pro_training,
         ]
 
+        # Load background lab revision context respecting observation cutoff `as_of`
+        lab_rev_ctx = self._load_lab_revision_context_for_weekly(cycle_id, as_of=as_of)
+        if lab_rev_ctx.get("formatted_text"):
+            initial_context_lines.extend([
+                "",
+                lab_rev_ctx["formatted_text"],
+            ])
+
         return {
             "initial_context": "\n".join(initial_context_lines),
             "latest_pro_strategy": latest_pro_strategy,
@@ -1706,6 +2037,7 @@ class WeeklyConsiliumService:
             "laboratory_history": laboratory_history,
             "evaluated_ledger_version": last_evaluated_ver,
             "latest_ledger_version": latest_lab_ctx.ledger_version,
+            "lab_revision_context": lab_rev_ctx,
         }
 
     # ==========================================================================
@@ -1873,14 +2205,14 @@ class WeeklyConsiliumService:
                             resolved_sprint_number = len(existing_sprints) + 1
                             resolved_sprint_id = f"sprint_{cycle_id}_w{resolved_sprint_number}"[:64]
 
-                # 5. Load previous conclusions, active strategy, and 7-day Athena diary
-                prev_ctx = self._load_previous_consilium_context(cycle_id)
+                # 5. Determine observation window and load previous conclusions, active strategy, and 7-day Athena diary
                 window_start, window_end = self.resolve_sprint_observation_window(
                     cycle_id=cycle_id,
                     sprint_number=resolved_sprint_number,
                     sprint_id=resolved_sprint_id,
                     reference_date=resolved_date,
                 )
+                prev_ctx = self._load_previous_consilium_context(cycle_id, as_of=window_end)
                 from app.services.athena_daily_journal_service import AthenaDailyJournalService
                 journal_service = AthenaDailyJournalService(
                     db=self.db, now_provider=self.now_provider
@@ -1901,10 +2233,14 @@ class WeeklyConsiliumService:
                     )
                     athena_diary_str = self.format_athena_diary_for_consilium(seven_day_logs)
 
+                lab_rev_data = prev_ctx.get("lab_revision_context") or {}
+                lab_rev_formatted = str(lab_rev_data.get("formatted_text") or "")
+
                 # 6. STAGE 1: Execute Weekly Deputy Chief Physician (Gemini Flash) with lease renewal
                 flash_prompt = build_weekly_flash_prompt(
                     initial_context=prev_ctx["initial_context"],
                     athena_diary=athena_diary_str,
+                    lab_revision_context=lab_rev_formatted,
                 )
                 flash_output: WeeklyFlashMasterOutput = await self._execute_with_lease_renewal(
                     cycle_id,
@@ -1930,6 +2266,7 @@ class WeeklyConsiliumService:
                     draft_weekly_system_reports_json=json.dumps(
                         draft_weekly_reports_dict, ensure_ascii=False
                     ),
+                    lab_revision_context=lab_rev_formatted,
                 )
                 pro_output: WeeklyProMasterOutput = await self._execute_with_lease_renewal(
                     cycle_id,
@@ -2175,6 +2512,10 @@ class WeeklyConsiliumService:
                             "observation_period_end_utc": window_end.isoformat(),
                             "completed_at_utc": self._now_utc().isoformat(),
                             "system_count": len(final_system_updates),
+                            "lab_ledger_version": lab_rev_data.get("current_ledger_version"),
+                            "evaluated_lab_revision_version": lab_rev_data.get("latest_eval_ver"),
+                            "lab_revision_report_id": lab_rev_data.get("latest_report_id"),
+                            "lab_revision_status": lab_rev_data.get("status_code"),
                         },
                         commit=False,
                     )

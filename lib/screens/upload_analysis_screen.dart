@@ -50,7 +50,7 @@ class _UploadAnalysisScreenState extends State<UploadAnalysisScreen> {
     try {
       FilePickerResult? result = await FilePicker.platform.pickFiles(
         type: FileType.custom,
-        allowedExtensions: ['jpg', 'jpeg', 'png', 'webp', 'heic', 'heif'],
+        allowedExtensions: ['jpg', 'jpeg', 'png', 'webp', 'heic', 'heif', 'pdf'],
         allowMultiple: true,
       );
 
@@ -75,6 +75,37 @@ class _UploadAnalysisScreenState extends State<UploadAnalysisScreen> {
         _errorMessage = "Error selecting files: $e";
         _isRetryable = false;
       });
+    }
+  }
+
+  Future<void> _confirmAndStartParsing() async {
+    if (_isLoading || _selectedFiles.isEmpty) return;
+
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: const Color(0xFF1E1E1E),
+        title: const Text("Confirm Upload", style: TextStyle(color: Colors.white)),
+        content: const Text(
+          "Upload these photos or documents?",
+          style: TextStyle(color: Colors.white70),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(false),
+            child: const Text("Cancel", style: TextStyle(color: Colors.grey)),
+          ),
+          ElevatedButton(
+            style: ElevatedButton.styleFrom(backgroundColor: Colors.blueAccent),
+            onPressed: () => Navigator.of(ctx).pop(true),
+            child: const Text("Upload", style: TextStyle(color: Colors.white)),
+          ),
+        ],
+      ),
+    );
+
+    if (confirmed == true) {
+      await _startParsing();
     }
   }
 
@@ -435,7 +466,7 @@ class _UploadAnalysisScreenState extends State<UploadAnalysisScreen> {
                     backgroundColor: Colors.blueAccent,
                     disabledBackgroundColor: Colors.grey.shade800,
                   ),
-                  onPressed: _isLoading || _selectedFiles.isEmpty ? null : _startParsing,
+                  onPressed: _isLoading || _selectedFiles.isEmpty ? null : _confirmAndStartParsing,
                   child: _isLoading
                       ? const CircularProgressIndicator(color: Colors.white)
                       : const Text("Analyze 🤖", style: TextStyle(fontSize: 16, color: Colors.white)),
@@ -451,7 +482,7 @@ class _UploadAnalysisScreenState extends State<UploadAnalysisScreen> {
                       foregroundColor: Colors.blueAccent,
                       side: const BorderSide(color: Colors.blueAccent),
                     ),
-                    onPressed: _startParsing,
+                    onPressed: _confirmAndStartParsing,
                     icon: const Icon(Icons.refresh, size: 18),
                     label: const Text("Retry Upload", style: TextStyle(fontSize: 15)),
                   ),

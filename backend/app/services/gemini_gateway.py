@@ -416,5 +416,5 @@ class GeminiGateway:
             return response_schema.model_validate(parsed_dict)
         except ValidationError as val_err:
             raise GeminiValidationError(
-                f"Model response failed structured schema validation for {response_schema.__name__}."
+                f"Model response failed structured schema validation for {response_schema.__name__}: {val_err}"
             ) from val_err

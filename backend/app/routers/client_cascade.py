@@ -19,6 +19,16 @@ from app.database import get_db
 from app.models.medical_cycle import MedicalCycle
 from app.repositories.cycle_repository import MedicalCycleRepository
 from app.repositories.report_repository import ModelReportRepository, ReportVersionConflictError
+from app.schemas.lab_scheduling import (
+    LabChangeType,
+    LabDocumentRecord,
+    LabDocumentStatus,
+    LabManualEditRequest,
+    LabManualEditResponse,
+    LabRevisionPendingTask,
+    LabSchedulingStatusResponse,
+)
+from app.services.lab_scheduling_service import LabSchedulingService
 from app.schemas.consilium import (
     AnamnesisQuestionnaireAnswers,
     AnamnesisIntakeClientResponse,
@@ -395,44 +405,67 @@ async def submit_client_lab_document_intake(
     cycle_repo = MedicalCycleRepository(db)
     cycle, _created = cycle_repo.get_or_create_active_for_patient(session.patient_id)
 
-    # 2. Process lab images via LabVisionOcrService with atomic ledger integration
+    # 2. Save original documents and check file duplicates via LabSchedulingService
+    scheduling_service = LabSchedulingService(db=db, gateway=gateway, now_provider=now_provider)
+    saved_records: List[LabDocumentRecord] = []
+    for f in upload_files:
+        content = await f.read()
+        await f.seek(0)
+        rec = scheduling_service.save_uploaded_document(
+            cycle_id=cycle.cycle_id,
+            patient_id=session.patient_id,
+            filename=f.filename or "uploaded_report",
+            content_bytes=content,
+        )
+        saved_records.append(rec)
+
+    prev_state = scheduling_service.lab_revision_service.get_lab_ledger_state(cycle.cycle_id)
+    prev_version = prev_state.ledger_version
+
+    # 3. Process lab images via LabVisionOcrService with atomic ledger integration
     service = LabVisionOcrService(
         db=db,
         gateway=gateway,
         now_provider=now_provider,
     )
     try:
-        return await service.process_lab_images(
+        response = await service.process_lab_images(
             cycle_id=cycle.cycle_id,
             files=upload_files,
             is_correction=is_correction,
             sample_date_override=sample_date,
         )
-    except ConsiliumCycleNotFoundError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=str(exc),
-        ) from exc
-    except (ConsiliumConcurrencyConflictError, ReportVersionConflictError) as exc:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail=str(exc),
-        ) from exc
-    except LabVisionValidationError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=str(exc),
-        ) from exc
-    except GeminiGatewayError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail="Gemini Vision OCR extraction failed. Please retry later.",
-        ) from exc
-    except ConsiliumError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail=str(exc),
-        ) from exc
+        # Check if meaningful changes occurred
+        new_state = scheduling_service.lab_revision_service.get_lab_ledger_state(cycle.cycle_id)
+        is_meaningful = new_state.ledger_version > prev_version
+        scheduling_service.update_or_create_pending_task(
+            cycle_id=cycle.cycle_id,
+            patient_id=session.patient_id,
+            is_meaningful_change=is_meaningful,
+        )
+        for rec in saved_records:
+            if not rec.is_duplicate:
+                rec.status = LabDocumentStatus.PROCESSED
+                rec.processed_at_utc = now_provider().isoformat()
+                scheduling_service.update_document_record(rec)
+        return response
+    except Exception as exc:
+        for rec in saved_records:
+            if not rec.is_duplicate:
+                rec.status = LabDocumentStatus.ERROR
+                rec.error_message = str(exc)
+                scheduling_service.update_document_record(rec)
+        if isinstance(exc, ConsiliumCycleNotFoundError):
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+        if isinstance(exc, (ConsiliumConcurrencyConflictError, ReportVersionConflictError)):
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+        if isinstance(exc, LabVisionValidationError):
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+        if isinstance(exc, GeminiGatewayError):
+            raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Gemini Vision OCR extraction failed. Please retry later.") from exc
+        if isinstance(exc, ConsiliumError):
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)) from exc
+        raise
 
 
 @router.get(
@@ -459,6 +492,61 @@ def get_client_lab_ledger_state(
 ) -> LabLedgerStateResponse:
     lab_service = LabRevisionConsiliumService(db=db, gateway=gateway, now_provider=now_provider)
     return lab_service.get_lab_ledger_state(cycle.cycle_id)
+
+@router.post(
+    "/cascade/labs/manual-edit",
+    response_model=LabManualEditResponse,
+    summary="Submit manual edits or corrections to laboratory markers (with 15-minute debounce change detection)",
+    description=(
+        "Applies manual patient adjustments or error corrections to laboratory markers. "
+        "Strictly verifies meaningful changes against current ledger baseline. "
+        "Meaningful changes reset the 15-minute debounce countdown for background Lab Revision. "
+        "Empty or identical values (e.g. 4 -> 4) result in NO_CHANGE without timer reset."
+    ),
+)
+async def submit_client_lab_manual_edit(
+    payload: LabManualEditRequest,
+    cycle: MedicalCycle = Depends(resolve_active_cycle_for_patient),
+    db: Session = Depends(get_db),
+    session: DeviceSession = Depends(require_device_session),
+    _scope: DeviceSession = Depends(require_scopes(SCOPE_CASCADE_INTAKE)),
+    gateway: GeminiGateway = Depends(get_gemini_gateway),
+    now_provider: Callable[[], datetime] = Depends(get_server_now_provider),
+) -> LabManualEditResponse:
+    scheduling_service = LabSchedulingService(db=db, gateway=gateway, now_provider=now_provider)
+    try:
+        return scheduling_service.process_manual_edit(
+            cycle_id=cycle.cycle_id,
+            patient_id=session.patient_id,
+            mutations=payload.mutations,
+        )
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(exc),
+        ) from exc
+    except (ConsiliumConcurrencyConflictError, ReportVersionConflictError) as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=str(exc),
+        ) from exc
+
+
+@router.get(
+    "/cascade/labs/scheduling-status",
+    response_model=LabSchedulingStatusResponse,
+    summary="Get background Lab Revision scheduling status (debounce, cooldown, readiness)",
+)
+def get_client_lab_scheduling_status(
+    cycle: MedicalCycle = Depends(resolve_active_cycle_for_patient),
+    db: Session = Depends(get_db),
+    _scope: DeviceSession = Depends(require_scopes("cycle:read")),
+    gateway: GeminiGateway = Depends(get_gemini_gateway),
+    now_provider: Callable[[], datetime] = Depends(get_server_now_provider),
+) -> LabSchedulingStatusResponse:
+    scheduling_service = LabSchedulingService(db=db, gateway=gateway, now_provider=now_provider)
+    return scheduling_service.get_scheduling_status(cycle.cycle_id)
+
 
 
 @router.post(

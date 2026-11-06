@@ -669,6 +669,41 @@ class AegisApiClient {
     }
   }
 
+  /// Submits manual edits or corrections to laboratory markers (`POST /api/v1/client/cascade/labs/manual-edit`).
+  /// Requires `cascade:intake` scope.
+  Future<Map<String, dynamic>> submitManualLabEdit({
+    required List<Map<String, dynamic>> mutations,
+    String? accessToken,
+  }) async {
+    final uri = Uri.parse('$baseUrl/api/v1/client/cascade/labs/manual-edit');
+    try {
+      final response = await _sendWithAuthRetry(
+        sendRequest: (token) async {
+          final headers = await _buildHeaders(accessToken: token);
+          headers['Content-Type'] = 'application/json';
+          final body = json.encode({'mutations': mutations});
+          _log('POST $uri: $body');
+          return await _client.post(uri, headers: headers, body: body).timeout(timeout);
+        },
+        explicitAccessToken: accessToken,
+      );
+
+      if (response.statusCode == 200) {
+        return json.decode(response.body) as Map<String, dynamic>;
+      }
+      _handleErrorResponse(response);
+    } on TimeoutException catch (e) {
+      _log('Timeout on $uri: $e');
+      throw AegisTimeoutException('Manual lab edit request timed out after ${timeout.inSeconds}s');
+    } on SocketException catch (e) {
+      _log('Socket error on $uri: $e');
+      throw AegisNetworkException('Network connection failed: ${e.message}');
+    } on http.ClientException catch (e) {
+      _log('Client error on $uri: $e');
+      throw AegisNetworkException('HTTP client error: ${e.message}');
+    }
+  }
+
   /// Upload an electrocardiogram tracing image for server-side Vision ECG analysis.
   /// (`POST /api/v1/client/cascade/intake/ecg`).
   /// Requires `cascade:intake` scope.

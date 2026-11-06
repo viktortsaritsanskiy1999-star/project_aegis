@@ -556,18 +556,26 @@ MANDATORY JSON RESPONSE FORMAT (STRICTLY OBSERVE KEYS):
 # Ported from lib/services/weekly_sprint_cascade_service.dart + lib/services/curator_agent.dart
 # ==============================================================================
 
-def build_weekly_flash_prompt(initial_context: str, athena_diary: str) -> str:
+def build_weekly_flash_prompt(
+    initial_context: str,
+    athena_diary: str,
+    lab_revision_context: Optional[str] = None,
+) -> str:
     """
     Builds the Weekly Deputy Chief Physician (Gemini Flash) prompt from
     lib/services/weekly_sprint_cascade_service.dart, preserving weekly_deputy_analysis
-    and adding the 8 dated user_system_reports for the Atlas.
+    and adding the 8 dated user_system_reports for the Atlas and optional background Lab Revision input.
     """
+    lab_section = ""
+    if lab_revision_context and lab_revision_context.strip():
+        lab_section = f"\n\nPARALLEL LAB REVISION INPUT & LABORATORY STATUS:\n{lab_revision_context.strip()}\n"
+
     return f"""You are the Head of Department (Aegis Clinical Analyst).
 1 week (7 days) of patient monitoring has passed. Your task is to compare the weekly dynamics with the original plan and prepare a summary for the Chief Physician.
 
 INITIAL PATIENT STATUS AND PLAN:
 {initial_context}
-
+{lab_section}
 ATHENA'S WEEKLY DIARY (ATHENA LOGS):
 {athena_diary}
 
@@ -575,6 +583,7 @@ YOUR TASK:
 1. Highlight the patient's key successes over 7 days (symptom dynamics, adherence to recommendations).
 2. Identify bottlenecks or emerging complaints.
 3. Formulate a short proposal for the Chief Physician: whether the current strategy needs to be adjusted for the next week.
+4. If background Lab Revision input is provided, evaluate the laboratory dynamics and any unreviewed markers currently in cooldown.
 
 ADDITIONAL USER-FACING TASK (8 WEEKLY DATED ATLAS SYSTEM UPDATES):
 In addition to "weekly_deputy_analysis", generate 8 separate user-facing updates in "user_system_reports" for:
@@ -610,19 +619,24 @@ def build_weekly_pro_prompt(
     athena_diary: str,
     previous_strategy_context: str,
     draft_weekly_system_reports_json: str,
+    lab_revision_context: Optional[str] = None,
 ) -> str:
     """
     Builds the Weekly Chief Physician (Gemini Pro) prompt from
     lib/services/weekly_sprint_cascade_service.dart, preserving updated_weekly_strategy
     and adding practical 7-day Athena priorities, weekly_overall_report for the Vault,
-    and flash_quality_review for Flash's 8 weekly system updates.
+    flash_quality_review for Flash's 8 weekly system updates, and parallel Lab Revision input.
     """
+    lab_section = ""
+    if lab_revision_context and lab_revision_context.strip():
+        lab_section = f"\n\nPARALLEL LAB REVISION INPUT & LABORATORY STATUS:\n{lab_revision_context.strip()}\n"
+
     return f"""You are the Chief Physician of the Aegis expert system.
 Based on the weekly review by the Head of Department (Flash) and the Curator's (Athena) diary, update the working strategy for the NEXT WEEK.
 
 PREVIOUS ACTIVE STRATEGY AND CLINICAL CONTEXT:
 {previous_strategy_context}
-
+{lab_section}
 WEEKLY ANALYSIS FROM FLASH:
 {flash_analysis}
 
@@ -644,6 +658,10 @@ YOUR TASK:
    - If changing the strategy is not required, set "strategy_status" to "continued" and explicitly confirm continuation of the previous strategy with concrete 7-day priorities (NEVER return an empty strategy).
 3. "weekly_overall_report": Create a separate, warm, understandable weekly summary for the user's Vault ("title", "summary", "highlights").
 4. "flash_quality_review": Verify Flash's 8 weekly "user_system_reports". Overwrite any factual error, unverified diagnosis, or false guarantee of unchanged health via "corrected_user_system_reports", or set "approved_for_publication" to false if unsafe.
+5. AUTHORITY & INDEPENDENT VERDICT ON STRATEGY:
+   - Conclusions from the background Lab Revision (including parallel Gemini Pro) are strictly advisory inputs and do NOT replace your decision as Chief Physician of the Weekly Consilium.
+   - If new laboratory markers arrived during cooldown, evaluate them directly from the ledger without relying on outdated revision conclusions.
+   - You must independently assess the complete patient picture (symptoms, Mode 2 / vitals, Athena logs, labs, and Flash synthesis) to determine whether to update the strategy ("updated") or confirm its continuation ("continued").
 
 CRITICAL JSON FORMATTING RULE:
 Inside string values, it is STRICTLY FORBIDDEN to use unescaped double quotes. Use guillemets « » or ' '.
@@ -774,6 +792,61 @@ COMPARATIVE ANALYSIS RULES FOR THIS ORGAN SYSTEM:
     return base_prompt + comparative_addendum
 
 
+def build_background_lab_revision_deputy_prompt(comparative_context: str) -> str:
+    """
+    Constructs prompt for Deputy Chief Physician (Gemini Flash) in Stage 6B background Lab Revision.
+    Strictly analytical: compares new vs previous findings across all 8 systems, identifies discrepancies,
+    clinical correlations, and data limitations without generating user-facing advice or instructions for Athena.
+    """
+    return f"""You are the senior analytical module "Synthesis and Control" (Deputy Chief Physician) of the Aegis expert medical system.
+You are conducting a BACKGROUND COMPARATIVE LAB-REVISION ANALYSIS in the active medical cycle following laboratory ledger updates.
+This analysis is internal and purely analytical (SERVER_ONLY) to prepare evidence for the upcoming Weekly Consilium.
+
+COMPARATIVE CLINICAL DOSSIER:
+{comparative_context}
+
+YOUR ANALYTICAL RESPONSIBILITIES:
+1. Conduct an intersystem comparative synthesis: evaluate what has changed and what remains consistent relative to prior conclusions and baseline anamnesis.
+2. Cross-audit all 8 Flash-Lite specialists: identify any conflicting interpretations, discrepancies, or overstatements between organ systems.
+3. Trace pathophysiological links across organ systems (e.g. metabolic-cardiovascular-renal axes).
+4. Delineate clear data limitations, unmeasured parameters, and residual uncertainties.
+5. Formulate draft clinical hypotheses for Chief Physician (Gemini Pro) evaluation.
+
+CRITICAL INVARIANTS:
+- Do NOT generate user-facing messages or patient-directed advice.
+- Do NOT issue instructions to Athena to change her current plan or active strategy.
+- Adhere strictly to verifiable evidence; never invent missing facts."""
+
+
+def build_background_lab_revision_chief_prompt(full_comparative_context: str) -> str:
+    """
+    Constructs prompt for Chief Physician (Gemini Pro) in Stage 6B background Lab Revision.
+    Strictly analytical: issues the definitive Lab Revision Report for the next Weekly Consilium.
+    Must rigorously distinguish observed facts, trends over time, clinical hypotheses,
+    uncertainties, and targeted questions for the next Weekly Consilium.
+    Does NOT update the active patient strategy, Athena's weekly plan, or vitals thresholds.
+    """
+    return f"""You are the Chief Physician (Gemini Pro) of the Aegis expert medical system.
+You are delivering the SUPREME ANALYTICAL LAB-REVISION REPORT for the active medical cycle.
+Your verdict is strictly internal and analytical (SERVER_ONLY). It will serve as authoritative evidence for the next Weekly Consilium (Stage 6C).
+
+NOTE ON AUTHORITY:
+Lab Revision is NOT a Weekly Consilium and does NOT have the authority to update the patient's active strategy, modify Athena's weekly plan, or alter vitals monitoring thresholds.
+Your role is exclusively comparative clinical reassessment and analytical synthesis.
+
+FULL COMPARATIVE CONTEXT (Anamnesis, Lab Diff, 8 Specialist Findings, Deputy Flash Synthesis, Historical Conclusions & Strategy Baseline):
+{full_comparative_context}
+
+YOUR REVISION REQUIREMENTS:
+1. Analytical Summary: Synthesize the clinical significance of the new/corrected laboratory markers in context of the overall patient picture.
+2. Observed Facts & Marker Trends: Explicitly record verifiable observations and directional changes over time (distinguishing error corrections from dated longitudinal studies).
+3. Clinical Hypotheses: Propose pathophysiological working hypotheses. NEVER present unconfirmed hypotheses as definitive diagnoses.
+4. Uncertainties & Data Deficits: Highlight missing tests, borderline values, or diagnostic gaps that require further monitoring.
+5. Questions for Next Weekly Consilium: Define targeted clinical questions, focus topics, and surveillance priorities for the upcoming Weekly Consilium.
+6. Cascade Quality Audit: Provide a concise appraisal of the 8 specialists and Deputy Flash findings, noting any points of agreement or divergence."""
+
+
+
 def build_lab_revision_flash_master_prompt(comparative_context: str) -> str:
     """
     Extends Deputy Chief Physician (Gemini Flash) instructions for comparative intersystem
@@ -837,6 +910,61 @@ You are issuing the SUPREME COMPARATIVE VERDICT after laboratory results were up
    - Ensure systems without revision explicitly explain that available new data does not provide sufficient grounds to change the previous assessment, and NEVER claim that health is guaranteed unchanged.
    - Deterministically overwrite any flawed system summary via "corrected_user_system_reports" before publication, or set "approved_for_publication": false if unsafe."""
     return base_prompt + comparative_addendum
+
+
+def build_background_lab_revision_deputy_prompt(comparative_context: str) -> str:
+    """
+    Constructs prompt for Deputy Chief Physician (Gemini Flash) in Stage 6B background Lab Revision.
+    Strictly analytical: compares new vs previous findings across all 8 systems, identifies discrepancies,
+    clinical correlations, and data limitations without generating user-facing advice or instructions for Athena.
+    """
+    return f"""You are the senior analytical module "Synthesis and Control" (Deputy Chief Physician) of the Aegis expert medical system.
+You are conducting a BACKGROUND COMPARATIVE LAB-REVISION ANALYSIS in the active medical cycle following laboratory ledger updates.
+This analysis is internal and purely analytical (SERVER_ONLY) to prepare evidence for the upcoming Weekly Consilium.
+
+COMPARATIVE CLINICAL DOSSIER:
+{comparative_context}
+
+YOUR ANALYTICAL RESPONSIBILITIES:
+1. Conduct an intersystem comparative synthesis: evaluate what has changed and what remains consistent relative to prior conclusions and baseline anamnesis.
+2. Cross-audit all 8 Flash-Lite specialists: identify any conflicting interpretations, discrepancies, or overstatements between organ systems.
+3. Trace pathophysiological links across organ systems (e.g. metabolic-cardiovascular-renal axes).
+4. Delineate clear data limitations, unmeasured parameters, and residual uncertainties.
+5. Formulate draft clinical hypotheses for Chief Physician (Gemini Pro) evaluation.
+
+CRITICAL INVARIANTS:
+- Do NOT generate user-facing messages or patient-directed advice.
+- Do NOT issue instructions to Athena to change her current plan or active strategy.
+- Adhere strictly to verifiable evidence; never invent missing facts."""
+
+
+def build_background_lab_revision_chief_prompt(full_comparative_context: str) -> str:
+    """
+    Constructs prompt for Chief Physician (Gemini Pro) in Stage 6B background Lab Revision.
+    Strictly analytical: issues the definitive Lab Revision Report for the next Weekly Consilium.
+    Must rigorously distinguish observed facts, trends over time, clinical hypotheses,
+    uncertainties, and targeted questions for the next Weekly Consilium.
+    Does NOT update the active patient strategy, Athena's weekly plan, or vitals thresholds.
+    """
+    return f"""You are the Chief Physician (Gemini Pro) of the Aegis expert medical system.
+You are delivering the SUPREME ANALYTICAL LAB-REVISION REPORT for the active medical cycle.
+Your verdict is strictly internal and analytical (SERVER_ONLY). It will serve as authoritative evidence for the next Weekly Consilium (Stage 6C).
+
+NOTE ON AUTHORITY:
+Lab Revision is NOT a Weekly Consilium and does NOT have the authority to update the patient's active strategy, modify Athena's weekly plan, or alter vitals monitoring thresholds.
+Your role is exclusively comparative clinical reassessment and analytical synthesis.
+
+FULL COMPARATIVE CONTEXT (Anamnesis, Lab Diff, 8 Specialist Findings, Deputy Flash Synthesis, Historical Conclusions & Strategy Baseline):
+{full_comparative_context}
+
+YOUR REVISION REQUIREMENTS:
+1. Analytical Summary: Synthesize the clinical significance of the new/corrected laboratory markers in context of the overall patient picture.
+2. Observed Facts & Marker Trends: Explicitly record verifiable observations and directional changes over time (distinguishing error corrections from dated longitudinal studies).
+3. Clinical Hypotheses: Propose pathophysiological working hypotheses. NEVER present unconfirmed hypotheses as definitive diagnoses.
+4. Uncertainties & Data Deficits: Highlight missing tests, borderline values, or diagnostic gaps that require further monitoring.
+5. Questions for Next Weekly Consilium: Define targeted clinical questions, focus topics, and surveillance priorities for the upcoming Weekly Consilium.
+6. Cascade Quality Audit: Provide a concise appraisal of the 8 specialists and Deputy Flash findings, noting any points of agreement or divergence."""
+
 
 
 def build_lab_vision_ocr_prompt(page_count: int = 1) -> str:

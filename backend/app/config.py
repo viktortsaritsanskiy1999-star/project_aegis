@@ -144,6 +144,11 @@ class Settings(BaseSettings):
         default=False,
         alias="AEGIS_ENABLE_MODE2_MONITORING",
     )
+    # Stage 6 Background Lab Revision automation flag
+    enable_lab_revision: bool = Field(
+        default=False,
+        alias="AEGIS_ENABLE_LAB_REVISION",
+    )
 
 
 settings = Settings()
