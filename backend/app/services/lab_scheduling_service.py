@@ -145,6 +145,9 @@ class LabSchedulingService:
         """Finds any existing document record with matching cryptographic file hash in cycle."""
         docs = self.get_document_records(cycle_id)
         for d in docs:
+            if d.file_sha256 == file_sha256 and d.status != LabDocumentStatus.ERROR and not d.is_duplicate:
+                return d
+        for d in docs:
             if d.file_sha256 == file_sha256 and d.status != LabDocumentStatus.ERROR:
                 return d
         return None
@@ -189,6 +192,15 @@ class LabSchedulingService:
                 ocr_report_id=existing_match.ocr_report_id,
                 is_duplicate=True,
                 duplicate_of_document_id=existing_match.document_id,
+            )
+            self.report_repo.create_next_version(
+                cycle_id=cycle_id,
+                model="aegis-lab-intake",
+                report_type=LAB_DOCUMENT_REPORT_TYPE,
+                privacy_level=PrivacyLevel.SERVER_ONLY,
+                content=dup_record.model_dump(),
+                created_at=now_dt,
+                commit=True,
             )
             return dup_record
 

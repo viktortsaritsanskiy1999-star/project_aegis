@@ -965,17 +965,17 @@ class ClinicalAutomationService:
                                     n += 1
                                     if n > 52:
                                         break
-            # Discover background Lab Revision tasks if enabled
-            if self.enable_lab_revision:
-                ready_tasks = self.lab_scheduling_service.get_ready_tasks_for_execution()
-                for t in ready_tasks:
-                    job = self.enqueue_lab_revision(
-                        cycle_id=t.cycle_id,
-                        patient_id=t.patient_id,
-                        target_ledger_version=t.target_ledger_version,
-                    )
-                    if job is not None:
-                        discovered.append(job)
+        # Discover background Lab Revision tasks if enabled
+        if self.enable_lab_revision:
+            ready_tasks = self.lab_scheduling_service.get_ready_tasks_for_execution()
+            for t in ready_tasks:
+                job = self.enqueue_lab_revision(
+                    cycle_id=t.cycle_id,
+                    patient_id=t.patient_id,
+                    target_ledger_version=t.target_ledger_version,
+                )
+                if job is not None:
+                    discovered.append(job)
         return discovered
 
     # ==========================================================================

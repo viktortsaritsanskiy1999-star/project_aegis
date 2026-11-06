@@ -309,9 +309,17 @@ class WellnessDailyService:
         Returns WellnessTriggerType.WAKE_UP, WellnessTriggerType.SCHEDULED_MIDDAY, or None.
         """
         effective_now = as_of or self._now_utc()
-        window_start, window_end = self.resolve_observation_window(
+        nominal_start, nominal_end = self.resolve_observation_window(
             cycle_id, calendar_week, calendar_day
         )
+        prev_rep = self.get_previous_daily_wellness_report(
+            cycle_id, calendar_week, calendar_day
+        )
+        if prev_rep is not None and prev_rep.window and prev_rep.window.end_utc:
+            prev_end = self._parse_iso_utc(prev_rep.window.end_utc)
+            window_start = prev_end if prev_end is not None else nominal_start
+        else:
+            window_start = nominal_start
 
         # Do not evaluate future windows
         if effective_now < window_start:
@@ -321,10 +329,10 @@ class WellnessDailyService:
         measurements = self.gather_genuine_measurements(
             cycle_id=cycle_id,
             start_dt=window_start,
-            end_dt=min(effective_now, window_end),
+            end_dt=min(effective_now, nominal_end),
         )
         is_wake_up, _, _ = self.inspect_measurements_for_confirmed_wake_up(
-            measurements, window_start, window_end
+            measurements, window_start, nominal_end
         )
         if is_wake_up:
             return WellnessTriggerType.WAKE_UP
@@ -601,6 +609,48 @@ class WellnessDailyService:
                     continue
         return None
 
+    def get_previous_daily_wellness_report(
+        self,
+        cycle_id: str,
+        calendar_week: int,
+        calendar_day: int,
+    ) -> Optional[WellnessDailyReport]:
+        """
+        Finds the most recent daily wellness report that preceded (calendar_week, calendar_day).
+        For Week 1 Day 1, returns None.
+        For Day > 1, checks (week, day - 1).
+        For Day 1 (week > 1), checks (week - 1, 7).
+        Falls back to any earlier completed wellness report if intermediate days are missing.
+        """
+        if calendar_day > 1:
+            prev_w = calendar_week
+            prev_d = calendar_day - 1
+        else:
+            if calendar_week > 1:
+                prev_w = calendar_week - 1
+                prev_d = 7
+            else:
+                return None
+
+        immediate_prev = self.get_daily_wellness_report(cycle_id, prev_w, prev_d)
+        if immediate_prev is not None:
+            return immediate_prev
+
+        # Backward search within same week
+        for d in range(prev_d - 1, 0, -1):
+            cand = self.get_daily_wellness_report(cycle_id, prev_w, d)
+            if cand is not None:
+                return cand
+
+        # Backward search in previous week
+        if prev_w > 1:
+            for d in range(7, 0, -1):
+                cand = self.get_daily_wellness_report(cycle_id, prev_w - 1, d)
+                if cand is not None:
+                    return cand
+
+        return None
+
     def list_wellness_reports(self, cycle_id: str) -> List[WellnessDailyReport]:
         """
         Returns all persisted WellnessDailyReport records for cycle_id in chronological order.
@@ -690,32 +740,46 @@ class WellnessDailyService:
         patient_id = cycle.patient_id if cycle else "unknown"
         tz_name = self.get_patient_timezone(clean_cycle)
 
-        window_start, window_end = self.resolve_observation_window(
+        nominal_start, nominal_end = self.resolve_observation_window(
             clean_cycle, calendar_week, calendar_day
         )
+        prev_rep = self.get_previous_daily_wellness_report(
+            clean_cycle, calendar_week, calendar_day
+        )
+        if prev_rep is not None and prev_rep.window and prev_rep.window.end_utc:
+            prev_end = self._parse_iso_utc(prev_rep.window.end_utc)
+            window_start = prev_end if prev_end is not None else nominal_start
+        else:
+            window_start = nominal_start
+
         resolved_trigger = trigger or self.evaluate_trigger(
             clean_cycle, calendar_week, calendar_day, as_of=effective_now
         ) or WellnessTriggerType.MANUAL
 
+        if effective_now < nominal_end:
+            actual_end = max(effective_now, window_start + timedelta(seconds=1))
+        else:
+            actual_end = max(nominal_end, window_start + timedelta(seconds=1))
+
         time_window = WellnessTimeWindow(
             start_utc=window_start.isoformat(),
-            end_utc=window_end.isoformat(),
+            end_utc=actual_end.isoformat(),
             user_timezone=tz_name,
             calendar_week=calendar_week,
             calendar_day=calendar_day,
         )
 
-        # 2. Gather measurements up to effective_now (or end of window)
+        # 2. Gather measurements up to actual_end
         measurements = self.gather_genuine_measurements(
             cycle_id=clean_cycle,
             start_dt=window_start,
-            end_dt=min(effective_now, window_end),
+            end_dt=actual_end,
         )
 
         mode2_episodes = self.mode2_service.get_wellness_episodes_for_window(
             cycle_id=clean_cycle,
             start_dt=window_start,
-            end_dt=min(effective_now, window_end),
+            end_dt=actual_end,
         )
 
         now_iso = effective_now.isoformat()
@@ -851,7 +915,8 @@ class WellnessDailyService:
             return []
 
         hours_elapsed = (effective_now - anchor_dt).total_seconds() / 3600.0
-        days_to_check = min(7, int(hours_elapsed // 24) + 1)
+        existing_reports = self.list_wellness_reports(clean_cycle)
+        days_to_check = min(7, max(int(hours_elapsed // 24) + 1, len(existing_reports) + 1))
 
         pending: List[Tuple[int, int, WellnessTriggerType]] = []
         for d in range(1, days_to_check + 1):

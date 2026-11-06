@@ -47,10 +47,21 @@ async def lifespan(app: FastAPI):
         )
         worker = ClinicalAutomationWorker(
             session_factory=worker_session_factory,
-            enable_weekly_plan=settings.enable_weekly_plan,
-            enable_daily_journal=settings.enable_daily_journal,
-            enable_wellness_daily=settings.enable_wellness_daily,
-            enable_automatic_weekly=settings.enable_automatic_weekly,
+            gateway_factory=getattr(app.state, "gateway_factory", None),
+            now_provider=getattr(app.state, "now_provider", None),
+            poll_interval_seconds=getattr(app.state, "worker_poll_interval", 5.0),
+            enable_weekly_plan=getattr(
+                app.state, "enable_weekly_plan", settings.enable_weekly_plan
+            ),
+            enable_daily_journal=getattr(
+                app.state, "enable_daily_journal", settings.enable_daily_journal
+            ),
+            enable_wellness_daily=getattr(
+                app.state, "enable_wellness_daily", settings.enable_wellness_daily
+            ),
+            enable_automatic_weekly=getattr(
+                app.state, "enable_automatic_weekly", settings.enable_automatic_weekly
+            ),
             enable_lab_revision=getattr(
                 app.state, "enable_lab_revision", settings.enable_lab_revision
             ),
