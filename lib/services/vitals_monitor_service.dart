@@ -86,6 +86,9 @@ class VitalsMonitorService extends ChangeNotifier {
   DateTime? get workoutEndTime => _workoutEndTime;
   String? get currentSessionId => _currentSessionId;
 
+  /// Optional listener notified when a workout finishes, receiving (sessionId, completedAt)
+  void Function(String? sessionId, DateTime completedAt)? onWorkoutCompleted;
+
   final List<PulseRecord> _workoutPulseLog = [];
   List<PulseRecord> get workoutPulseLog => List.unmodifiable(_workoutPulseLog);
 
@@ -445,6 +448,7 @@ class VitalsMonitorService extends ChangeNotifier {
     );
 
     debugPrint("🏁 [VitalsMonitor]: Workout ended at $_workoutEndTime. Session: $_currentSessionId, Duration: ${duration.inMinutes}m ${duration.inSeconds % 60}s. Switched to AlertState.postWorkoutRecovery.");
+    onWorkoutCompleted?.call(_currentSessionId, _workoutEndTime!);
     notifyListeners();
   }
 

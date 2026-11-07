@@ -440,6 +440,43 @@ class AegisApiClient {
     }
   }
 
+  /// Completes active workout session and transitions to recovery on server.
+  Future<Map<String, dynamic>> postWorkoutFinish({
+    required String cycleId,
+    String? sessionId,
+    String? accessToken,
+  }) async {
+    final uri = Uri.parse('$baseUrl/api/v1/vitals/mode2/workout-finish');
+    final payloadJson = json.encode({
+      'cycle_id': cycleId,
+      if (sessionId != null) 'session_id': sessionId,
+    });
+    try {
+      final response = await _sendWithAuthRetry(
+        sendRequest: (token) async {
+          final headers = await _buildHeaders(accessToken: token);
+          _log('POST $uri (cycle: $cycleId, session: $sessionId)');
+          return await _client.post(uri, headers: headers, body: payloadJson).timeout(timeout);
+        },
+        explicitAccessToken: accessToken,
+      );
+
+      if (response.statusCode == 200 || response.statusCode == 201) {
+        return json.decode(response.body) as Map<String, dynamic>;
+      }
+      _handleErrorResponse(response);
+    } on TimeoutException catch (e) {
+      _log('Timeout on $uri: $e');
+      throw AegisTimeoutException('Workout finish request timed out after ${timeout.inSeconds}s');
+    } on SocketException catch (e) {
+      _log('Socket error on $uri: $e');
+      throw AegisNetworkException('Network connection failed: ${e.message}');
+    } on http.ClientException catch (e) {
+      _log('Client error on $uri: $e');
+      throw AegisNetworkException('HTTP client error: ${e.message}');
+    }
+  }
+
   /// Get authoritative latest vitals stream
   Future<VitalsStreamResponse> getLatestVitals(
     String cycleId, {

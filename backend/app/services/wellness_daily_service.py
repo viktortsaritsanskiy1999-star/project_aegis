@@ -916,13 +916,14 @@ class WellnessDailyService:
 
         hours_elapsed = (effective_now - anchor_dt).total_seconds() / 3600.0
         existing_reports = self.list_wellness_reports(clean_cycle)
-        days_to_check = min(7, max(int(hours_elapsed // 24) + 1, len(existing_reports) + 1))
+        total_days_elapsed = max(int(hours_elapsed // 24) + 1, len(existing_reports) + 1)
+        existing_days = {(r.calendar_week, r.calendar_day) for r in existing_reports}
 
         pending: List[Tuple[int, int, WellnessTriggerType]] = []
-        for d in range(1, days_to_check + 1):
-            w = 1  # current sprint
-            existing = self.get_daily_wellness_report(clean_cycle, w, d)
-            if existing is not None:
+        for day_idx in range(1, total_days_elapsed + 1):
+            w = (day_idx - 1) // 7 + 1
+            d = (day_idx - 1) % 7 + 1
+            if (w, d) in existing_days:
                 continue
 
             trig = self.evaluate_trigger(clean_cycle, w, d, as_of=effective_now)

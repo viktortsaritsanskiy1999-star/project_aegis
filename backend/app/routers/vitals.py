@@ -1,5 +1,5 @@
 from datetime import datetime, timezone
-from typing import Any, Callable, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from sqlalchemy.orm import Session
 
@@ -18,6 +18,7 @@ from app.schemas.health import (
 )
 from app.schemas.mode2 import (
     Mode2EpisodeSummaryResponse,
+    Mode2WorkoutFinishRequest,
     Mode2WorkoutResponseRequest,
 )
 from app.security.auth import (
@@ -44,6 +45,7 @@ def _build_mode2_summary_response(ep: Any) -> Mode2EpisodeSummaryResponse:
     return Mode2EpisodeSummaryResponse(
         episode_id=ep.episode_id,
         cycle_id=ep.cycle_id,
+        session_id=getattr(ep, "session_id", None),
         status=ep.status.value if hasattr(ep.status, "value") else str(ep.status),
         started_at_utc=ep.started_at_utc,
         closed_at_utc=ep.closed_at_utc,
@@ -122,6 +124,7 @@ async def ingest_measurement_endpoint(
             measured_at=rec.measured_at,
             note=rec.note,
             phase=rec.phase,
+            session_id=rec.session_id,
         )
 
     response.status_code = status.HTTP_201_CREATED if is_new else status.HTTP_200_OK
@@ -232,6 +235,7 @@ async def ingest_batch_endpoint(
                     measured_at=rec.measured_at,
                     note=rec.note,
                     phase=rec.phase,
+                    session_id=rec.session_id,
                 )
 
     response.status_code = status.HTTP_201_CREATED if recorded_count > 0 else status.HTTP_200_OK
@@ -418,4 +422,35 @@ def get_mode2_episode_history_endpoint(
     mode2_svc = Mode2VitalsMonitoringService(db=db)
     episodes = mode2_svc.get_episode_history(cycle_id)
     return [_build_mode2_summary_response(ep) for ep in episodes]
+
+
+@router.post(
+    "/mode2/workout-finish",
+    summary="Complete active workout session and transition to recovery",
+    description="Transitions an active workout session to recovering status, matching client finishWorkout.",
+)
+def finish_mode2_workout_endpoint(
+    payload: Optional[Mode2WorkoutFinishRequest] = None,
+    cycle_id: Optional[str] = Query(default=None, min_length=3, max_length=64),
+    session_id: Optional[str] = Query(default=None),
+    db: Session = Depends(get_db),
+    session: AuthSession = Depends(require_scopes("vitals:write")),
+    now_provider: Callable[[], datetime] = Depends(get_server_now_provider),
+) -> Dict[str, Any]:
+    resolved_cycle_id = (payload.cycle_id if payload and payload.cycle_id else None) or cycle_id
+    if not resolved_cycle_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="cycle_id is required either in payload body or query parameter.",
+        )
+    resolved_session_id = (payload.session_id if payload and payload.session_id else None) or session_id
+    verify_cycle_access_for_session(db, session, resolved_cycle_id)
+    mode2_svc = Mode2VitalsMonitoringService(db=db, now_provider=now_provider)
+    ws = mode2_svc.complete_workout_session(resolved_cycle_id, session_id=resolved_session_id)
+    return {
+        "status": "success",
+        "message": "Workout session completed, transitioned to recovery.",
+        "session_id": ws.session_id if ws else resolved_session_id,
+        "workout_status": ws.status if ws else "recovering",
+    }
 

@@ -65,6 +65,7 @@ class Mode2EpisodeRecord(BaseModel):
     episode_id: str = Field(..., description="Unique episode identifier, e.g. 'ep_mode2_{cycle_id}_{uuid}'")
     cycle_id: str
     patient_id: str
+    session_id: Optional[str] = Field(default=None, description="Linked workout session identifier")
     status: Mode2EpisodeStatus = Mode2EpisodeStatus.ACTIVE
     started_at_utc: str
     closed_at_utc: Optional[str] = None
@@ -111,12 +112,21 @@ class Mode2WorkoutResponseRequest(BaseModel):
     symptoms: Optional[str] = Field(default=None, max_length=2000)
 
 
+class Mode2WorkoutFinishRequest(BaseModel):
+    """Client request to finish workout and transition to recovery."""
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    cycle_id: Optional[str] = Field(default=None, min_length=3, max_length=64)
+    session_id: Optional[str] = Field(default=None, max_length=64)
+
+
 class Mode2EpisodeSummaryResponse(BaseModel):
     """Sanitized client-facing summary of a Mode 2 episode."""
     model_config = ConfigDict(extra="forbid")
 
     episode_id: str
     cycle_id: str
+    session_id: Optional[str] = None
     status: str
     started_at_utc: str
     closed_at_utc: Optional[str] = None

@@ -145,6 +145,7 @@ class VitalsSyncQueue extends ChangeNotifier {
 
   final List<VitalsQueueItem> _pendingItems = [];
   final List<VitalsQueueItem> _quarantinedItems = [];
+  final List<Map<String, String>> _pendingWorkoutFinishes = [];
 
   bool _isFlushing = false;
   bool _isPaused = false;
@@ -1344,6 +1345,41 @@ class VitalsSyncQueue extends ChangeNotifier {
     }
   }
 
+  /// Queues and dispatches a workout completion event to the server.
+  /// If online and authenticated, sends immediately via AegisApiClient.
+  /// If offline or on transient network error, buffers and delivers upon flush().
+  Future<void> notifyWorkoutFinished({
+    String? cycleId,
+    String? sessionId,
+    AegisApiClient? apiClient,
+  }) async {
+    final effectiveCycleId = (cycleId != null && cycleId.isNotEmpty) ? cycleId : _activeCycleId;
+    final entry = <String, String>{
+      if (effectiveCycleId != null) 'cycle_id': effectiveCycleId,
+      if (sessionId != null && sessionId.isNotEmpty) 'session_id': sessionId,
+    };
+
+    final client = apiClient ?? _apiClient;
+    if (effectiveCycleId != null && effectiveCycleId.isNotEmpty) {
+      try {
+        await client.postWorkoutFinish(
+          cycleId: effectiveCycleId,
+          sessionId: sessionId,
+        );
+        debugPrint('[VitalsSyncQueue] Workout finish dispatched immediately to server (session: $sessionId, cycle: $effectiveCycleId)');
+        return;
+      } catch (e) {
+        debugPrint('⚠️ [VitalsSyncQueue] Direct workout finish delivery deferred (offline/error: $e). Storing in pending queue.');
+      }
+    }
+
+    final alreadyQueued = _pendingWorkoutFinishes.any((p) =>
+        p['cycle_id'] == effectiveCycleId && p['session_id'] == sessionId);
+    if (!alreadyQueued && entry.isNotEmpty) {
+      _pendingWorkoutFinishes.add(entry);
+    }
+  }
+
   /// Enqueue an incoming HealthMeasurement with atomic single-snapshot persistence.
   /// If cycleId is unknown, the item is persisted locally without a fictitious fallback cycle.
   Future<VitalsQueueItem> enqueue(
@@ -1707,6 +1743,27 @@ class VitalsSyncQueue extends ChangeNotifier {
           _lastSyncError = _pauseReason;
           notifyListeners();
           return SyncResult(status: SyncStatus.paused, message: _pauseReason);
+        }
+
+        // Deliver any pending workout finishes
+        if (_pendingWorkoutFinishes.isNotEmpty) {
+          final finishesCopy = List<Map<String, String>>.from(_pendingWorkoutFinishes);
+          for (final finishEntry in finishesCopy) {
+            try {
+              final cId = finishEntry['cycle_id'] ?? _activeCycleId;
+              if (cId != null && cId.isNotEmpty) {
+                await flushClient.postWorkoutFinish(
+                  cycleId: cId,
+                  sessionId: finishEntry['session_id'],
+                  accessToken: verifiedToken,
+                );
+                _pendingWorkoutFinishes.remove(finishEntry);
+                debugPrint('[VitalsSyncQueue] Flushed pending workout finish for session: ${finishEntry['session_id']}');
+              }
+            } catch (finishErr) {
+              debugPrint('⚠️ [VitalsSyncQueue] Retry of pending workout finish failed: $finishErr');
+            }
+          }
         }
 
         // Filter only items matching both the confirmed activeCycleId AND the active patientId

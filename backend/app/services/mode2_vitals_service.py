@@ -1,14 +1,16 @@
 import asyncio
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Any, Callable, Dict, List, Optional, Tuple
 import uuid
 
 from sqlalchemy.orm import Session
 
 from app.models.model_report import ModelReport
+from app.models.workout_session import WorkoutSession
 from app.repositories.cycle_repository import MedicalCycleRepository
 from app.repositories.measurement_repository import HealthMeasurementRepository
 from app.repositories.report_repository import ModelReportRepository
+from app.repositories.workout_repository import WorkoutSessionRepository
 from app.schemas.privacy import PrivacyLevel
 from app.schemas.chat import AthenaChatRequest, AthenaVitalsAlertContext
 from app.schemas.mode2 import (
@@ -95,6 +97,23 @@ WORKOUT_NEGATIVE_KEYWORDS = [
     "поко",
 ]
 
+WORKOUT_FINISH_KEYWORDS = [
+    "тренировка завершена",
+    "тренировку завершил",
+    "закончил тренировку",
+    "закончила тренировку",
+    "завершил тренировку",
+    "завершила тренировку",
+    "тренировка окончена",
+    "закончил заниматься",
+    "закончила заниматься",
+    "отзанимался",
+    "отзанималась",
+    "завершить тренировку",
+    "workout finished",
+    "finish workout",
+]
+
 
 class Mode2VitalsMonitoringService:
     """
@@ -129,6 +148,7 @@ class Mode2VitalsMonitoringService:
         self.cycle_repo = MedicalCycleRepository(db)
         self.report_repo = ModelReportRepository(db)
         self.meas_repo = HealthMeasurementRepository(db)
+        self.workout_repo = WorkoutSessionRepository(db)
         self.athena_chat_service = AthenaChatService(
             db=db, gateway=self.gateway, now_provider=now_provider
         )
@@ -140,6 +160,122 @@ class Mode2VitalsMonitoringService:
                 return now.replace(tzinfo=timezone.utc)
             return now.astimezone(timezone.utc)
         return datetime.now(timezone.utc)
+
+    # ==========================================================================
+    # WORKOUT SESSION & CONTEXT LIFECYCLE MANAGEMENT
+    # ==========================================================================
+
+    def get_active_workout_session(
+        self,
+        cycle_id: str,
+        as_of: Optional[datetime] = None,
+    ) -> Optional[WorkoutSession]:
+        """
+        Retrieves the currently active workout session for the medical cycle.
+        A session is active if its status is 'active' and it has not timed out (> 3 hours).
+        Timed out sessions are automatically finished to prevent state leak.
+        """
+        now_dt = as_of or self._now_utc()
+        sessions = self.workout_repo.list_by_cycle(cycle_id)
+        for s in sessions:
+            if s.status == "active":
+                ref_time = s.activity_confirmed_at or s.anomaly_detected_at or s.created_at
+                if ref_time.tzinfo is None:
+                    ref_time = ref_time.replace(tzinfo=timezone.utc)
+                if (now_dt - ref_time) > timedelta(hours=3):
+                    self.workout_repo.finish_data_collection(s.session_id)
+                    continue
+                return s
+        return None
+
+    def _ensure_active_workout_session(
+        self,
+        cycle_id: str,
+        confirmed_at: datetime,
+        session_id: Optional[str] = None,
+        anomaly_detected_at: Optional[datetime] = None,
+    ) -> WorkoutSession:
+        act = self.get_active_workout_session(cycle_id, as_of=confirmed_at)
+        if act is not None:
+            return act
+
+        clean_dt = confirmed_at if confirmed_at.tzinfo is not None else confirmed_at.replace(tzinfo=timezone.utc)
+        detected_dt = anomaly_detected_at or clean_dt
+        if detected_dt.tzinfo is None:
+            detected_dt = detected_dt.replace(tzinfo=timezone.utc)
+
+        sid = session_id or f"ws_{cycle_id}_{uuid.uuid4().hex[:10]}"
+        return self.workout_repo.create(
+            session_id=sid,
+            cycle_id=cycle_id,
+            anomaly_detected_at=detected_dt,
+            activity_confirmed_at=clean_dt,
+            status="active",
+        )
+
+    def complete_workout_session(
+        self,
+        cycle_id: str,
+        session_id: Optional[str] = None,
+        completed_at: Optional[datetime] = None,
+        physiological_end_time: Optional[datetime] = None,
+    ) -> Optional[WorkoutSession]:
+        """
+        Transitions active workout session to 'recovering'.
+        Matches client finishWorkout flow.
+        Idempotent: if session is already recovering or completed, returns it safely.
+        """
+        now_dt = completed_at or self._now_utc()
+        if session_id:
+            ws = self.workout_repo.complete_workout(
+                session_id=session_id,
+                workout_completed_at=now_dt,
+                physiological_end_time=physiological_end_time,
+            )
+            if ws:
+                return ws
+        act = self.get_active_workout_session(cycle_id, as_of=now_dt)
+        if act:
+            return self.workout_repo.complete_workout(
+                session_id=act.session_id,
+                workout_completed_at=now_dt,
+                physiological_end_time=physiological_end_time,
+            )
+        # Idempotent fallback: find most recent recovering/completed session for cycle
+        recent_sessions = self.workout_repo.list_by_cycle(cycle_id)
+        for s in recent_sessions:
+            if s.status in ("recovering", "completed"):
+                return s
+        return None
+
+    def finish_workout(
+        self,
+        cycle_id: str,
+        session_id: Optional[str] = None,
+        completed_at: Optional[datetime] = None,
+    ) -> Optional[WorkoutSession]:
+        """Convenience alias matching client-side finishWorkout."""
+        return self.complete_workout_session(
+            cycle_id=cycle_id,
+            session_id=session_id,
+            completed_at=completed_at,
+        )
+
+    def finish_workout_recovery(
+        self,
+        cycle_id: str,
+        session_id: Optional[str] = None,
+    ) -> Optional[WorkoutSession]:
+        """
+        Transitions a recovering workout session to 'completed'.
+        """
+        if session_id:
+            return self.workout_repo.finish_data_collection(session_id)
+        sessions = self.workout_repo.list_by_cycle(cycle_id)
+        for s in sessions:
+            if s.status == "recovering":
+                return self.workout_repo.finish_data_collection(s.session_id)
+        return None
 
     def resolve_thresholds(self, cycle_id: str) -> Dict[str, Any]:
         """
@@ -307,6 +443,7 @@ class Mode2VitalsMonitoringService:
         measured_at: Optional[datetime] = None,
         note: Optional[str] = None,
         phase: Optional[str] = None,
+        session_id: Optional[str] = None,
     ) -> Optional[Mode2EpisodeRecord]:
         """
         Core operational ingestion method.
@@ -326,6 +463,12 @@ class Mode2VitalsMonitoringService:
         thresholds = self.resolve_thresholds(cycle_id)
         active_ep = self.get_active_episode(cycle_id)
 
+        # Check if incoming telemetry indicates transition to post-workout recovery
+        if phase and any(r in phase.lower() for r in ("recovery", "recovering")):
+            act_w = self.get_active_workout_session(cycle_id, as_of=now_dt)
+            if act_w is not None:
+                self.complete_workout_session(cycle_id, session_id=act_w.session_id, completed_at=now_dt)
+
         # ----------------------------------------------------------------------
         # SCENARIO A: NO ACTIVE EPISODE
         # ----------------------------------------------------------------------
@@ -341,15 +484,25 @@ class Mode2VitalsMonitoringService:
                 # Normal reading, standby mode
                 return None
 
+            active_workout = self.get_active_workout_session(cycle_id, as_of=now_dt)
+            is_confirmed_workout = (active_workout is not None)
+
             # Open a brand NEW Mode 2 Episode
             cycle = self.cycle_repo.get(cycle_id)
             patient_id = cycle.patient_id if cycle else "unknown_patient"
             episode_id = f"ep_mode2_{cycle_id}_{uuid.uuid4().hex[:12]}"
 
+            resolved_context = (
+                Mode2WorkoutContext.CONFIRMED_WORKOUT
+                if is_confirmed_workout
+                else Mode2WorkoutContext.UNKNOWN
+            )
+
             new_ep = Mode2EpisodeRecord(
                 episode_id=episode_id,
                 cycle_id=cycle_id,
                 patient_id=patient_id,
+                session_id=active_workout.session_id if active_workout else session_id,
                 status=Mode2EpisodeStatus.ACTIVE,
                 started_at_utc=now_iso,
                 baseline_pulse=baseline,
@@ -362,7 +515,7 @@ class Mode2VitalsMonitoringService:
                 latest_pulse=pulse,
                 latest_spo2=spo2,
                 thresholds_applied=thresholds,
-                workout_context=Mode2WorkoutContext.UNKNOWN,
+                workout_context=resolved_context,
                 telemetry_samples=[
                     Mode2TelemetryPoint(
                         timestamp_utc=now_iso,
@@ -384,33 +537,55 @@ class Mode2VitalsMonitoringService:
                 consecutive_normal_readings=0,
             )
 
-            # Direct delivery to Athena (AthenaChatService)
-            athena_alert_request = AthenaChatRequest(
-                event_type="vitals_alert",
-                vitals_alert=AthenaVitalsAlertContext(
-                    current_pulse=pulse,
-                    baseline_pulse=baseline,
-                    measured_at=now_iso,
-                    notes=f"{reason} (SpO2: {spo2}%" if spo2 else reason,
-                ),
-                message=None,
+            is_critical = (
+                pulse <= thresholds["critical_bradycardia_bpm"]
+                or pulse >= thresholds["critical_tachycardia_bpm"]
+                or (spo2 is not None and spo2 <= thresholds["critical_spo2"])
             )
 
-            athena_resp = await self.athena_chat_service.handle_turn(
-                patient_id=patient_id,
-                request=athena_alert_request,
-                cycle_id=cycle_id,
-            )
-
-            new_ep.athena_events.append(
-                Mode2AthenaEvent(
-                    event_type="initial_alert",
-                    timestamp_utc=now_iso,
-                    prompt_summary=f"HR spike: {pulse} bpm (baseline {baseline} bpm). {reason}",
-                    athena_reply=athena_resp.reply,
-                    emergency_trigger=athena_resp.emergency_trigger,
+            if not is_confirmed_workout or is_critical:
+                # Direct delivery to Athena (AthenaChatService)
+                athena_alert_request = AthenaChatRequest(
+                    event_type="vitals_alert",
+                    vitals_alert=AthenaVitalsAlertContext(
+                        current_pulse=pulse,
+                        baseline_pulse=baseline,
+                        measured_at=now_iso,
+                        notes=(
+                            f"CRITICAL DURING CONFIRMED WORKOUT: {reason}"
+                            if is_confirmed_workout
+                            else (f"{reason} (SpO2: {spo2}%" if spo2 else reason)
+                        ),
+                    ),
+                    message=None,
                 )
-            )
+
+                athena_resp = await self.athena_chat_service.handle_turn(
+                    patient_id=patient_id,
+                    request=athena_alert_request,
+                    cycle_id=cycle_id,
+                )
+
+                new_ep.athena_events.append(
+                    Mode2AthenaEvent(
+                        event_type="initial_alert",
+                        timestamp_utc=now_iso,
+                        prompt_summary=f"HR spike: {pulse} bpm (baseline {baseline} bpm). {reason}",
+                        athena_reply=athena_resp.reply,
+                        emergency_trigger=athena_resp.emergency_trigger,
+                    )
+                )
+            else:
+                # Confirmed workout continuation: silent logging, NO duplicate question to user!
+                new_ep.athena_events.append(
+                    Mode2AthenaEvent(
+                        event_type="workout_continuation",
+                        timestamp_utc=now_iso,
+                        prompt_summary=f"Confirmed workout continued: pulse {pulse} bpm (baseline {baseline} bpm). {reason}",
+                        athena_reply="[Mode 2: Confirmed workout active, continuous observation without redundant prompt]",
+                        emergency_trigger=False,
+                    )
+                )
 
             self.save_episode(new_ep, commit=True)
             return new_ep
@@ -418,6 +593,13 @@ class Mode2VitalsMonitoringService:
         # ----------------------------------------------------------------------
         # SCENARIO B: ACTIVE EPISODE EXISTS
         # ----------------------------------------------------------------------
+        if active_ep.workout_context == Mode2WorkoutContext.UNKNOWN:
+            act_w = self.get_active_workout_session(cycle_id, as_of=now_dt)
+            if act_w is not None:
+                active_ep.workout_context = Mode2WorkoutContext.CONFIRMED_WORKOUT
+                if not active_ep.session_id:
+                    active_ep.session_id = act_w.session_id
+
         active_ep.telemetry_samples.append(
             Mode2TelemetryPoint(
                 timestamp_utc=now_iso,
@@ -633,6 +815,13 @@ class Mode2VitalsMonitoringService:
         lower_text = user_text.lower()
         if is_workout is True:
             active_ep.workout_context = Mode2WorkoutContext.CONFIRMED_WORKOUT
+            act_w = self._ensure_active_workout_session(
+                cycle_id=cycle_id,
+                confirmed_at=now_dt,
+                session_id=active_ep.session_id,
+            )
+            if not active_ep.session_id:
+                active_ep.session_id = act_w.session_id
         elif is_workout is False:
             active_ep.workout_context = Mode2WorkoutContext.NOT_WORKING_OUT
         else:
@@ -640,6 +829,17 @@ class Mode2VitalsMonitoringService:
                 active_ep.workout_context = Mode2WorkoutContext.NOT_WORKING_OUT
             elif any(kw in lower_text for kw in WORKOUT_AFFIRMATIVE_KEYWORDS):
                 active_ep.workout_context = Mode2WorkoutContext.CONFIRMED_WORKOUT
+                act_w = self._ensure_active_workout_session(
+                    cycle_id=cycle_id,
+                    confirmed_at=now_dt,
+                    session_id=active_ep.session_id,
+                )
+                if not active_ep.session_id:
+                    active_ep.session_id = act_w.session_id
+
+        # Check if user statement signals workout completion
+        if any(kw in lower_text for kw in WORKOUT_FINISH_KEYWORDS):
+            self.complete_workout_session(cycle_id=cycle_id, completed_at=now_dt)
 
         # 3. Detect dangerous symptoms / red flags
         combined_text = f"{user_text} {symptoms or ''}".lower()
@@ -736,6 +936,16 @@ class Mode2VitalsMonitoringService:
             active_ep.workout_context = Mode2WorkoutContext.NOT_WORKING_OUT
         elif any(kw in lower for kw in WORKOUT_AFFIRMATIVE_KEYWORDS):
             active_ep.workout_context = Mode2WorkoutContext.CONFIRMED_WORKOUT
+            act_w = self._ensure_active_workout_session(
+                cycle_id=cycle_id,
+                confirmed_at=now_dt,
+                session_id=active_ep.session_id,
+            )
+            if not active_ep.session_id:
+                active_ep.session_id = act_w.session_id
+
+        if any(kw in lower for kw in WORKOUT_FINISH_KEYWORDS):
+            self.complete_workout_session(cycle_id=cycle_id, completed_at=now_dt)
 
         self.save_episode(active_ep, commit=True)
         return active_ep

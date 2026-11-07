@@ -51,6 +51,17 @@ class WorkoutSessionRepository:
         if not session:
             return None
 
+        # Idempotent guard: if already completed, preserve status
+        if session.status == "completed":
+            return session
+        if session.status == "recovering":
+            # Session is already recovering; do not overwrite workout_completed_at on retried delivery
+            if physiological_end_time and not session.physiological_end_time:
+                session.physiological_end_time = physiological_end_time
+                self.db.commit()
+                self.db.refresh(session)
+            return session
+
         session.workout_completed_at = workout_completed_at or datetime.now(timezone.utc)
         if physiological_end_time:
             session.physiological_end_time = physiological_end_time

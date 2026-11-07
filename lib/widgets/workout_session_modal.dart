@@ -1,6 +1,8 @@
 import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
+import '../services/api/aegis_api_client.dart';
+import '../services/sync/vitals_sync_queue.dart';
 import '../services/vitals_monitor_service.dart';
 import '../services/health_data_provider.dart';
 import '../services/time_service.dart';
@@ -413,7 +415,29 @@ class _WorkoutSessionModalState extends State<WorkoutSessionModal> {
                       elevation: 0,
                     ),
                     onPressed: () {
+                      final sessionId = vitalsService.currentSessionId;
+                      final healthProvider = Provider.of<HealthDataProvider?>(context, listen: false);
+                      final syncQueue = Provider.of<VitalsSyncQueue?>(context, listen: false) ?? healthProvider?.syncQueue;
+                      final apiClient = Provider.of<AegisApiClient?>(context, listen: false);
+
                       vitalsService.finishWorkout();
+
+                      // Non-blocking, resilient offline-first notification to server
+                      if (syncQueue != null) {
+                        unawaited(syncQueue.notifyWorkoutFinished(
+                          sessionId: sessionId,
+                          apiClient: apiClient,
+                        ));
+                      } else if (apiClient != null) {
+                        final cycleId = healthProvider?.syncQueue?.activeCycleId;
+                        if (cycleId != null) {
+                          unawaited(apiClient.postWorkoutFinish(
+                            cycleId: cycleId,
+                            sessionId: sessionId,
+                          ).catchError((_) => <String, dynamic>{}));
+                        }
+                      }
+
                       Navigator.of(context).pop();
                     },
                     child: const Row(
