@@ -72,6 +72,7 @@ class AutomationJobType(str, Enum):
     WEEKLY_CONSILIUM_C = "weekly_consilium_step_c"
     LAB_REVISION = "lab_revision"
     REFERRAL_DOCUMENT_GENERATION = "referral_document_generation"
+    REFERRAL_FOLLOWUP_REMINDER = "referral_followup_reminder"
 
 
 class AutomationJobStatus(str, Enum):
@@ -238,6 +239,8 @@ class ClinicalAutomationService:
             return f"lab_revision_{clean_cycle}"
         if resolved_type == AutomationJobType.REFERRAL_DOCUMENT_GENERATION:
             return f"referral_doc_{clean_cycle}"
+        if resolved_type == AutomationJobType.REFERRAL_FOLLOWUP_REMINDER:
+            return f"referral_reminder_{clean_cycle}_i1"
         return f"auto_{resolved_type.value}_{clean_cycle}"
 
     @staticmethod
@@ -764,6 +767,135 @@ class ClinicalAutomationService:
             next_attempt_at_utc=eff_available,
         )
 
+    def enqueue_referral_followup_reminder(
+        self,
+        cycle_id: str,
+        patient_id: Optional[str] = None,
+        *,
+        referral_id: Optional[str] = None,
+        target_interval: Optional[int] = None,
+        available_at_utc: Optional[datetime] = None,
+        max_attempts: int = DEFAULT_JOB_MAX_ATTEMPTS,
+    ) -> Optional[AutomationJobRecord]:
+        """
+        Stage 8A.4: Enqueues a durable `referral_followup_reminder` job for an active
+        referral once a 168-hour interval has completed (or scheduled at `available_at_utc`).
+        Never enqueues for non-active cycles or `visit_confirmed` referrals.
+        """
+        clean_cycle = cycle_id.strip()
+        cycle = self.cycle_repo.get(clean_cycle)
+        if cycle is None or cycle.status != "active":
+            return None
+
+        effective_patient_id = (patient_id or cycle.patient_id or "").strip()
+        if not effective_patient_id:
+            return None
+
+        sched = self.weekly_service.get_referral_followup_reminder_schedule(
+            clean_cycle, as_of=self._now_utc()
+        )
+        if not sched.get("eligible"):
+            return None
+
+        eff_ref_id = (referral_id or sched.get("referral_id") or "").strip()
+        if not eff_ref_id:
+            return None
+
+        eff_interval = int(target_interval if target_interval is not None else sched.get("target_interval", 1))
+        if eff_interval < 1:
+            eff_interval = 1
+
+        if available_at_utc is not None:
+            eff_available = available_at_utc.isoformat()
+        else:
+            eff_available = str(sched.get("due_at_utc") or self._now_utc().isoformat())
+
+        idempotency_key = f"referral_reminder_{clean_cycle}_{eff_ref_id}_i{eff_interval}"
+        return self.enqueue_or_get_job(
+            patient_id=effective_patient_id,
+            cycle_id=clean_cycle,
+            job_type=AutomationJobType.REFERRAL_FOLLOWUP_REMINDER,
+            idempotency_key=idempotency_key,
+            max_attempts=max_attempts,
+            next_attempt_at_utc=eff_available,
+        )
+
+    def cancel_pending_referral_reminders(
+        self,
+        cycle_id: str,
+        *,
+        referral_id: Optional[str] = None,
+        reason: str = "visit_confirmed",
+        commit: bool = True,
+    ) -> int:
+        """
+        Stage 8A.4: Marks any PENDING or RETRYABLE_FAILURE `referral_followup_reminder`
+        jobs for `cycle_id` (and `referral_id` if provided) as COMPLETED with
+        `skipped=True` so confirmed visits or closed cycles never execute stale reminders.
+        """
+        clean_cycle = cycle_id.strip()
+        rows = (
+            self.db.query(ModelReport)
+            .filter(ModelReport.cycle_id == clean_cycle)
+            .filter(ModelReport.model == AUTOMATION_SCHEDULER_MODEL)
+            .filter(ModelReport.report_type.like(f"{AUTOMATION_JOB_REPORT_PREFIX}%"))
+            .populate_existing()
+            .all()
+        )
+        now_iso = self._now_utc().isoformat()
+        cancelled = 0
+        for row in rows:
+            content = dict(row.content or {})
+            if content.get("job_type") != AutomationJobType.REFERRAL_FOLLOWUP_REMINDER.value:
+                continue
+            if content.get("status") not in (
+                AutomationJobStatus.PENDING.value,
+                AutomationJobStatus.RETRYABLE_FAILURE.value,
+            ):
+                continue
+            idem = str(content.get("idempotency_key") or "")
+            if referral_id and f"_{referral_id}_" not in idem:
+                continue
+
+            content["status"] = AutomationJobStatus.COMPLETED.value
+            content["lease_owner_id"] = None
+            content["lease_expires_at_utc"] = None
+            content["updated_at_utc"] = now_iso
+            content["result_metadata"] = {
+                "skipped": True,
+                "reason": reason,
+                "cancelled_at_utc": now_iso,
+            }
+            row.content = content
+            row.version = int(row.version or 1) + 1
+            cancelled += 1
+
+        if commit and cancelled > 0:
+            self.db.commit()
+        return cancelled
+
+    def _has_due_weekly_consilium_job(self, cycle_id: str, now_dt: datetime) -> bool:
+        """
+        Returns True if a Weekly Consilium job (Step A, B, or C) is currently due or
+        actively running for `cycle_id` so Weekly Summary (Step C) delivers the active
+        referral follow-up first without racing a duplicate standalone reminder.
+        """
+        weekly_types = {
+            AutomationJobType.WEEKLY_CONSILIUM_A,
+            AutomationJobType.WEEKLY_CONSILIUM_B,
+            AutomationJobType.WEEKLY_CONSILIUM_C,
+        }
+        for job in self.list_jobs(cycle_id=cycle_id):
+            if job.job_type not in weekly_types:
+                continue
+            if job.status == AutomationJobStatus.RUNNING:
+                return True
+            if job.status in (AutomationJobStatus.PENDING, AutomationJobStatus.RETRYABLE_FAILURE):
+                next_dt = self._parse_iso_utc(job.next_attempt_at_utc)
+                if next_dt is None or next_dt <= now_dt:
+                    return True
+        return False
+
     def get_job_by_id(self, job_id: str) -> Optional[AutomationJobRecord]:
         row = (
             self.db.query(ModelReport)
@@ -1032,6 +1164,22 @@ class ClinicalAutomationService:
                 )
                 if ref_doc_job is not None:
                     discovered.append(ref_doc_job)
+
+            # Stage 8A.4: Discover due 168-hour Referral Follow-up Reminders for active cycles
+            now_dt = self._now_utc()
+            rem_sched = self.weekly_service.get_referral_followup_reminder_schedule(
+                cycle.cycle_id, as_of=now_dt
+            )
+            if rem_sched.get("eligible") and rem_sched.get("is_due"):
+                if not self._has_due_weekly_consilium_job(cycle.cycle_id, now_dt):
+                    rem_job = self.enqueue_referral_followup_reminder(
+                        cycle_id=cycle.cycle_id,
+                        patient_id=cycle.patient_id,
+                        referral_id=str(rem_sched.get("referral_id") or ""),
+                        target_interval=int(rem_sched.get("target_interval") or 1),
+                    )
+                    if rem_job is not None:
+                        discovered.append(rem_job)
 
         # Discover background Lab Revision tasks if enabled
         if self.enable_lab_revision:
@@ -2001,6 +2149,87 @@ class ClinicalAutomationService:
             "status": res.status,
         }
 
+    async def _execute_referral_followup_reminder(
+        self, job: AutomationJobRecord
+    ) -> Dict[str, Any]:
+        """
+        Stage 8A.4: Executes a server-scheduled 168-hour Referral Follow-up Reminder:
+        1. Validates patient/cycle ownership.
+        2. Gracefully skips with ZERO Gemini calls if the cycle is closed/completed,
+           if the referral is already `visit_confirmed`, if 168 hours have not yet
+           elapsed, or if Athena's Weekly Summary already covered this interval.
+        3. Sends at most ONE reminder message via `AthenaChatService.send_referral_followup_reminder`.
+        4. If Gemini/delivery fails, raises retryable error so the reminder is NOT marked sent.
+        """
+        cycle = self.cycle_repo.get(job.cycle_id)
+        if cycle is None or cycle.patient_id != job.patient_id:
+            raise ConsiliumCycleNotFoundError(
+                f"Cycle '{job.cycle_id}' not found for patient '{job.patient_id}'."
+            )
+
+        if cycle.status != "active":
+            return {
+                "skipped": True,
+                "reason": "cycle_not_active",
+                "cycle_status": cycle.status,
+            }
+
+        now_dt = self._now_utc()
+        sched = self.weekly_service.get_referral_followup_reminder_schedule(
+            job.cycle_id, as_of=now_dt
+        )
+        if not sched.get("eligible"):
+            return {
+                "skipped": True,
+                "reason": str(sched.get("reason") or "not_eligible"),
+            }
+
+        active_ref_id = str(sched.get("referral_id") or "")
+        m_int = re.search(r"_i(\d+)$", job.idempotency_key)
+        job_interval = int(m_int.group(1)) if m_int else int(sched.get("target_interval") or 1)
+
+        if active_ref_id and f"_{active_ref_id}_" not in job.idempotency_key:
+            return {
+                "skipped": True,
+                "reason": "referral_superseded",
+                "active_referral_id": active_ref_id,
+            }
+
+        if int(sched.get("covered_up_to_interval") or 0) >= job_interval:
+            return {
+                "skipped": True,
+                "reason": "interval_already_covered",
+                "covered_up_to_interval": sched.get("covered_up_to_interval"),
+            }
+
+        if not sched.get("is_due"):
+            return {
+                "skipped": True,
+                "reason": "not_due_before_168h",
+                "due_at_utc": sched.get("due_at_utc"),
+            }
+
+        eff_interval = max(job_interval, int(sched.get("target_interval") or 1))
+        chat_resp = await self.athena_service.send_referral_followup_reminder(
+            cycle_id=job.cycle_id,
+            referral_id=active_ref_id,
+            target_interval=eff_interval,
+            idempotency_key=job.idempotency_key,
+        )
+        if chat_resp is None:
+            return {
+                "skipped": True,
+                "reason": "skipped_at_commit_guard",
+            }
+
+        return {
+            "skipped": False,
+            "referral_id": active_ref_id,
+            "target_interval": eff_interval,
+            "message_id": chat_resp.message_id,
+            "created_at_utc": chat_resp.created_at,
+        }
+
     async def execute_claimed_job(self, claimed: AutomationJobRecord) -> AutomationJobRecord:
         if not claimed.lease_owner_id:
             raise ConsiliumConcurrencyConflictError(
@@ -2062,6 +2291,12 @@ class ClinicalAutomationService:
                     claimed.job_id,
                     lease_owner_id,
                     lambda: self._execute_referral_document_generation(claimed),
+                )
+            elif claimed.job_type == AutomationJobType.REFERRAL_FOLLOWUP_REMINDER:
+                result_meta = await self._execute_with_job_lease_renewal(
+                    claimed.job_id,
+                    lease_owner_id,
+                    lambda: self._execute_referral_followup_reminder(claimed),
                 )
             else:
                 raise ValueError(f"Unsupported automation job_type '{claimed.job_type}'.")

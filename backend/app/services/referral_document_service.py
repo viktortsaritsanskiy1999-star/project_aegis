@@ -959,9 +959,14 @@ class ReferralDocumentService:
             cleared_pending = None if (latest_pending in (None, target_sprint_id)) else latest_pending
 
             updated_lifecycle: Dict[str, Any] = dict(latest_ref_state)
+            next_status = (
+                "visit_confirmed"
+                if latest_ref_state.get("status") == "visit_confirmed"
+                else "document_ready"
+            )
             updated_lifecycle.update(
                 {
-                    "status": "document_ready",
+                    "status": next_status,
                     "document_report_id": client_report.report_id,
                     "raw_document_report_id": raw_report.report_id,
                     "document_ready_at_utc": now_iso,
@@ -999,7 +1004,7 @@ class ReferralDocumentService:
             document_report_id=client_report.report_id,
             raw_document_report_id=raw_report.report_id,
             document_version=client_report.version,
-            status="document_ready",
+            status=next_status,
             created_at_utc=now_iso,
             reused_existing=False,
         )
@@ -1022,10 +1027,16 @@ class ReferralDocumentService:
         if client_doc.report_id not in history_ids:
             history_ids.append(client_doc.report_id)
 
-        updated = dict(ref_state)
+        latest_state = self.weekly_service.get_referral_lifecycle_state(cycle_id) or dict(ref_state)
+        updated = dict(latest_state)
+        next_status = (
+            "visit_confirmed"
+            if latest_state.get("status") == "visit_confirmed"
+            else "document_ready"
+        )
         updated.update(
             {
-                "status": "document_ready",
+                "status": next_status,
                 "document_report_id": client_doc.report_id,
                 "raw_document_report_id": doc_metrics.get("raw_document_report_id") or ref_state.get("raw_document_report_id"),
                 "document_ready_at_utc": ref_state.get("document_ready_at_utc") or now_iso,

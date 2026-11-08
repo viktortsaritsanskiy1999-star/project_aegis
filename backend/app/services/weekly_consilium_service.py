@@ -37,6 +37,7 @@ from app.services.consilium_prompts import (
     build_weekly_flash_prompt,
     build_weekly_pro_prompt,
     build_athena_system_prompt,
+    build_athena_referral_context_block,
 )
 from app.services.gemini_gateway import GeminiGateway, GeminiModelRole
 from app.services.primary_consilium_service import (
@@ -58,6 +59,8 @@ WEEKLY_DEPUTY_INTERNAL_REPORT_TYPE = "weekly_deputy_internal"
 WEEKLY_CHIEF_INTERNAL_REPORT_TYPE = "weekly_chief_physician_internal"
 WEEKLY_OVERALL_CLIENT_REPORT_TYPE = "weekly_user_overall_report"
 REFERRAL_LIFECYCLE_STATE_REPORT_TYPE = "referral_lifecycle_state"
+REFERRAL_REMINDER_INTERVAL_HOURS: int = 168
+REFERRAL_WRAPUP_DEDUP_WINDOW_HOURS: int = 144
 
 WEEKLY_CONSILIUM_LOCK_TTL_SECONDS: int = 120
 WEEKLY_CONSILIUM_LOCK_HEARTBEAT_SECONDS: float = 15.0
@@ -866,6 +869,22 @@ class WeeklyConsiliumService:
                 "referral_id": state.get("referral_id"),
                 "urgency": state.get("urgency"),
                 "target_specialties": list(state.get("target_specialties") or []),
+                "clinical_reason_for_referral": state.get("clinical_reason_for_referral"),
+                "observed_syndromes_or_trends": list(state.get("observed_syndromes_or_trends") or []),
+                "recommended_workup_for_doctor_discussion": list(
+                    state.get("recommended_workup_for_doctor_discussion") or []
+                ),
+                "sprint_id": state.get("sprint_id"),
+                "sprint_number": state.get("sprint_number"),
+                "origin_sprint_number": state.get("origin_sprint_number") or state.get("sprint_number"),
+                "created_at_utc": state.get("created_at_utc"),
+                "decision_date_utc": state.get("decision_date_utc"),
+                "last_reminder_at_utc": state.get("last_reminder_at_utc"),
+                "reminder_count": int(state.get("reminder_count") or 0),
+                "covered_up_to_interval": int(state.get("covered_up_to_interval") or 0),
+                "visit_confirmed_at_utc": state.get("visit_confirmed_at_utc"),
+                "visit_confirmation_turn_id": state.get("visit_confirmation_turn_id"),
+                "visit_confirmation_note": state.get("visit_confirmation_note"),
             }
 
         is_failed = gen_state in ("retryable_failure", "terminal_failure")
@@ -899,10 +918,367 @@ class WeeklyConsiliumService:
             "urgency": state.get("urgency"),
             "target_specialties": list(state.get("target_specialties") or []),
             "clinical_reason_for_referral": state.get("clinical_reason_for_referral"),
+            "observed_syndromes_or_trends": list(state.get("observed_syndromes_or_trends") or []),
+            "recommended_workup_for_doctor_discussion": list(
+                state.get("recommended_workup_for_doctor_discussion") or []
+            ),
+            "sprint_id": state.get("sprint_id"),
+            "sprint_number": state.get("sprint_number"),
+            "origin_sprint_number": state.get("origin_sprint_number") or state.get("sprint_number"),
             "created_at_utc": state.get("created_at_utc"),
+            "decision_date_utc": state.get("decision_date_utc"),
+            "last_reminder_at_utc": state.get("last_reminder_at_utc"),
+            "reminder_count": int(state.get("reminder_count") or 0),
+            "covered_up_to_interval": int(state.get("covered_up_to_interval") or 0),
+            "initial_wrapup_notified_at_utc": state.get("initial_wrapup_notified_at_utc"),
+            "last_weekly_wrapup_referral_at_utc": state.get("last_weekly_wrapup_referral_at_utc"),
+            "last_weekly_wrapup_sprint_number": state.get("last_weekly_wrapup_sprint_number"),
             "last_generation_error_type": state.get("last_generation_error_type"),
             "last_generation_failed_at_utc": state.get("last_generation_failed_at_utc"),
         }
+
+    def should_include_referral_in_weekly_wrapup(
+        self,
+        cycle_id: str,
+        sprint_number: int,
+        as_of: Optional[datetime] = None,
+    ) -> Dict[str, Any]:
+        """
+        Stage 8A.4: Determines whether Athena's Weekly Summary (Step C) should include
+        the active Referral announcement/follow-up and which 168-hour interval (if any)
+        it covers so Weekly Summary and standalone 168-hour reminders never duplicate
+        each other in the same period.
+        """
+        cycle = self.cycle_repo.get(cycle_id)
+        ref_state = self.get_referral_state_for_athena(cycle_id)
+        if cycle is None or cycle.status != "active" or not ref_state.get("has_active_referral"):
+            return {
+                "include_referral": False,
+                "reason": "no_active_referral",
+                "covers_interval": None,
+                "referral_state": ref_state,
+            }
+
+        now_dt = as_of or self._now_utc()
+        if now_dt.tzinfo is None:
+            now_dt = now_dt.replace(tzinfo=timezone.utc)
+        else:
+            now_dt = now_dt.astimezone(timezone.utc)
+
+        anchor_dt = self._parse_iso_datetime_utc(ref_state.get("created_at_utc")) or now_dt
+        elapsed_hours = max(0.0, (now_dt - anchor_dt).total_seconds() / 3600.0)
+        completed_intervals = int(elapsed_hours // REFERRAL_REMINDER_INTERVAL_HOURS)
+        covered_up_to = int(ref_state.get("covered_up_to_interval") or 0)
+        initial_notified = ref_state.get("initial_wrapup_notified_at_utc")
+
+        # Initial announcement in the Weekly Summary for a newly issued referral
+        if not initial_notified and int(ref_state.get("reminder_count") or 0) == 0:
+            return {
+                "include_referral": True,
+                "mode": "initial_announcement",
+                "covers_interval": completed_intervals if completed_intervals >= 1 else None,
+                "referral_state": ref_state,
+            }
+
+        # Subsequent Weekly Summary while referral remains active:
+        # Check if a standalone reminder or prior wrap-up was sent very recently
+        last_rem_dt = self._parse_iso_datetime_utc(ref_state.get("last_reminder_at_utc"))
+        last_wrap_dt = self._parse_iso_datetime_utc(ref_state.get("last_weekly_wrapup_referral_at_utc"))
+        latest_notif_dt: Optional[datetime] = None
+        for dt_cand in (last_rem_dt, last_wrap_dt):
+            if dt_cand is not None and (latest_notif_dt is None or dt_cand > latest_notif_dt):
+                latest_notif_dt = dt_cand
+
+        if latest_notif_dt is not None:
+            hours_since_last = (now_dt - latest_notif_dt).total_seconds() / 3600.0
+            if hours_since_last < REFERRAL_WRAPUP_DEDUP_WINDOW_HOURS:
+                return {
+                    "include_referral": False,
+                    "reason": "recent_referral_notification_already_sent",
+                    "covers_interval": None,
+                    "referral_state": ref_state,
+                }
+
+        if completed_intervals >= 1:
+            candidate_interval = completed_intervals
+        elif elapsed_hours >= REFERRAL_WRAPUP_DEDUP_WINDOW_HOURS:
+            candidate_interval = 1
+        else:
+            return {
+                "include_referral": False,
+                "reason": "within_initial_interval_before_168h",
+                "covers_interval": None,
+                "referral_state": ref_state,
+            }
+
+        if candidate_interval <= covered_up_to:
+            return {
+                "include_referral": False,
+                "reason": "interval_already_covered",
+                "covers_interval": None,
+                "referral_state": ref_state,
+            }
+
+        return {
+            "include_referral": True,
+            "mode": "periodic_followup",
+            "covers_interval": candidate_interval,
+            "referral_state": ref_state,
+        }
+
+    def record_weekly_wrapup_referral_delivery(
+        self,
+        *,
+        cycle_id: str,
+        referral_id: str,
+        sprint_number: int,
+        message_id: str,
+        covers_interval: Optional[int],
+        sent_at_utc: Optional[str] = None,
+        commit: bool = True,
+    ) -> Optional[ModelReport]:
+        """
+        Records on the latest `referral_lifecycle_state` version that Athena's Weekly
+        Summary communicated the active referral, advancing `covered_up_to_interval`
+        when covering a completed 168-hour period WITHOUT resetting `created_at_utc`.
+        """
+        latest = self._get_latest_referral_lifecycle_report(cycle_id)
+        if latest is None or not latest.content:
+            return None
+        prior = dict(latest.content)
+        if prior.get("referral_id") != referral_id:
+            return None
+        if prior.get("status") not in ("generating_document", "document_ready"):
+            return None
+
+        eff_iso = sent_at_utc or self._now_utc().isoformat()
+        updated = dict(prior)
+        if not updated.get("initial_wrapup_notified_at_utc"):
+            updated["initial_wrapup_notified_at_utc"] = eff_iso
+        updated["last_weekly_wrapup_referral_at_utc"] = eff_iso
+        updated["last_weekly_wrapup_sprint_number"] = sprint_number
+        updated["last_weekly_wrapup_message_id"] = message_id
+        if covers_interval is not None and covers_interval >= 1:
+            prior_cov = int(updated.get("covered_up_to_interval") or 0)
+            updated["covered_up_to_interval"] = max(prior_cov, int(covers_interval))
+        updated["updated_at_utc"] = eff_iso
+
+        return self.report_repo.create_next_version(
+            cycle_id=cycle_id,
+            sprint_id=latest.sprint_id,
+            model=self.gateway.pro_model,
+            report_type=REFERRAL_LIFECYCLE_STATE_REPORT_TYPE,
+            privacy_level=PrivacyLevel.SERVER_ONLY,
+            content=updated,
+            commit=commit,
+        )
+
+    def get_referral_followup_reminder_schedule(
+        self,
+        cycle_id: str,
+        as_of: Optional[datetime] = None,
+    ) -> Dict[str, Any]:
+        """
+        Stage 8A.4: Deterministically computes from server state whether a 168-hour
+        referral follow-up reminder is eligible and currently due for `cycle_id`.
+        Enforces:
+        - Cycle must exist and have status == 'active';
+        - Latest referral_lifecycle_state must be active ('generating_document' or 'document_ready');
+        - Never due before 168 hours from `created_at_utc`;
+        - At most one reminder per completed 168-hour interval;
+        - Never duplicates a period already covered by Athena's Weekly Summary;
+        - Never fires sooner than 168 hours after a prior periodic reminder/wrap-up follow-up.
+        """
+        cycle = self.cycle_repo.get(cycle_id)
+        if cycle is None or cycle.status != "active":
+            return {
+                "eligible": False,
+                "is_due": False,
+                "reason": "cycle_not_active",
+            }
+
+        state = self.get_referral_lifecycle_state(cycle_id)
+        if not state:
+            return {
+                "eligible": False,
+                "is_due": False,
+                "reason": "no_referral",
+            }
+
+        status_val = str(state.get("status") or "none")
+        if status_val not in ("generating_document", "document_ready"):
+            return {
+                "eligible": False,
+                "is_due": False,
+                "reason": f"referral_status_{status_val}",
+                "referral_id": state.get("referral_id"),
+            }
+
+        now_dt = as_of or self._now_utc()
+        if now_dt.tzinfo is None:
+            now_dt = now_dt.replace(tzinfo=timezone.utc)
+        else:
+            now_dt = now_dt.astimezone(timezone.utc)
+
+        anchor_dt = self._parse_iso_datetime_utc(state.get("created_at_utc"))
+        if anchor_dt is None:
+            return {
+                "eligible": False,
+                "is_due": False,
+                "reason": "missing_created_at_anchor",
+            }
+
+        covered_up_to = int(state.get("covered_up_to_interval") or 0)
+        reminder_count = int(state.get("reminder_count") or 0)
+        next_interval_floor = covered_up_to + 1
+
+        due_dt = anchor_dt + timedelta(hours=REFERRAL_REMINDER_INTERVAL_HOURS * next_interval_floor)
+
+        last_rem_dt = self._parse_iso_datetime_utc(state.get("last_reminder_at_utc"))
+        if last_rem_dt is not None:
+            cand_dt = last_rem_dt + timedelta(hours=REFERRAL_REMINDER_INTERVAL_HOURS)
+            if cand_dt > due_dt:
+                due_dt = cand_dt
+
+        # If a periodic Weekly Summary covered an interval >= 1, also respect 168h spacing from it
+        if covered_up_to >= 1:
+            last_wrap_dt = self._parse_iso_datetime_utc(state.get("last_weekly_wrapup_referral_at_utc"))
+            if last_wrap_dt is not None:
+                cand_wrap_dt = last_wrap_dt + timedelta(hours=REFERRAL_REMINDER_INTERVAL_HOURS)
+                if cand_wrap_dt > due_dt:
+                    due_dt = cand_wrap_dt
+
+        is_due = now_dt >= due_dt
+        elapsed_hours = max(0.0, (now_dt - anchor_dt).total_seconds() / 3600.0)
+        completed_intervals = int(elapsed_hours // REFERRAL_REMINDER_INTERVAL_HOURS)
+        target_interval = max(next_interval_floor, completed_intervals) if is_due else next_interval_floor
+
+        return {
+            "eligible": True,
+            "is_due": is_due,
+            "referral_id": state.get("referral_id"),
+            "cycle_id": cycle_id,
+            "patient_id": cycle.patient_id,
+            "target_interval": target_interval,
+            "covered_up_to_interval": covered_up_to,
+            "reminder_count": reminder_count,
+            "due_at_utc": due_dt.isoformat(),
+            "created_at_utc": anchor_dt.isoformat(),
+        }
+
+    def record_referral_reminder_sent(
+        self,
+        *,
+        cycle_id: str,
+        referral_id: str,
+        target_interval: int,
+        message_id: str,
+        sent_at_utc: Optional[str] = None,
+        commit: bool = True,
+    ) -> Optional[ModelReport]:
+        """
+        Stage 8A.4: Atomically updates the latest `referral_lifecycle_state` after a
+        168-hour follow-up reminder chat message has been persisted.
+        Idempotent against duplicate retries or multi-interval catch-up after downtime.
+        """
+        cycle = self.cycle_repo.get(cycle_id)
+        if cycle is None or cycle.status != "active":
+            return None
+
+        latest = self._get_latest_referral_lifecycle_report(cycle_id)
+        if latest is None or not latest.content:
+            return None
+        prior = dict(latest.content)
+        if prior.get("referral_id") != referral_id:
+            return None
+        if prior.get("status") not in ("generating_document", "document_ready"):
+            return None
+
+        prior_covered = int(prior.get("covered_up_to_interval") or 0)
+        if prior_covered >= target_interval or prior.get("last_reminder_message_id") == message_id:
+            return latest
+
+        eff_dt = self._parse_iso_datetime_utc(sent_at_utc) or self._now_utc()
+        eff_iso = eff_dt.isoformat()
+        anchor_dt = self._parse_iso_datetime_utc(prior.get("created_at_utc")) or eff_dt
+        completed_now = int(max(0.0, (eff_dt - anchor_dt).total_seconds() / 3600.0) // REFERRAL_REMINDER_INTERVAL_HOURS)
+
+        updated = dict(prior)
+        updated["reminder_count"] = int(prior.get("reminder_count") or 0) + 1
+        updated["last_reminder_at_utc"] = eff_iso
+        updated["last_reminder_message_id"] = message_id
+        updated["covered_up_to_interval"] = max(prior_covered, int(target_interval), completed_now)
+        updated["updated_at_utc"] = eff_iso
+
+        return self.report_repo.create_next_version(
+            cycle_id=cycle_id,
+            sprint_id=latest.sprint_id,
+            model=self.gateway.pro_model,
+            report_type=REFERRAL_LIFECYCLE_STATE_REPORT_TYPE,
+            privacy_level=PrivacyLevel.SERVER_ONLY,
+            content=updated,
+            commit=commit,
+        )
+
+    def confirm_referral_visit(
+        self,
+        *,
+        cycle_id: str,
+        turn_id: str,
+        confirmed_at_utc: Optional[str] = None,
+        context_note: Optional[str] = None,
+        commit: bool = True,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Stage 8A.4: Transitions the latest active `referral_lifecycle_state` to
+        `status = 'visit_confirmed'` upon verified structured `COMPLETED_VISIT` event.
+        Preserves `document_report_id` and `document_history_report_ids` so Safe history
+        remains intact. Never starts Neo or closes the medical cycle.
+        """
+        cycle = self.cycle_repo.get(cycle_id)
+        if cycle is None or cycle.status != "active":
+            return None
+
+        latest = self._get_latest_referral_lifecycle_report(cycle_id)
+        if latest is None or not latest.content:
+            return None
+        prior = dict(latest.content)
+        current_status = str(prior.get("status") or "none")
+
+        if current_status == "visit_confirmed":
+            return prior
+        if current_status not in ("generating_document", "document_ready"):
+            return None
+
+        eff_iso = confirmed_at_utc or self._now_utc().isoformat()
+        history_ids: List[str] = list(prior.get("document_history_report_ids") or [])
+        doc_id = prior.get("document_report_id")
+        if doc_id and str(doc_id) not in history_ids:
+            history_ids.append(str(doc_id))
+
+        updated = dict(prior)
+        updated["status"] = "visit_confirmed"
+        updated["document_history_report_ids"] = history_ids
+        updated["visit_confirmed_at_utc"] = eff_iso
+        updated["visit_confirmation_turn_id"] = turn_id
+        updated["visit_confirmation_source"] = "patient_self_report_structured_event"
+        updated["visit_confirmation_note"] = (
+            context_note.strip()
+            if (isinstance(context_note, str) and context_note.strip())
+            else "Patient self-reported completed in-person clinician visit in Athena chat (not independent clinical verification)."
+        )
+        updated["updated_at_utc"] = eff_iso
+
+        self.report_repo.create_next_version(
+            cycle_id=cycle_id,
+            sprint_id=latest.sprint_id,
+            model=self.gateway.pro_model,
+            report_type=REFERRAL_LIFECYCLE_STATE_REPORT_TYPE,
+            privacy_level=PrivacyLevel.SERVER_ONLY,
+            content=updated,
+            commit=commit,
+        )
+        return updated
 
     def record_referral_document_generation_status(
         self,
@@ -1092,6 +1468,8 @@ class WeeklyConsiliumService:
                 "patient_id": patient_id,
                 "sprint_id": sprint_id,
                 "sprint_number": sprint_number,
+                "origin_sprint_id": prior_content.get("origin_sprint_id") or prior_content.get("sprint_id") or sprint_id,
+                "origin_sprint_number": prior_content.get("origin_sprint_number") or prior_content.get("sprint_number") or sprint_number,
                 "referral_source": prior_content.get("referral_source") or "weekly_consilium_pro",
                 "status": current_status,
                 "urgency": effective_urgency,
@@ -1109,7 +1487,13 @@ class WeeklyConsiliumService:
                 "last_generation_error_type": None,
                 "last_generation_failed_at_utc": None,
                 "last_reminder_at_utc": last_reminder_at,
+                "last_reminder_message_id": prior_content.get("last_reminder_message_id"),
                 "reminder_count": reminder_count,
+                "covered_up_to_interval": int(prior_content.get("covered_up_to_interval") or 0),
+                "initial_wrapup_notified_at_utc": prior_content.get("initial_wrapup_notified_at_utc"),
+                "last_weekly_wrapup_referral_at_utc": prior_content.get("last_weekly_wrapup_referral_at_utc"),
+                "last_weekly_wrapup_sprint_number": prior_content.get("last_weekly_wrapup_sprint_number"),
+                "last_weekly_wrapup_message_id": prior_content.get("last_weekly_wrapup_message_id"),
                 "visit_confirmed_at_utc": None,
                 "visit_confirmation_turn_id": None,
                 "created_at_utc": created_at_utc,
@@ -1127,6 +1511,15 @@ class WeeklyConsiliumService:
             )
 
         # New referral (either first referral in cycle or previous was 'visit_confirmed')
+        prior_history_ids: List[str] = []
+        if latest_report is not None and latest_report.content:
+            for hid in list(latest_report.content.get("document_history_report_ids") or []):
+                if hid and hid not in prior_history_ids:
+                    prior_history_ids.append(str(hid))
+            prev_doc = latest_report.content.get("document_report_id")
+            if prev_doc and str(prev_doc) not in prior_history_ids:
+                prior_history_ids.append(str(prev_doc))
+
         new_referral_id = str(uuid.uuid4())
         new_content: Dict[str, Any] = {
             "referral_id": new_referral_id,
@@ -1134,6 +1527,8 @@ class WeeklyConsiliumService:
             "patient_id": patient_id,
             "sprint_id": sprint_id,
             "sprint_number": sprint_number,
+            "origin_sprint_id": sprint_id,
+            "origin_sprint_number": sprint_number,
             "referral_source": "weekly_consilium_pro",
             "status": "generating_document",
             "urgency": decision.urgency,
@@ -1146,12 +1541,18 @@ class WeeklyConsiliumService:
             "document_ready_at_utc": None,
             "generated_for_sprint_id": None,
             "pending_document_sprint_id": sprint_id,
-            "document_history_report_ids": [],
+            "document_history_report_ids": prior_history_ids,
             "document_generation_state": "pending",
             "last_generation_error_type": None,
             "last_generation_failed_at_utc": None,
             "last_reminder_at_utc": None,
+            "last_reminder_message_id": None,
             "reminder_count": 0,
+            "covered_up_to_interval": 0,
+            "initial_wrapup_notified_at_utc": None,
+            "last_weekly_wrapup_referral_at_utc": None,
+            "last_weekly_wrapup_sprint_number": None,
+            "last_weekly_wrapup_message_id": None,
             "visit_confirmed_at_utc": None,
             "visit_confirmation_turn_id": None,
             "created_at_utc": now_iso,
@@ -1584,6 +1985,11 @@ class WeeklyConsiliumService:
             lines.append(f"🚩 Symptoms: {symptoms_str}")
             lines.append(f"⚠️ Red Flags: {str(log.red_flags).lower()}")
             lines.append(f"📝 Summary for Chief Physician: {log.summary_for_master}")
+            if log.referral_visit_event == "COMPLETED_VISIT":
+                lines.append(
+                    "📋 Patient Self-Reported Doctor Visit: COMPLETED_VISIT "
+                    "(patient self-report; requires independent clinical verification)"
+                )
             lines.append("--------------------------------------------------")
         return "\n".join(lines)
 
@@ -1796,7 +2202,12 @@ class WeeklyConsiliumService:
             ]
         )
 
-        system_prompt = build_athena_system_prompt(full_curator_context)
+        ref_state = self.get_referral_state_for_athena(cycle_id)
+        referral_ctx_block = build_athena_referral_context_block(ref_state)
+        system_prompt = build_athena_system_prompt(
+            full_curator_context,
+            referral_context_block=referral_ctx_block,
+        )
         chat_history = self.get_athena_chat_history(cycle_id)
 
         return ActiveAthenaStrategyContext(

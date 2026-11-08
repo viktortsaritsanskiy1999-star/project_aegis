@@ -349,5 +349,20 @@ class AthenaWeeklyWrapupOutput(BaseModel):
 
     message: str = Field(
         ...,
-        description="Понятное, дружелюбное итоговое сообщение от Афины пользователю с приглашением открыть силуэт человека",
+        min_length=1,
+        description="Clear, warm weekly summary message from Athena to the user inviting them to open the Safe / human silhouette.",
+    )
+
+
+class AthenaReferralReminderOutput(BaseModel):
+    """
+    Stage 8A.4: Structured output from Gemini Flash for Athena's 168-hour
+    referral follow-up reminder message.
+    """
+    model_config = ConfigDict(extra="ignore")
+
+    message: str = Field(
+        ...,
+        min_length=1,
+        description="Calm, supportive English follow-up reminder message from Athena regarding the active in-person medical referral.",
     )

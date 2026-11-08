@@ -1428,7 +1428,10 @@ async def test_28b_wrapup_message_honest_about_no_data_and_missing_telemetry(tmp
         if "You are the Head of Department" in prompt or "weekly_deputy" in prompt.lower():
             return httpx.Response(200, json=_gemini_envelope(_sample_weekly_flash_output()))
         if "Internal Athena Weekly Wrap-up Message Formulation" in prompt:
-            assert "КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО утверждать о стабильности" in prompt
+            assert (
+                "NEVER claim guaranteed stability" in prompt
+                or "КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО утверждать о стабильности" in prompt
+            )
             assert "Недостаточно телеметрии" in prompt or "NO_DATA" in prompt
             honest_resp = {
                 "message": (

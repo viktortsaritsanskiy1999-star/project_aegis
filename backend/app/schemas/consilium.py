@@ -620,9 +620,44 @@ class AthenaClinicalLogEntry(BaseModel):
     adherence_to_plan: str = Field(default="UNKNOWN", min_length=1, max_length=32)
     red_flags: bool = Field(default=False)
     summary_for_master: str = Field(..., min_length=1)
+    referral_visit_event: Optional[
+        Literal[
+            "NONE",
+            "COMPLETED_VISIT",
+            "FUTURE_OR_BOOKED",
+            "NOT_YET_OR_NEGATED",
+            "UNCLEAR_NEEDS_CLARIFICATION",
+        ]
+    ] = Field(default=None)
+    referral_visit_context_note: Optional[str] = Field(default=None, max_length=500)
     timestamp: Optional[str] = Field(default=None, max_length=64)
     sprint_day: Optional[int] = Field(default=None, ge=1, le=7)
     event_type: Optional[str] = Field(default=None, max_length=64)
+
+    @field_validator("referral_visit_event", mode="before")
+    @classmethod
+    def normalize_referral_visit_event(cls, v: Any) -> Optional[str]:
+        if v is None:
+            return None
+        s = str(v).strip().upper()
+        if not s:
+            return None
+        allowed = {
+            "NONE",
+            "COMPLETED_VISIT",
+            "FUTURE_OR_BOOKED",
+            "NOT_YET_OR_NEGATED",
+            "UNCLEAR_NEEDS_CLARIFICATION",
+        }
+        if s in allowed:
+            return s
+        if s in ("FUTURE", "BOOKED", "PLANNED", "FUTURE_INTENT"):
+            return "FUTURE_OR_BOOKED"
+        if s in ("NOT_YET", "NEGATED", "NEGATION", "NO"):
+            return "NOT_YET_OR_NEGATED"
+        if s in ("AMBIGUOUS", "UNCLEAR", "CLARIFY"):
+            return "UNCLEAR_NEEDS_CLARIFICATION"
+        return "UNCLEAR_NEEDS_CLARIFICATION"
 
 
 class ActiveAthenaStrategyContext(BaseModel):

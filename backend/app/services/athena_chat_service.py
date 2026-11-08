@@ -24,6 +24,7 @@ from app.schemas.chat import (
     AthenaChatResponse,
     AthenaChatMessageItem,
     AthenaChatHistoryResponse,
+    AthenaReferralReminderOutput,
     AthenaVitalsAlertContext,
     AthenaWeeklyWrapupOutput,
 )
@@ -33,7 +34,10 @@ from app.schemas.consilium import (
 )
 from app.schemas.privacy import PrivacyLevel
 from app.services.consilium_prompts import (
+    build_athena_referral_context_block,
+    build_athena_referral_followup_reminder_prompt,
     build_athena_system_prompt,
+    build_athena_turn_referral_addendum,
     build_athena_weekly_wrapup_prompt,
 )
 from app.services.gemini_gateway import GeminiGateway, GeminiModelRole
@@ -465,6 +469,7 @@ class AthenaChatService:
                 request,
                 resolved_cycle_id,
                 effective_sprint_day=effective_sprint_day,
+                chat_history=chat_history,
             )
 
             # 6. Build Multi-Turn Conversation Contents for Gemini
@@ -526,7 +531,14 @@ class AthenaChatService:
                     )
 
                     # 8. Post-Processing: Extract Structured Signals, Sanitize Reply & Flush Clinical Log
-                    clean_reply, emergency_triggered, emergency_notice, parsed_prog = self._process_and_persist_reports(
+                    (
+                        clean_reply,
+                        emergency_triggered,
+                        emergency_notice,
+                        parsed_prog,
+                        parsed_clinical_entry,
+                        clinical_report_parsed_ok,
+                    ) = self._process_and_persist_reports(
                         cycle_id=resolved_cycle_id,
                         sprint_id=active_sprint_id,
                         raw_response=raw_response,
@@ -556,6 +568,41 @@ class AthenaChatService:
                         commit=False,
                     )
 
+                    # 9b. Stage 8A.4: Contextual Doctor Visit Confirmation (strictly via structured COMPLETED_VISIT event)
+                    has_patient_reply = bool(request.message and request.message.strip())
+                    cycle_row = self.cycle_repo.get(resolved_cycle_id)
+                    if (
+                        cycle_row is not None
+                        and cycle_row.status == "active"
+                        and not used_emergency_fallback
+                        and clinical_report_parsed_ok
+                        and parsed_clinical_entry is not None
+                        and parsed_clinical_entry.referral_visit_event == "COMPLETED_VISIT"
+                        and has_patient_reply
+                        and request.event_type in ("user_message", "routine_answer", "out_of_turn_message", "daily_pulse")
+                    ):
+                        confirmed_ref = self.weekly_service.confirm_referral_visit(
+                            cycle_id=resolved_cycle_id,
+                            turn_id=message_id,
+                            confirmed_at_utc=turn_now_iso,
+                            context_note=parsed_clinical_entry.referral_visit_context_note,
+                            commit=False,
+                        )
+                        if confirmed_ref is not None:
+                            from app.services.clinical_automation_service import ClinicalAutomationService
+
+                            auto_svc = ClinicalAutomationService(
+                                db=self.db,
+                                gateway=self.gateway,
+                                now_provider=self.now_provider,
+                            )
+                            auto_svc.cancel_pending_referral_reminders(
+                                resolved_cycle_id,
+                                referral_id=str(confirmed_ref.get("referral_id")) if confirmed_ref.get("referral_id") else None,
+                                reason="visit_confirmed",
+                                commit=False,
+                            )
+
                     # 10. Update / Record routine question state & Goal Progression (Stage 2)
                     turn_question_id: Optional[str] = None
                     turn_routine_status: Optional[str] = None
@@ -569,7 +616,6 @@ class AthenaChatService:
                     )
                     active_plan = plan_svc.get_active_weekly_plan(resolved_cycle_id)
 
-                    has_patient_reply = bool(request.message and request.message.strip())
                     is_mode2_active = self._is_mode2_active_for_cycle(resolved_cycle_id)
 
                     # If Mode 2 is active, user messages are part of operational accompaniment, not routine daily check-in
@@ -1041,21 +1087,32 @@ class AthenaChatService:
                 user_summary = (
                     target_report.content.get("summary")
                     or target_report.content.get("title")
-                    or "Итоги недели подведены."
+                    or "Weekly health summary completed."
                 )
                 highlights = target_report.content.get("highlights") or []
             else:
                 user_summary = (
-                    f"Семидневная неделя сопровождения (Неделя №{sprint_number}) завершена. "
-                    "Доступные объективные показатели обработаны и зафиксированы в медицинском сейфе."
+                    f"Week {sprint_number} of health accompaniment has concluded. "
+                    "Available objective indicators have been processed and recorded in the medical vault (Safe)."
                 )
                 highlights = []
+
+            # 1b. Stage 8A.4: Determine whether an active referral should be announced/followed up in this Weekly Summary
+            wrapup_ref_plan = self.weekly_service.should_include_referral_in_weekly_wrapup(
+                clean_cycle_id,
+                sprint_number=sprint_number,
+                as_of=turn_dt,
+            )
+            include_referral = bool(wrapup_ref_plan.get("include_referral"))
+            ref_state_for_wrapup = wrapup_ref_plan.get("referral_state")
 
             # 2. Build prompt for Gemini Flash
             prompt = build_athena_weekly_wrapup_prompt(
                 user_overall_summary=user_summary,
                 highlights=highlights,
                 week_number=sprint_number,
+                referral_state=ref_state_for_wrapup,
+                include_referral_followup=include_referral,
             )
 
             # 3. Call Gemini Flash
@@ -1100,6 +1157,34 @@ class AthenaChatService:
                 commit=False,
             )
 
+            # 5b. Stage 8A.4: Record Weekly Summary referral delivery & cancel any newly-covered pending standalone reminder
+            if include_referral and isinstance(ref_state_for_wrapup, dict) and ref_state_for_wrapup.get("referral_id"):
+                ref_id_str = str(ref_state_for_wrapup["referral_id"])
+                covers_int = wrapup_ref_plan.get("covers_interval")
+                self.weekly_service.record_weekly_wrapup_referral_delivery(
+                    cycle_id=clean_cycle_id,
+                    referral_id=ref_id_str,
+                    sprint_number=sprint_number,
+                    message_id=message_id,
+                    covers_interval=covers_int,
+                    sent_at_utc=turn_now_iso,
+                    commit=False,
+                )
+                if covers_int is not None and int(covers_int) >= 1:
+                    from app.services.clinical_automation_service import ClinicalAutomationService
+
+                    auto_svc = ClinicalAutomationService(
+                        db=self.db,
+                        gateway=self.gateway,
+                        now_provider=self.now_provider,
+                    )
+                    auto_svc.cancel_pending_referral_reminders(
+                        clean_cycle_id,
+                        referral_id=ref_id_str,
+                        reason="covered_by_weekly_wrapup",
+                        commit=False,
+                    )
+
             self.db.commit()
 
             return AthenaChatResponse(
@@ -1114,6 +1199,200 @@ class AthenaChatService:
                 question_id=None,
                 routine_question_status=None,
                 reminders_count=0,
+            )
+
+    async def send_referral_followup_reminder(
+        self,
+        *,
+        cycle_id: str,
+        referral_id: str,
+        target_interval: int = 1,
+        idempotency_key: Optional[str] = None,
+    ) -> Optional[AthenaChatResponse]:
+        """
+        Stage 8A.4: Sends Athena's server-scheduled 168-hour follow-up reminder message
+        for an active, unconfirmed in-person medical referral.
+        Invariants:
+        1. Strictly server-scheduled; never invoked before 168 hours from `created_at_utc`.
+        2. Skips with ZERO Gemini calls if the cycle is closed, the visit is already
+           confirmed, or the target 168-hour interval was already covered.
+        3. If Gemini fails, raises without incrementing `reminder_count` or persisting partial state.
+        4. Fully idempotent across retries and concurrent workers.
+        """
+        clean_cycle_id = cycle_id.strip()
+        clean_ref_id = referral_id.strip()
+        eff_interval = max(1, int(target_interval))
+
+        cycle = self.cycle_repo.get(clean_cycle_id)
+        if cycle is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Medical cycle '{clean_cycle_id}' not found.",
+            )
+        if cycle.status != "active":
+            return None
+
+        clean_idem = (
+            idempotency_key.strip()
+            if (idempotency_key and idempotency_key.strip())
+            else f"referral_reminder_{clean_cycle_id}_{clean_ref_id}_i{eff_interval}"
+        )
+
+        async with self._get_cycle_lock(clean_cycle_id):
+            existing_turn = self._find_idempotent_turn(clean_cycle_id, clean_idem)
+            if existing_turn is not None:
+                return existing_turn
+
+            turn_dt = self._now_utc()
+            turn_now_iso = turn_dt.isoformat()
+
+            sched = self.weekly_service.get_referral_followup_reminder_schedule(
+                clean_cycle_id, as_of=turn_dt
+            )
+            if (
+                not sched.get("eligible")
+                or str(sched.get("referral_id") or "") != clean_ref_id
+                or not sched.get("is_due")
+                or int(sched.get("covered_up_to_interval") or 0) >= eff_interval
+            ):
+                return None
+
+            ref_state = self.weekly_service.get_referral_state_for_athena(clean_cycle_id)
+            if not ref_state.get("has_active_referral"):
+                return None
+
+            reminder_number = int(ref_state.get("reminder_count") or 0) + 1
+            prompt = build_athena_referral_followup_reminder_prompt(
+                referral_state=ref_state,
+                reminder_number=reminder_number,
+            )
+
+            reminder_output: AthenaReferralReminderOutput = await self.gateway.generate_structured(
+                prompt=prompt,
+                response_schema=AthenaReferralReminderOutput,
+                model=GeminiModelRole.FLASH,
+            )
+            clean_reply = reminder_output.message.strip()
+            if not clean_reply:
+                from app.services.gemini_gateway import GeminiGatewayError
+
+                raise GeminiGatewayError("Empty referral follow-up reminder message returned by Gemini Flash.")
+
+            message_id = f"msg_{uuid.uuid4().hex[:16]}"
+            auth_week, auth_day, _ = self.weekly_service.get_authoritative_calendar_schedule(
+                clean_cycle_id, as_of=turn_dt
+            )
+            max_persist_retries = 8
+            new_rem_count = reminder_number
+
+            for persist_attempt in range(max_persist_retries + 1):
+                if persist_attempt > 0:
+                    self.db.rollback()
+                    self.db.expire_all()
+                    time.sleep(0.015 * persist_attempt)
+                    bind = self.db.get_bind()
+                    if bind is not None and bind.dialect.name == "sqlite":
+                        self.db.execute(sql_text("BEGIN IMMEDIATE"))
+                elif not self.db.new and not self.db.dirty and not self.db.deleted:
+                    self.db.expire_all()
+
+                try:
+                    existing_turn = self._find_idempotent_turn(clean_cycle_id, clean_idem)
+                    if existing_turn is not None:
+                        self.db.rollback()
+                        return existing_turn
+
+                    curr_cycle = self.cycle_repo.get(clean_cycle_id)
+                    if curr_cycle is None or curr_cycle.status != "active":
+                        self.db.rollback()
+                        return None
+
+                    curr_sched = self.weekly_service.get_referral_followup_reminder_schedule(
+                        clean_cycle_id, as_of=turn_dt
+                    )
+                    if (
+                        not curr_sched.get("eligible")
+                        or str(curr_sched.get("referral_id") or "") != clean_ref_id
+                        or not curr_sched.get("is_due")
+                        or int(curr_sched.get("covered_up_to_interval") or 0) >= eff_interval
+                    ):
+                        self.db.rollback()
+                        return None
+
+                    eff_sprint_id = self.weekly_service.resolve_active_sprint_id(
+                        clean_cycle_id,
+                        as_of=turn_dt,
+                        commit=False,
+                    )
+                    base_turn_ver = self.report_repo.get_latest_version_number(
+                        cycle_id=clean_cycle_id,
+                        report_type=ATHENA_CHAT_TURN_REPORT_TYPE,
+                        privacy_level=PrivacyLevel.SERVER_ONLY,
+                    )
+                    new_rem_count = int(curr_sched.get("reminder_count") or 0) + 1
+
+                    self.weekly_service.save_athena_chat_message(
+                        cycle_id=clean_cycle_id,
+                        sender="curator",
+                        text=clean_reply,
+                        sprint_id=eff_sprint_id,
+                        timestamp=turn_now_iso,
+                        commit=False,
+                    )
+
+                    self._save_idempotency_turn(
+                        cycle_id=clean_cycle_id,
+                        sprint_id=eff_sprint_id,
+                        idempotency_key=clean_idem,
+                        message_id=message_id,
+                        reply=clean_reply,
+                        emergency_trigger=False,
+                        emergency_notice=None,
+                        created_at=turn_now_iso,
+                        sprint_day=auth_day,
+                        sprint_number=auth_week,
+                        event_type="referral_followup_reminder",
+                        question_id=None,
+                        routine_question_status=None,
+                        reminders_count=new_rem_count,
+                        expected_version=base_turn_ver + 1,
+                        commit=False,
+                    )
+
+                    self.weekly_service.record_referral_reminder_sent(
+                        cycle_id=clean_cycle_id,
+                        referral_id=clean_ref_id,
+                        target_interval=eff_interval,
+                        message_id=message_id,
+                        sent_at_utc=turn_now_iso,
+                        commit=False,
+                    )
+
+                    self.db.commit()
+                    break
+                except (ReportVersionConflictError, IntegrityError, OperationalError) as exc:
+                    self.db.rollback()
+                    if persist_attempt < max_persist_retries:
+                        continue
+                    raise ReportVersionConflictError(
+                        f"Concurrent persistence conflict during referral follow-up reminder for cycle '{clean_cycle_id}': {exc}"
+                    ) from exc
+                except BaseException:
+                    self.db.rollback()
+                    raise
+
+            return AthenaChatResponse(
+                reply=clean_reply,
+                emergency_trigger=False,
+                emergency_notice=None,
+                cycle_id=clean_cycle_id,
+                sprint_day=auth_day,
+                sprint_number=auth_week,
+                message_id=message_id,
+                created_at=turn_now_iso,
+                question_id=None,
+                routine_question_status=None,
+                reminders_count=new_rem_count,
             )
 
     def get_sanitized_history(
@@ -1507,6 +1786,8 @@ class AthenaChatService:
         self, cycle_id: str, as_of: Optional[datetime] = None
     ) -> Tuple[str, List[Dict[str, str]], Optional[str]]:
         medical_context = self.build_patient_medical_context(cycle_id)
+        ref_state = self.weekly_service.get_referral_state_for_athena(cycle_id)
+        referral_ctx_block = build_athena_referral_context_block(ref_state)
 
         try:
             ctx = self.weekly_service.get_active_athena_context(cycle_id, as_of=as_of)
@@ -1522,7 +1803,10 @@ class AthenaChatService:
                     ctx.athena_logs_summary,
                 ]
             )
-            system_prompt = build_athena_system_prompt(full_curator_context)
+            system_prompt = build_athena_system_prompt(
+                full_curator_context,
+                referral_context_block=referral_ctx_block,
+            )
             return system_prompt, ctx.chat_history, ctx.sprint_id
         except ConsiliumContextMissingError:
             # Fallback for newly paired patient prior to Primary Consilium execution
@@ -1539,11 +1823,49 @@ class AthenaChatService:
                     onboarding_route,
                 ]
             )
-            system_prompt = build_athena_system_prompt(full_curator_context)
+            system_prompt = build_athena_system_prompt(
+                full_curator_context,
+                referral_context_block=referral_ctx_block,
+            )
             chat_history = self.weekly_service.get_athena_chat_history(cycle_id)
             return system_prompt, chat_history, None
 
     def _build_turn_prompt_and_record(
+        self,
+        request: AthenaChatRequest,
+        cycle_id: str,
+        effective_sprint_day: Optional[int] = None,
+        chat_history: Optional[List[Dict[str, str]]] = None,
+    ) -> Tuple[str, str]:
+        prompt, user_record = self._build_base_turn_prompt_and_record(
+            request=request,
+            cycle_id=cycle_id,
+            effective_sprint_day=effective_sprint_day,
+        )
+        has_user_text = bool(request.message and request.message.strip())
+        if has_user_text and request.event_type in (
+            "user_message",
+            "routine_answer",
+            "out_of_turn_message",
+            "daily_pulse",
+        ):
+            ref_state = self.weekly_service.get_referral_state_for_athena(cycle_id)
+            if ref_state.get("has_active_referral"):
+                last_curator_msg: Optional[str] = None
+                if chat_history:
+                    for item in reversed(chat_history):
+                        if isinstance(item, dict) and str(item.get("sender", "")).lower() == "curator":
+                            candidate = str(item.get("text", "")).strip()
+                            if candidate:
+                                last_curator_msg = candidate
+                                break
+                prompt = prompt + build_athena_turn_referral_addendum(
+                    ref_state,
+                    last_curator_message=last_curator_msg,
+                )
+        return prompt, user_record
+
+    def _build_base_turn_prompt_and_record(
         self,
         request: AthenaChatRequest,
         cycle_id: str,
@@ -1878,6 +2200,11 @@ YOUR INSTRUCTION:
                 if role != last_role:
                     contents.append({"role": role, "parts": [{"text": text}]})
                     last_role = role
+                elif contents:
+                    # Preserve consecutive messages of the same role (e.g., curator reply followed
+                    # by server-initiated weekly summary or referral follow-up reminder) while
+                    # maintaining Gemini's strict alternating user/model turn structure.
+                    contents[-1]["parts"][0]["text"] = f"{contents[-1]['parts'][0]['text']}\n\n{text}"
 
         # Ensure first turn is from user if history starts with model
         if contents and contents[0]["role"] == "model":
@@ -1949,7 +2276,7 @@ YOUR INSTRUCTION:
         event_type: Optional[str] = None,
         as_of: Optional[datetime] = None,
         commit: bool = True,
-    ) -> Tuple[str, bool, Optional[str], Optional[Dict[str, Any]]]:
+    ) -> Tuple[str, bool, Optional[str], Optional[Dict[str, Any]], Optional[AthenaClinicalLogEntry], bool]:
         working_text = raw_response
 
         # 1. Detect and strip [EMERGENCY_TRIGGER]
@@ -1959,6 +2286,8 @@ YOUR INSTRUCTION:
         # 2. Extract and parse [CLINICAL_REPORT] JSON
         clinical_match = CLINICAL_REPORT_REGEX.search(working_text)
         is_critical_report = False
+        parsed_clinical_entry: Optional[AthenaClinicalLogEntry] = None
+        clinical_report_parsed_ok = False
 
         if clinical_match:
             raw_json = clinical_match.group(1).strip()
@@ -1970,6 +2299,9 @@ YOUR INSTRUCTION:
             try:
                 parsed_dict = json.loads(raw_json)
                 log_entry = AthenaClinicalLogEntry.model_validate(parsed_dict)
+                if not used_emergency_fallback:
+                    parsed_clinical_entry = log_entry
+                    clinical_report_parsed_ok = True
                 if log_entry.status.upper() == "CRITICAL" or log_entry.red_flags:
                     is_critical_report = True
             except Exception as parse_err:
@@ -2017,7 +2349,7 @@ YOUR INSTRUCTION:
         working_text = re.sub(r"\[/?GOAL_PROGRESSION\]", "", working_text, flags=re.IGNORECASE).strip()
         working_text = EMERGENCY_TRIGGER_REGEX.sub("", working_text).strip()
         working_text = re.sub(
-            r"=== (?:AUTHORITATIVE PATIENT MEDICAL CONTEXT|GUIDELINES AND CLINICAL ROUTE|DEEP CLINICAL ANALYSIS|PRIMARY SYNTHESIS|INSTRUCTIONS AND ROUTE)[\s\S]*?===\n?",
+            r"=== (?:AUTHORITATIVE PATIENT MEDICAL CONTEXT|GUIDELINES AND CLINICAL ROUTE|DEEP CLINICAL ANALYSIS|PRIMARY SYNTHESIS|INSTRUCTIONS AND ROUTE|ACTIVE IN-PERSON MEDICAL REFERRAL CONTEXT|REFERRAL LIFECYCLE CONTEXT)[\s\S]*?===\n?",
             "",
             working_text,
             flags=re.IGNORECASE,
@@ -2041,4 +2373,11 @@ YOUR INSTRUCTION:
                     else "CRITICAL_STATUS: Clinical indicators require immediate medical attention.")
             )
 
-        return clean_reply, final_emergency, final_notice, parsed_prog
+        return (
+            clean_reply,
+            final_emergency,
+            final_notice,
+            parsed_prog,
+            parsed_clinical_entry,
+            clinical_report_parsed_ok,
+        )

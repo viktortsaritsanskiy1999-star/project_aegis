@@ -212,6 +212,58 @@ class AnamnesisIntakeClientResponse {
   };
 }
 
+/// Client-safe view of active referral status without internal clinical reasoning.
+/// Matches backend ClientReferralStatus schema.
+@immutable
+class ClientReferralStatus {
+  final bool hasActiveReferral;
+  final String status;
+  final String documentGenerationState;
+  final String? urgency;
+  final List<String> targetSpecialties;
+  final String? clinicalReasonSummary;
+  final String? documentReportId;
+  final String? createdAtUtc;
+
+  const ClientReferralStatus({
+    this.hasActiveReferral = false,
+    this.status = 'none',
+    this.documentGenerationState = 'none',
+    this.urgency,
+    this.targetSpecialties = const [],
+    this.clinicalReasonSummary,
+    this.documentReportId,
+    this.createdAtUtc,
+  });
+
+  factory ClientReferralStatus.fromJson(Map<String, dynamic> json) {
+    return ClientReferralStatus(
+      hasActiveReferral: json['has_active_referral'] == true,
+      status: json['status'] as String? ?? 'none',
+      documentGenerationState: json['document_generation_state'] as String? ?? 'none',
+      urgency: json['urgency'] as String?,
+      targetSpecialties: (json['target_specialties'] as List<dynamic>?)
+              ?.map((e) => e.toString())
+              .toList() ??
+          const [],
+      clinicalReasonSummary: json['clinical_reason_summary'] as String?,
+      documentReportId: json['document_report_id'] as String?,
+      createdAtUtc: json['created_at_utc'] as String?,
+    );
+  }
+
+  Map<String, dynamic> toJson() => {
+    'has_active_referral': hasActiveReferral,
+    'status': status,
+    'document_generation_state': documentGenerationState,
+    if (urgency != null) 'urgency': urgency,
+    'target_specialties': targetSpecialties,
+    if (clinicalReasonSummary != null) 'clinical_reason_summary': clinicalReasonSummary,
+    if (documentReportId != null) 'document_report_id': documentReportId,
+    if (createdAtUtc != null) 'created_at_utc': createdAtUtc,
+  };
+}
+
 /// Clinical pipeline readiness status summary for the authenticated patient.
 /// Matches backend ClientCascadeStatusResponse schema.
 @immutable
@@ -237,6 +289,8 @@ class ClientCascadeStatusResponse {
   final String? activeRoutineQuestionText;
   final int routineQuestionRemindersCount;
   final bool canSendRoutineReminder;
+  final bool hasActiveReferral;
+  final ClientReferralStatus referralStatus;
 
   const ClientCascadeStatusResponse({
     required this.patientId,
@@ -260,6 +314,8 @@ class ClientCascadeStatusResponse {
     this.activeRoutineQuestionText,
     this.routineQuestionRemindersCount = 0,
     this.canSendRoutineReminder = false,
+    this.hasActiveReferral = false,
+    this.referralStatus = const ClientReferralStatus(),
   });
 
   factory ClientCascadeStatusResponse.fromJson(Map<String, dynamic> json) {
@@ -285,6 +341,10 @@ class ClientCascadeStatusResponse {
       activeRoutineQuestionText: json['active_routine_question_text'] as String?,
       routineQuestionRemindersCount: (json['routine_question_reminders_count'] as num?)?.toInt() ?? 0,
       canSendRoutineReminder: json['can_send_routine_reminder'] == true,
+      hasActiveReferral: json['has_active_referral'] == true,
+      referralStatus: json['referral_status'] is Map
+          ? ClientReferralStatus.fromJson(Map<String, dynamic>.from(json['referral_status'] as Map))
+          : const ClientReferralStatus(),
     );
   }
 
@@ -310,6 +370,8 @@ class ClientCascadeStatusResponse {
     if (activeRoutineQuestionText != null) 'active_routine_question_text': activeRoutineQuestionText,
     'routine_question_reminders_count': routineQuestionRemindersCount,
     'can_send_routine_reminder': canSendRoutineReminder,
+    'has_active_referral': hasActiveReferral,
+    'referral_status': referralStatus.toJson(),
   };
 }
 
@@ -1551,5 +1613,252 @@ class EcgRecordEntry {
     if (recordDate != null) 'record_date': recordDate,
     if (localFilename != null) 'local_filename': localFilename,
     'status': status,
+  };
+}
+
+/// Client-safe summary item representing an observation document for doctor.
+/// Matches backend ClientReferralDocumentItem schema.
+@immutable
+class ClientReferralDocumentItem {
+  final String reportId;
+  final String cycleId;
+  final String? sprintId;
+  final String referralId;
+  final String createdAtUtc;
+  final String reportDate;
+  final String title;
+  final List<String> availableFormats;
+  final String summary;
+  final String urgency;
+  final List<String> targetSpecialties;
+  final String cycleStatus;
+  final int documentVersion;
+
+  const ClientReferralDocumentItem({
+    required this.reportId,
+    required this.cycleId,
+    this.sprintId,
+    required this.referralId,
+    required this.createdAtUtc,
+    required this.reportDate,
+    required this.title,
+    this.availableFormats = const ['pdf', 'docx', 'md'],
+    required this.summary,
+    this.urgency = 'routine',
+    this.targetSpecialties = const [],
+    this.cycleStatus = 'active',
+    this.documentVersion = 1,
+  });
+
+  factory ClientReferralDocumentItem.fromJson(Map<String, dynamic> json) {
+    return ClientReferralDocumentItem(
+      reportId: json['report_id'] as String? ?? '',
+      cycleId: json['cycle_id'] as String? ?? '',
+      sprintId: json['sprint_id'] as String?,
+      referralId: json['referral_id'] as String? ?? '',
+      createdAtUtc: json['created_at_utc'] as String? ?? '',
+      reportDate: json['report_date'] as String? ?? '',
+      title: json['title'] as String? ?? 'Aegis Health Observation Summary',
+      availableFormats: (json['available_formats'] as List<dynamic>?)
+              ?.map((e) => e.toString())
+              .toList() ??
+          const ['pdf', 'docx', 'md'],
+      summary: json['summary'] as String? ?? '',
+      urgency: json['urgency'] as String? ?? 'routine',
+      targetSpecialties: (json['target_specialties'] as List<dynamic>?)
+              ?.map((e) => e.toString())
+              .toList() ??
+          const [],
+      cycleStatus: json['cycle_status'] as String? ?? 'active',
+      documentVersion: (json['document_version'] as num?)?.toInt() ?? 1,
+    );
+  }
+
+  Map<String, dynamic> toJson() => {
+    'report_id': reportId,
+    'cycle_id': cycleId,
+    if (sprintId != null) 'sprint_id': sprintId,
+    'referral_id': referralId,
+    'created_at_utc': createdAtUtc,
+    'report_date': reportDate,
+    'title': title,
+    'available_formats': availableFormats,
+    'summary': summary,
+    'urgency': urgency,
+    'target_specialties': targetSpecialties,
+    'cycle_status': cycleStatus,
+    'document_version': documentVersion,
+  };
+}
+
+/// List of all doctor observation documents across patient's medical cycles.
+/// Matches backend ClientReferralDocumentListResponse schema.
+@immutable
+class ClientReferralDocumentListResponse {
+  final String patientId;
+  final int totalCount;
+  final List<ClientReferralDocumentItem> documents;
+
+  const ClientReferralDocumentListResponse({
+    required this.patientId,
+    required this.totalCount,
+    this.documents = const [],
+  });
+
+  factory ClientReferralDocumentListResponse.fromJson(Map<String, dynamic> json) {
+    return ClientReferralDocumentListResponse(
+      patientId: json['patient_id'] as String? ?? '',
+      totalCount: (json['total_count'] as num?)?.toInt() ?? 0,
+      documents: (json['documents'] as List<dynamic>?)
+              ?.map((e) => ClientReferralDocumentItem.fromJson(Map<String, dynamic>.from(e as Map)))
+              .toList() ??
+          const [],
+    );
+  }
+
+  Map<String, dynamic> toJson() => {
+    'patient_id': patientId,
+    'total_count': totalCount,
+    'documents': documents.map((d) => d.toJson()).toList(),
+  };
+}
+
+/// Structured clinical observation section for mobile Safe UI display.
+/// Matches backend ClientReferralDocumentSection schema.
+@immutable
+class ClientReferralDocumentSection {
+  final int sectionNumber;
+  final String sectionTitle;
+  final dynamic content;
+  final bool isBulletList;
+
+  const ClientReferralDocumentSection({
+    required this.sectionNumber,
+    required this.sectionTitle,
+    required this.content,
+    this.isBulletList = false,
+  });
+
+  List<String> get bulletItems {
+    if (content is List) {
+      return (content as List).map((e) => e.toString()).toList();
+    }
+    if (content is String && (content as String).isNotEmpty) {
+      return [content as String];
+    }
+    return const [];
+  }
+
+  String get asPlainText {
+    if (content is List) {
+      return (content as List).map((e) => '• $e').join('\n');
+    }
+    return content?.toString() ?? '';
+  }
+
+  factory ClientReferralDocumentSection.fromJson(Map<String, dynamic> json) {
+    return ClientReferralDocumentSection(
+      sectionNumber: (json['section_number'] as num?)?.toInt() ?? 1,
+      sectionTitle: json['section_title'] as String? ?? '',
+      content: json['content'],
+      isBulletList: json['is_bullet_list'] == true,
+    );
+  }
+
+  Map<String, dynamic> toJson() => {
+    'section_number': sectionNumber,
+    'section_title': sectionTitle,
+    'content': content,
+    'is_bullet_list': isBulletList,
+  };
+}
+
+/// Complete client-safe structured view of doctor document for mobile Safe.
+/// Matches backend ClientReferralDocumentDetailResponse schema.
+@immutable
+class ClientReferralDocumentDetailResponse {
+  final String reportId;
+  final String cycleId;
+  final String? sprintId;
+  final String referralId;
+  final String createdAtUtc;
+  final String reportDate;
+  final String title;
+  final String urgency;
+  final List<String> targetSpecialties;
+  final String informationalDisclaimer;
+  final String executiveSummary;
+  final List<ClientReferralDocumentSection> sections;
+  final String renderedMarkdown;
+  final List<String> availableFormats;
+  final String cycleStatus;
+  final int documentVersion;
+
+  const ClientReferralDocumentDetailResponse({
+    required this.reportId,
+    required this.cycleId,
+    this.sprintId,
+    required this.referralId,
+    required this.createdAtUtc,
+    required this.reportDate,
+    required this.title,
+    this.urgency = 'routine',
+    this.targetSpecialties = const [],
+    required this.informationalDisclaimer,
+    required this.executiveSummary,
+    this.sections = const [],
+    required this.renderedMarkdown,
+    this.availableFormats = const ['pdf', 'docx', 'md'],
+    this.cycleStatus = 'active',
+    this.documentVersion = 1,
+  });
+
+  factory ClientReferralDocumentDetailResponse.fromJson(Map<String, dynamic> json) {
+    return ClientReferralDocumentDetailResponse(
+      reportId: json['report_id'] as String? ?? '',
+      cycleId: json['cycle_id'] as String? ?? '',
+      sprintId: json['sprint_id'] as String?,
+      referralId: json['referral_id'] as String? ?? '',
+      createdAtUtc: json['created_at_utc'] as String? ?? '',
+      reportDate: json['report_date'] as String? ?? '',
+      title: json['title'] as String? ?? 'Aegis Health Observation Summary',
+      urgency: json['urgency'] as String? ?? 'routine',
+      targetSpecialties: (json['target_specialties'] as List<dynamic>?)
+              ?.map((e) => e.toString())
+              .toList() ??
+          const [],
+      informationalDisclaimer: json['informational_disclaimer'] as String? ?? '',
+      executiveSummary: json['executive_summary'] as String? ?? '',
+      sections: (json['sections'] as List<dynamic>?)
+              ?.map((e) => ClientReferralDocumentSection.fromJson(Map<String, dynamic>.from(e as Map)))
+              .toList() ??
+          const [],
+      renderedMarkdown: json['rendered_markdown'] as String? ?? '',
+      availableFormats: (json['available_formats'] as List<dynamic>?)
+              ?.map((e) => e.toString())
+              .toList() ??
+          const ['pdf', 'docx', 'md'],
+      cycleStatus: json['cycle_status'] as String? ?? 'active',
+      documentVersion: (json['document_version'] as num?)?.toInt() ?? 1,
+    );
+  }
+
+  Map<String, dynamic> toJson() => {
+    'report_id': reportId,
+    'cycle_id': cycleId,
+    if (sprintId != null) 'sprint_id': sprintId,
+    'referral_id': referralId,
+    'created_at_utc': createdAtUtc,
+    'report_date': reportDate,
+    'title': title,
+    'urgency': urgency,
+    'target_specialties': targetSpecialties,
+    'informational_disclaimer': informationalDisclaimer,
+    'executive_summary': executiveSummary,
+    'sections': sections.map((s) => s.toJson()).toList(),
+    'rendered_markdown': renderedMarkdown,
+    'available_formats': availableFormats,
+    'cycle_status': cycleStatus,
+    'document_version': documentVersion,
   };
 }

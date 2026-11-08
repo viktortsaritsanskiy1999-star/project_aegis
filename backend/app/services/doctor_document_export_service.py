@@ -425,6 +425,24 @@ class DoctorDocumentExportService:
             doc_date=metadata.get("report_date", ""),
             patient_ref=metadata.get("patient_id", ""),
         )
+
+        # Ensure deterministic binary output by binding PDF CreationDate to the stored document creation timestamp
+        doc_dt: Optional[datetime] = None
+        raw_dt = metadata.get("created_at_utc")
+        if isinstance(raw_dt, datetime):
+            doc_dt = raw_dt
+        elif isinstance(raw_dt, str) and raw_dt:
+            try:
+                normalized = raw_dt.replace("Z", "+00:00") if raw_dt.endswith("Z") else raw_dt
+                doc_dt = datetime.fromisoformat(normalized)
+            except Exception:
+                doc_dt = None
+        if doc_dt is None:
+            doc_dt = datetime(2026, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
+        if not doc_dt.tzinfo:
+            doc_dt = doc_dt.replace(tzinfo=timezone.utc)
+        pdf.set_creation_date(doc_dt)
+
         pdf.add_page()
         f_fam = pdf.font_family
 

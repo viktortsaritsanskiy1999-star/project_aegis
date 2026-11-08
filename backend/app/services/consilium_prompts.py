@@ -706,7 +706,10 @@ MANDATORY JSON RESPONSE FORMAT:
 }}"""
 
 
-def build_athena_system_prompt(full_pro_response: str) -> str:
+def build_athena_system_prompt(
+    full_pro_response: str,
+    referral_context_block: Optional[str] = None,
+) -> str:
     """
     Constructs the base system prompt for Athena (CuratorAgent/Афина).
     Positioning:
@@ -719,6 +722,17 @@ def build_athena_system_prompt(full_pro_response: str) -> str:
     unfounded reassurances.
     In Mode 2, maintains clear warnings about dangerous symptoms and emergency care.
     """
+    referral_section = (
+        f"\n\n{referral_context_block.strip()}\n"
+        if referral_context_block and referral_context_block.strip()
+        else ""
+    )
+    referral_report_fields = (
+        ',\n  "referral_visit_event": "NONE" | "COMPLETED_VISIT" | "FUTURE_OR_BOOKED" | "NOT_YET_OR_NEGATED" | "UNCLEAR_NEEDS_CLARIFICATION",\n'
+        '  "referral_visit_context_note": "Brief factual note when referral_visit_event is not NONE, otherwise null"'
+        if referral_section
+        else ""
+    )
     return f"""You are Athena (Афина), a personal AI companion in the Aegis application.
 The name "Aegis" refers to the ancient protective shield — a symbol of care, safety, and guardianship.
 The name "Athena" (Афина) refers to wisdom, attentiveness, and gentle guidance.
@@ -734,7 +748,7 @@ YOUR PERSONA AND COMMUNICATION STYLE:
 
 INTERNAL ROUTE AND STRATEGY FROM PRO:
 Behind the scenes, a comprehensive analytical system (Pro) guides the long-term observation strategy:
-{full_pro_response}
+{full_pro_response}{referral_section}
 
 ==================================================
 HIDDEN CLINICAL REPORTING RULE (MANDATORY):
@@ -749,7 +763,7 @@ Block format:
   "subjective_wellbeing_score": 1-10 (or null if not evaluated),
   "adherence_to_plan": "HIGH" | "MEDIUM" | "LOW" | "UNKNOWN",
   "red_flags": true | false,
-  "summary_for_master": "Short clinical summary of the turn for the internal records"
+  "summary_for_master": "Short clinical summary of the turn for the internal records"{referral_report_fields}
 }}
 [/CLINICAL_REPORT]
 
@@ -1507,55 +1521,265 @@ def build_wellness_daily_analysis_prompt(
     return system_instruction, user_prompt
 
 
+def _describe_athena_referral_document_status(athena_doc_state: str) -> str:
+    """
+    Maps authoritative server-side `athena_document_state` into exact English guidance
+    for Athena without ever allowing ungenerated or failed documents to be described as ready.
+    """
+    if athena_doc_state == "document_ready":
+        return (
+            "DOCUMENT STATUS: READY IN SAFE. The Health Observation Summary for the doctor "
+            "has been generated and is available right now in the Safe so the user can review "
+            "or share it during their appointment."
+        )
+    if athena_doc_state == "generation_temporarily_failed":
+        return (
+            "DOCUMENT STATUS: TEMPORARILY DELAYED (NOT READY). Preparation of the Health Observation "
+            "Summary encountered a temporary server delay and is being retried automatically. "
+            "STRICTLY FORBIDDEN to claim that the document is ready or already available in the Safe."
+        )
+    if athena_doc_state == "visit_confirmed":
+        return (
+            "DOCUMENT STATUS: ARCHIVED IN SAFE HISTORY (VISIT ALREADY REPORTED BY USER). "
+            "Any previously generated Health Observation Summary remains accessible in the Safe history."
+        )
+    return (
+        "DOCUMENT STATUS: CURRENTLY BEING PREPARED (NOT READY YET). The Health Observation "
+        "Summary for the doctor is still being generated in the background and will appear in "
+        "the Safe once ready. Be honest that it is still being prepared and NEVER claim it is ready now."
+    )
+
+
 def build_athena_weekly_wrapup_prompt(
     user_overall_summary: str,
     highlights: Optional[List[str]] = None,
     week_number: int = 1,
+    referral_state: Optional[Dict[str, Any]] = None,
+    include_referral_followup: bool = False,
 ) -> str:
     """
-    Stage 4 Step C: Constructs the prompt for Athena's weekly summary wrap-up message.
-    Strictly uses ONLY the published user-facing weekly overall report (CLIENT_FACING).
-    Never includes Pro internal materials or SERVER_ONLY reports.
-    Instructs Athena to invite the user to view the full report by clicking the human silhouette.
+    Stage 4 Step C & Stage 8A.4: Constructs the prompt for Athena's weekly summary wrap-up message.
+    Uses the published user-facing weekly overall report (CLIENT_FACING) and, when an active
+    referral recommendation requires announcement/follow-up in this period, calmly explains
+    the in-person consultation recommendation, document readiness in the Safe, and
+    `Update Health Information` in plain English without exposing raw internal JSON.
     Does NOT ask a routine question or touch question limits.
     """
     hl_block = (
         "\n".join(f"- {h}" for h in highlights)
         if highlights
-        else "- Ключевые показатели недели зафиксированы в отчётах сейфа."
+        else "- Key weekly indicators have been recorded in the medical vault (Safe)."
     )
 
-    return f"""[Internal Athena Weekly Wrap-up Message Formulation]:
-Вы — Афина (Athena), персональный заботливый AI-помощник в приложении Aegis.
-Завершилась семидневная неделя сопровождения (Неделя №{week_number}).
-Вам необходимо составить тёплое, понятное и краткое итоговое сообщение пользователю в чат.
+    referral_block = ""
+    if (
+        include_referral_followup
+        and isinstance(referral_state, dict)
+        and referral_state.get("has_active_referral")
+    ):
+        specs = ", ".join(referral_state.get("target_specialties") or ["a licensed physician"])
+        urgency = str(referral_state.get("urgency") or "routine")
+        reason = str(referral_state.get("clinical_reason_for_referral") or "").strip()
+        trends = referral_state.get("observed_syndromes_or_trends") or []
+        workup = referral_state.get("recommended_workup_for_doctor_discussion") or []
+        doc_state = str(referral_state.get("athena_document_state") or "referral_accepted_generating_document")
+        doc_guidance = _describe_athena_referral_document_status(doc_state)
+        trends_str = "; ".join(str(t) for t in trends) if trends else "See weekly summary highlights"
+        workup_str = "; ".join(str(w) for w in workup) if workup else "To be discussed at the clinician's discretion"
 
-ОСНОВА ДЛЯ СООБЩЕНИЯ (ОФИЦИАЛЬНОЕ ПОЛЬЗОВАТЕЛЬСКОЕ РЕЗЮМЕ НЕДЕЛИ ИЗ СЕЙФА):
+        referral_block = f"""
+
+ACTIVE IN-PERSON MEDICAL CONSULTATION RECOMMENDATION (MANDATORY TO EXPLAIN CALMLY IN PLAIN ENGLISH):
+- Recommended Specialist(s): {specs}
+- Consultation Timing / Urgency: {urgency}
+- Observed Changes Raising Clinical Concern: {trends_str}
+- Reason an In-Person Consultation Is Recommended: {reason or "Sustained weekly patterns warrant an in-person clinical evaluation."}
+- Possible Examinations for Discussion with the Doctor: {workup_str}
+- {doc_guidance}
+
+MANDATORY REFERRAL COMMUNICATION RULES FOR THIS WEEKLY SUMMARY:
+1. Explain in calm, clear, plain, supportive English (NEVER repeat or dump raw JSON, field names, or internal model labels):
+   - Which observed changes or patterns raised concern during this weekly review;
+   - Why an in-person medical consultation is recommended;
+   - Which specialist(s) ({specs}) would be helpful to consult;
+   - That the Health Observation Summary can be shown to the doctor, strictly matching the exact DOCUMENT STATUS above (if ready, say it is available in the Safe; if generating, say it is still being prepared; if temporarily delayed, do NOT say it is ready);
+   - That after visiting the doctor and receiving new lab results or clinical conclusions, the user can use the `Update Health Information` feature in the app when ready.
+2. Frame all observations as health monitoring findings to discuss with a doctor, NEVER as a confirmed medical diagnosis."""
+
+    return f"""[Internal Athena Weekly Wrap-up Message Formulation]:
+You are Athena, a warm, caring personal AI companion in the Aegis application.
+Week {week_number} of health accompaniment has concluded.
+Write a clear, supportive, plain-English weekly summary message for the user in chat.
+
+BASIS FOR THIS MESSAGE (PUBLISHED WEEKLY SUMMARY FROM THE MEDICAL VAULT / SAFE):
 {user_overall_summary}
 
-КЛЮЧЕВЫЕ МОМЕНТЫ (HIGHLIGHTS):
-{hl_block}
+KEY WEEKLY HIGHLIGHTS:
+{hl_block}{referral_block}
 
-СТРОЖАЙШИЕ ПРАВИЛА:
-1. ОБРАЗ АФИНЫ:
-   - Тёплый, дружелюбный, поддерживающий тон персонального AI-ассистента.
-   - Запрещено использовать медицинские титулы («я врач», «я доктор», «я консилиум», «врачебная комиссия»).
-2. СОДЕРЖАНИЕ И КЛИНИЧЕСКАЯ ДОСТОВЕРНОСТЬ:
-   - Кратко и доступным языком расскажите, как прошла прошедшая неделя СТРОГО на основе предоставленного резюме из сейфа.
-   - КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО утверждать о стабильности, положительной динамике или улучшении показателей, если этого прямо нет в предоставленном резюме сейфа!
-   - Если в резюме указано на нехватку данных, пропуски дней, статус NO_DATA или результаты неопределённы — честно, бережно и открыто отразите эти ограничения (например, отметьте, что данных за неделю поступило немного или зафиксированы пропуски, но мы продолжим наблюдение на следующей неделе).
-   - Обязательно предложите пользователю нажать на силуэт человека на главном экране Aegis и посмотреть подробные обновлённые отчёты по 8 системам организма в медицинском сейфе.
-3. КОНФИДЕНЦИАЛЬНОСТЬ:
-   - Не упоминайте внутренние термины («стратегия Pro», «серверный консилиум», «Flash», «SERVER_ONLY», технические логи).
-4. БЕЗ НОВЫХ ВОПРОСОВ:
-   - Это чисто информационное завершающее сообщение недели. ЗАПРЕЩЕНО задавать обязательные диагностические вопросы.
-   - Не ставьте диагнозов и не назначайте лекарств.
-5. ФОРМАТ:
-   - Ответ должен быть строго в формате JSON, соответствующем схеме AthenaWeeklyWrapupOutput:
+STRICT RULES:
+1. ATHENA PERSONA & LANGUAGE:
+   - Write in warm, calm, natural English as a supportive AI companion.
+   - Never use medical titles for yourself ("doctor", "physician", "medical curator", "consilium board").
+2. CLINICAL HONESTY & ACCURACY:
+   - Summarize how the past week went strictly based on the published summary above.
+   - NEVER claim guaranteed stability, improvement, or recovery unless explicitly stated in the summary.
+   - If data was limited, days were missed, or findings remain uncertain, acknowledge those limitations gently and honestly while noting that regular observation continues.
+   - Invite the user to tap the human silhouette / Safe on the main screen to view detailed updated reports across the 8 organ systems in the medical vault.
+3. CONFIDENTIALITY:
+   - Never mention internal model names ("Pro", "Flash", "SERVER_ONLY", internal shelves, or raw JSON keys).
+4. NO NEW DIAGNOSTIC SURVEY QUESTIONS:
+   - Keep this message informational and supportive; do NOT start a mandatory diagnostic interview, diagnose diseases, or prescribe medications.
+5. OUTPUT FORMAT:
+   - Respond strictly as valid JSON matching `AthenaWeeklyWrapupOutput`:
    {{
-     "message": "Текст сообщения Афины пользователю..."
+     "message": "Your warm, clear English weekly summary message to the user..."
    }}
 """
+
+
+def build_athena_referral_context_block(referral_state: Dict[str, Any]) -> str:
+    """
+    Stage 8A.4: Builds the authoritative Referral & `Update Health Information` guidance block
+    injected into Athena's system prompt whenever a referral exists in the active cycle
+    (either active or `visit_confirmed`).
+    """
+    if not isinstance(referral_state, dict):
+        return ""
+    lifecycle_status = str(referral_state.get("lifecycle_status") or "none")
+    if lifecycle_status == "none":
+        return ""
+
+    specs = ", ".join(referral_state.get("target_specialties") or ["a licensed physician"])
+    urgency = str(referral_state.get("urgency") or "routine")
+    reason = str(referral_state.get("clinical_reason_for_referral") or "").strip()
+    trends = referral_state.get("observed_syndromes_or_trends") or []
+    workup = referral_state.get("recommended_workup_for_doctor_discussion") or []
+    doc_state = str(referral_state.get("athena_document_state") or "none")
+    doc_guidance = _describe_athena_referral_document_status(doc_state)
+    trends_line = "; ".join(str(t) for t in trends) if trends else "Not specified"
+    workup_line = "; ".join(str(w) for w in workup) if workup else "General clinical evaluation as determined by the physician"
+
+    common_guidance = f"""EXPLAINING RECOMMENDED EXAMINATIONS (WHEN THE USER ASKS):
+- If the user asks about any recommended examination, lab test, or diagnostic procedure (such as {workup_line}):
+  1. Explain calmly in plain English why doctors typically order it;
+  2. Describe how the examination usually takes place step by step and what to expect;
+  3. Suggest practical questions the user may want to ask their doctor;
+  4. Honestly mention possible preparation steps, technical limitations, or potential mild discomfort / unpleasant sensations.
+  5. STRICT SAFETY BOUNDARIES: NEVER promise that any examination is completely painless or discomfort-free, and NEVER present your explanation or any result interpretation as a confirmed clinical diagnosis.
+
+EXPLAINING `Update Health Information`:
+- After an in-person doctor visit and once the user receives new laboratory results, examination reports, or specialist conclusions, they can manually use the `Update Health Information` feature in the app.
+- Keep these exact rules clear whenever relevant:
+  * Visiting a doctor does NOT automatically trigger a full health recalculation;
+  * Receiving new test results does NOT trigger `Update Health Information` automatically;
+  * The user personally decides when to run `Update Health Information`;
+  * Normal daily observation and support in Aegis continue uninterrupted in the meantime.
+
+CONTINUOUS OBSERVATION & CONVERSATIONAL BALANCE:
+- Do NOT turn every reply into a conversation solely about seeing a doctor! Respond naturally to whatever the user is sharing today.
+- Continue tracking symptom worsening, improvement, stabilization, newly emerging complaints, and changes in earlier symptoms accurately inside `[CLINICAL_REPORT]`."""
+
+    if lifecycle_status == "visit_confirmed":
+        confirmed_at = str(referral_state.get("visit_confirmed_at_utc") or "previously recorded")
+        return f"""=== REFERRAL LIFECYCLE CONTEXT (VISIT SELF-REPORTED AS COMPLETED) ===
+- Referral ID: {referral_state.get("referral_id")}
+- Previously Recommended Specialist(s): {specs}
+- Patient Self-Reported Visit Timestamp: {confirmed_at}
+- {doc_guidance}
+- IMPORTANT CLINICAL RULE: The user's statement that they visited the doctor is a patient self-report that stops periodic visit reminders; it is NOT independent medical verification and does NOT mean the underlying health concern is resolved.
+- Do NOT send further reminders asking the user to go complete this same appointment.
+- Emit `"referral_visit_event": "NONE"` in `[CLINICAL_REPORT]` unless evaluating a brand-new active referral.
+
+{common_guidance}"""
+
+    return f"""=== ACTIVE IN-PERSON MEDICAL REFERRAL CONTEXT ===
+- Referral ID: {referral_state.get("referral_id")}
+- Recommended Specialist(s): {specs}
+- Urgency: {urgency}
+- Clinical Reason (translate into calm plain English, never quote raw JSON): {reason}
+- Observed Trends / Patterns: {trends_line}
+- Potential Examinations for Clinician Discussion: {workup_line}
+- {doc_guidance}
+
+CONTEXTUAL DOCTOR VISIT RECOGNITION IN NATURAL DIALOGUE (`referral_visit_event` IN `[CLINICAL_REPORT]`):
+- Understand the user's free, natural conversational language using recent chat history, your own previous question or reminder, and this active referral state — do NOT rely on rigid wording!
+- Set `"referral_visit_event"` inside `[CLINICAL_REPORT]` as follows:
+  1. `"COMPLETED_VISIT"`: ONLY when the user's message, understood in conversational context, clearly means they have ALREADY attended/completed an in-person appointment or examination with the doctor/specialist for this referral.
+     * Examples in full sentences: "I visited the doctor yesterday", "I had my appointment with the cardiologist", "The doctor examined me", "I have already seen the specialist", "I went, but it wasn't helpful".
+     * Examples in short contextual replies (when your preceding message asked or reminded about seeing the doctor, e.g. "Did you see the doctor?"): "I already did", "Yes, on Tuesday", "Yes, yesterday".
+     * Note: A completed visit is recorded from the user's self-report (stopping reminders), NOT as proof that the health issue is resolved. Warmly acknowledge their update, mention they can use `Update Health Information` whenever new results/conclusions are ready, and continue normal observation.
+  2. `"FUTURE_OR_BOOKED"`: When the appointment is planned, intended, or booked for the future and has NOT happened yet (e.g., "I will visit a doctor tomorrow", "I booked an appointment", "I booked it for Friday", "I only booked it", "I'm thinking about seeing a doctor").
+  3. `"NOT_YET_OR_NEGATED"`: When the visit has not occurred, is negated, is a question, is counterfactual/wishful, involves someone else's visit, or was only a phone call without an examination (e.g., "Not yet", "I haven't visited the doctor yet", "Should I visit the doctor?", "My friend visited a doctor", "The doctor called me", "I wish I had gone to the doctor").
+  4. `"UNCLEAR_NEEDS_CLARIFICATION"`: When the user mentions something potentially related to a visit, clinic, or doctor, but there is genuinely insufficient context to tell whether the in-person visit actually took place. Do NOT guess — ask ONE brief, natural clarifying question (respecting daily question limits) and set `"UNCLEAR_NEEDS_CLARIFICATION"`.
+  5. `"NONE"`: When the message is ordinary conversation or symptom reporting unrelated to confirming a doctor visit.
+
+{common_guidance}"""
+
+
+def build_athena_turn_referral_addendum(
+    referral_state: Dict[str, Any],
+    last_curator_message: Optional[str] = None,
+) -> str:
+    """
+    Stage 8A.4: Concise per-turn contextual addendum appended to interactive user turns
+    when a referral is active in the cycle so Gemini Flash evaluates short contextual
+    replies against Athena's immediately preceding message and emits `referral_visit_event`
+    inside the existing `[CLINICAL_REPORT]` JSON block (zero extra LLM calls).
+    """
+    if not isinstance(referral_state, dict) or not referral_state.get("has_active_referral"):
+        return ""
+    specs = ", ".join(referral_state.get("target_specialties") or ["specialist"])
+    prev_msg_line = (
+        f'- Your immediately preceding message to the user was: "{last_curator_message.strip()}"\n'
+        if last_curator_message and last_curator_message.strip()
+        else ""
+    )
+    return (
+        "\n\nACTIVE REFERRAL CONTEXTUAL CHECK (SINGLE-CALL STRUCTURED EVENT IN [CLINICAL_REPORT]):\n"
+        f"- Active referral specialist(s): {specs} (document status: {referral_state.get('athena_document_state')}).\n"
+        f"{prev_msg_line}"
+        "- Respond in clear, warm English. Do not force doctor talk if the user is discussing something else.\n"
+        "- Evaluate the user's message in full conversational context (including short replies to your previous message) "
+        'and include `"referral_visit_event"` (`"NONE"`, `"COMPLETED_VISIT"`, `"FUTURE_OR_BOOKED"`, '
+        '`"NOT_YET_OR_NEGATED"`, or `"UNCLEAR_NEEDS_CLARIFICATION"`) inside `[CLINICAL_REPORT]`. '
+        "If context is genuinely unclear on whether the visit already took place, ask one brief clarifying question instead of guessing.\n"
+    )
+
+
+def build_athena_referral_followup_reminder_prompt(
+    referral_state: Dict[str, Any],
+    reminder_number: int = 1,
+) -> str:
+    """
+    Stage 8A.4: Constructs the prompt for Athena's server-scheduled 168-hour follow-up
+    reminder while an in-person medical referral remains active and unconfirmed.
+    """
+    specs = ", ".join(referral_state.get("target_specialties") or ["a licensed physician"])
+    urgency = str(referral_state.get("urgency") or "routine")
+    reason = str(referral_state.get("clinical_reason_for_referral") or "").strip()
+    doc_state = str(referral_state.get("athena_document_state") or "referral_accepted_generating_document")
+    doc_guidance = _describe_athena_referral_document_status(doc_state)
+
+    return f"""[Internal Athena Referral Follow-up Reminder Formulation]:
+You are Athena, a calm, supportive personal AI companion in the Aegis application.
+A scheduled 168-hour follow-up interval (Reminder #{reminder_number}) has elapsed for an active in-person consultation recommendation, and the user has not yet confirmed completing the visit.
+
+ACTIVE REFERRAL DETAILS:
+- Recommended Specialist(s): {specs}
+- Consultation Timing / Urgency: {urgency}
+- Plain Clinical Context (do NOT dump raw JSON): {reason or "Ongoing weekly patterns warrant an in-person clinical evaluation."}
+- {doc_guidance}
+
+MANDATORY INSTRUCTIONS:
+1. Write a brief, warm, non-pushy follow-up message in clear English gently reminding the user about the recommended in-person consultation with {specs}.
+2. Accurately state the status of the Health Observation Summary strictly according to DOCUMENT STATUS above (if ready, remind them it is available in the Safe to bring to the doctor; if still generating or temporarily delayed, be honest and NEVER claim the file is ready).
+3. Invite the user to simply let you know in chat if they have already seen the doctor, and remind them that once they have new test results or medical conclusions they can use `Update Health Information` in the app.
+4. Do NOT sound alarmist, do NOT use medical titles for yourself, do NOT state confirmed diagnoses, and do NOT prescribe treatments.
+5. Respond strictly as valid JSON matching `AthenaReferralReminderOutput`:
+{{
+  "message": "Your calm, supportive English follow-up reminder message..."
+}}"""
 
 
 # ==============================================================================

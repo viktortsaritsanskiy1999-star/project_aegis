@@ -1030,6 +1030,117 @@ class AegisApiClient {
     }
   }
 
+  /// List doctor observation documents across all medical cycles (`GET /api/v1/client/referral/documents`).
+  /// Requires `reports:read` scope.
+  Future<ClientReferralDocumentListResponse> getReferralDocuments({
+    String? accessToken,
+  }) async {
+    final uri = Uri.parse('$baseUrl/api/v1/client/referral/documents');
+    try {
+      final response = await _sendWithAuthRetry(
+        sendRequest: (token) async {
+          final headers = await _buildHeaders(accessToken: token);
+          _log('GET $uri');
+          return await _client.get(uri, headers: headers).timeout(timeout);
+        },
+        explicitAccessToken: accessToken,
+      );
+
+      if (response.statusCode == 200) {
+        final data = json.decode(response.body) as Map<String, dynamic>;
+        return ClientReferralDocumentListResponse.fromJson(data);
+      }
+      _handleErrorResponse(response);
+    } on TimeoutException catch (e) {
+      _log('Timeout on $uri: $e');
+      throw AegisTimeoutException('Referral documents request timed out after ${timeout.inSeconds}s');
+    } on SocketException catch (e) {
+      _log('Socket error on $uri: $e');
+      throw AegisNetworkException('Network connection failed: ${e.message}');
+    } on http.ClientException catch (e) {
+      _log('Client error on $uri: $e');
+      throw AegisNetworkException('HTTP client error: ${e.message}');
+    }
+  }
+
+  /// Retrieve structured detail of a doctor observation document (`GET /api/v1/client/referral/documents/{report_id}`).
+  /// Requires `reports:read` scope.
+  Future<ClientReferralDocumentDetailResponse> getReferralDocumentDetail(
+    String reportId, {
+    String? accessToken,
+  }) async {
+    final cleanId = reportId.trim();
+    if (cleanId.isEmpty) {
+      throw const AegisValidationException('reportId must not be empty.');
+    }
+    final uri = Uri.parse('$baseUrl/api/v1/client/referral/documents/$cleanId');
+    try {
+      final response = await _sendWithAuthRetry(
+        sendRequest: (token) async {
+          final headers = await _buildHeaders(accessToken: token);
+          _log('GET $uri');
+          return await _client.get(uri, headers: headers).timeout(timeout);
+        },
+        explicitAccessToken: accessToken,
+      );
+
+      if (response.statusCode == 200) {
+        final data = json.decode(response.body) as Map<String, dynamic>;
+        return ClientReferralDocumentDetailResponse.fromJson(data);
+      }
+      _handleErrorResponse(response);
+    } on TimeoutException catch (e) {
+      _log('Timeout on $uri: $e');
+      throw AegisTimeoutException('Referral document detail request timed out after ${timeout.inSeconds}s');
+    } on SocketException catch (e) {
+      _log('Socket error on $uri: $e');
+      throw AegisNetworkException('Network connection failed: ${e.message}');
+    } on http.ClientException catch (e) {
+      _log('Client error on $uri: $e');
+      throw AegisNetworkException('HTTP client error: ${e.message}');
+    }
+  }
+
+  /// Export doctor observation document bytes (`GET /api/v1/client/referral/documents/{report_id}/export?format=pdf|docx|md`).
+  /// Requires `reports:read` scope.
+  Future<List<int>> exportReferralDocumentBytes(
+    String reportId, {
+    String format = 'pdf',
+    String? accessToken,
+  }) async {
+    final cleanId = reportId.trim();
+    if (cleanId.isEmpty) {
+      throw const AegisValidationException('reportId must not be empty.');
+    }
+    final cleanFormat = format.trim().toLowerCase();
+    final uri = Uri.parse('$baseUrl/api/v1/client/referral/documents/$cleanId/export')
+        .replace(queryParameters: {'format': cleanFormat});
+    try {
+      final response = await _sendWithAuthRetry(
+        sendRequest: (token) async {
+          final headers = await _buildHeaders(accessToken: token);
+          _log('GET $uri');
+          return await _client.get(uri, headers: headers).timeout(timeout);
+        },
+        explicitAccessToken: accessToken,
+      );
+
+      if (response.statusCode == 200) {
+        return response.bodyBytes;
+      }
+      _handleErrorResponse(response);
+    } on TimeoutException catch (e) {
+      _log('Timeout on $uri: $e');
+      throw AegisTimeoutException('Referral document export timed out after ${timeout.inSeconds}s');
+    } on SocketException catch (e) {
+      _log('Socket error on $uri: $e');
+      throw AegisNetworkException('Network connection failed: ${e.message}');
+    } on http.ClientException catch (e) {
+      _log('Client error on $uri: $e');
+      throw AegisNetworkException('HTTP client error: ${e.message}');
+    }
+  }
+
   /// Send an interactive chat turn to Athena wellness curator (`POST /api/v1/client/chat/athena`).
   /// Requires `chat:write` scope.
   /// Strictly preserves the caller's [AthenaChatRequest.idempotencyKey] across automatic 401 refresh retries

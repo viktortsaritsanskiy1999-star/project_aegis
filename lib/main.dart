@@ -1,4 +1,5 @@
 import 'package:aegis_health/screens/curator_chat_screen.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 import 'services/vault_service.dart';
@@ -22,6 +23,9 @@ import 'services/api/medical_ai_api_models.dart';
 import 'services/auth/auth_session_manager.dart';
 import 'services/sync/vitals_sync_queue.dart';
 import 'widgets/aegis_device_pairing_modal.dart';
+import 'screens/doctor_document_view_screen.dart';
+import 'widgets/doctor_documents_section.dart';
+import 'widgets/referral_banner.dart';
 
 /// Safe testable TokenProvider abstraction for standard Aegis mobile runtime.
 /// In standard mobile builds prior to Stage 5.3 user authentication, returns null.
@@ -220,7 +224,7 @@ class AtlasScreen extends StatefulWidget {
   AtlasScreenState createState() => AtlasScreenState();
 }
 
-class AtlasScreenState extends State<AtlasScreen> {
+class AtlasScreenState extends State<AtlasScreen> with WidgetsBindingObserver {
   final AthenaTriggerService _athenaTriggerService = AthenaTriggerService();
 
   // 1. Храним ссылку на сервис для отписки в dispose
@@ -250,6 +254,7 @@ class AtlasScreenState extends State<AtlasScreen> {
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
 
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted) return;
@@ -1285,11 +1290,19 @@ class AtlasScreenState extends State<AtlasScreen> {
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     // 4. Обязательно отписываемся от слушателей
     _authSessionManager?.removeListener(_onAuthSessionChanged);
     _vitalsService?.removeListener(_onVitalsStateChanged);
     _athenaTriggerService.dispose();
     super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed && mounted) {
+      _fetchPrimaryConsiliumReports(force: true);
+    }
   }
 
   // 🕒 TIME CONTROL MODAL SHEET
@@ -1628,13 +1641,21 @@ class AtlasScreenState extends State<AtlasScreen> {
       ),
     );
   }
-  void _openCuratorVault(BuildContext context) {
-    showModalBottomSheet(
+  void _openCuratorVault(BuildContext context) async {
+    await showModalBottomSheet(
       context: context,
       isScrollControlled: true,
       backgroundColor: Colors.transparent,
-      builder: (context) => const CuratorVaultSheet(),
+      builder: (context) => CuratorVaultSheet(
+        referralStatus: _latestCascadeStatus?.referralStatus,
+        onDocumentOpened: () {
+          _fetchPrimaryConsiliumReports(force: true);
+        },
+      ),
     );
+    if (mounted) {
+      _fetchPrimaryConsiliumReports(force: true);
+    }
   }
 
   @override
@@ -1832,6 +1853,35 @@ class AtlasScreenState extends State<AtlasScreen> {
                 ),
               ),
 
+              // 2.2 REFERRAL BANNER (NON-EMERGENCY)
+              if (_latestCascadeStatus?.hasActiveReferral == true &&
+                  _latestCascadeStatus?.referralStatus.status != 'visit_confirmed')
+                Positioned(
+                  top: 125,
+                  left: 15,
+                  right: 15,
+                  child: SafeArea(
+                    child: Center(
+                      child: ConstrainedBox(
+                        constraints: const BoxConstraints(maxWidth: 420),
+                        child: ReferralBanner(
+                          referralStatus: _latestCascadeStatus?.referralStatus,
+                          onOpenSafe: () => _openCuratorVault(context),
+                          onOpenDocument: (reportId) {
+                            Navigator.of(context).push(
+                              MaterialPageRoute(
+                                builder: (context) => DoctorDocumentViewScreen(reportId: reportId),
+                              ),
+                            ).then((_) {
+                              if (mounted) _fetchPrimaryConsiliumReports(force: true);
+                            });
+                          },
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+
               // 3️⃣ LEFT COLUMN OF ORGAN FOLDERS
               Positioned(
                   left: 20, top: 0, bottom: 0, width: 120,
@@ -1892,7 +1942,11 @@ class AtlasScreenState extends State<AtlasScreen> {
                             MaterialPageRoute(
                               builder: (context) => const CuratorChatScreen(),
                             ),
-                          );
+                          ).then((_) {
+                            if (mounted) {
+                              _fetchPrimaryConsiliumReports(force: true);
+                            }
+                          });
                         },
                         child: Stack(
                           clipBehavior: Clip.none,
@@ -2344,6 +2398,16 @@ class AtlasScreenState extends State<AtlasScreen> {
                     ),
                   ],
                 ],
+                if (isDone || _latestCascadeStatus?.hasActiveReferral == true) ...[
+                  const SizedBox(height: 20),
+                  DoctorDocumentsSection(
+                    referralStatus: _latestCascadeStatus?.referralStatus,
+                    onDocumentOpened: () {
+                      Navigator.of(context).pop();
+                      _fetchPrimaryConsiliumReports(force: true);
+                    },
+                  ),
+                ],
               ],
             ),
           ),
@@ -2656,7 +2720,16 @@ class AtlasScreenState extends State<AtlasScreen> {
 
 // 💬 CURATOR VAULT AND CHAT MODAL SCREEN
 class CuratorVaultSheet extends StatefulWidget {
-  const CuratorVaultSheet({super.key});
+  final ClientReferralStatus? referralStatus;
+  final VoidCallback? onDocumentOpened;
+  final bool? debugShowResetButton;
+
+  const CuratorVaultSheet({
+    super.key,
+    this.referralStatus,
+    this.onDocumentOpened,
+    this.debugShowResetButton,
+  });
 
   @override
   State<CuratorVaultSheet> createState() => _CuratorVaultSheetState();
@@ -2783,7 +2856,7 @@ class _CuratorVaultSheetState extends State<CuratorVaultSheet> {
         top: 20,
       ),
       child: SizedBox(
-        height: MediaQuery.of(context).size.height * 0.65,
+        height: MediaQuery.of(context).size.height * 0.80,
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
@@ -2798,12 +2871,14 @@ class _CuratorVaultSheetState extends State<CuratorVaultSheet> {
                     Text("CURATOR VAULT :: AEGIS", style: TextStyle(color: Colors.blueAccent, fontSize: 15, fontWeight: FontWeight.bold, letterSpacing: 1.2)),
                   ],
                 ),
-                // 🗑️ DELETE / RESET BUTTON
-                IconButton(
-                  icon: const Icon(Icons.delete_forever_rounded, color: Colors.redAccent, size: 22),
-                  tooltip: "Reset all data",
-                  onPressed: () => _showResetVaultDialog(context),
-                ),
+                // 🗑️ DELETE / RESET BUTTON (Restricted to debug/testing mode only; never shown in release builds)
+                if (widget.debugShowResetButton ?? kDebugMode)
+                  IconButton(
+                    key: const Key('debug_reset_vault_btn'),
+                    icon: const Icon(Icons.delete_forever_rounded, color: Colors.redAccent, size: 22),
+                    tooltip: "Reset all data (Debug/Test only)",
+                    onPressed: () => _showResetVaultDialog(context),
+                  ),
               ],
             ),
             const Divider(color: Colors.white24, height: 20),
@@ -2814,6 +2889,14 @@ class _CuratorVaultSheetState extends State<CuratorVaultSheet> {
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
+                    // 🩺 SECTION: DOCUMENTS FOR YOUR DOCTOR
+                    DoctorDocumentsSection(
+                      referralStatus: widget.referralStatus,
+                      onDocumentOpened: widget.onDocumentOpened,
+                    ),
+                    const SizedBox(height: 16),
+                    const Divider(color: Colors.white24, height: 20),
+
                     const Text("📋 M1 DUPLICATED FACTS AND VISION (WITHOUT HYPOTHESES):", style: TextStyle(color: Colors.orangeAccent, fontSize: 11, fontWeight: FontWeight.bold)),
                     const SizedBox(height: 6),
                     Container(
@@ -2860,6 +2943,44 @@ class _CuratorVaultSheetState extends State<CuratorVaultSheet> {
                         border: Border.all(color: Colors.purpleAccent.withOpacity(0.3)),
                       ),
                       child: Text(weeklyPlan, style: const TextStyle(color: Colors.white, fontSize: 12)),
+                    ),
+
+                    const SizedBox(height: 16),
+
+                    // 🛡️ FUTURE STAGE 8B: UPDATE HEALTH INFORMATION (NEO)
+                    // Compatible structure for Stage 8B; strictly non-active without server-side Neo cascade.
+                    // Never linked to destructive resetVault().
+                    Container(
+                      key: const Key('update_health_info_placeholder'),
+                      width: double.infinity,
+                      padding: const EdgeInsets.all(10),
+                      decoration: BoxDecoration(
+                        color: const Color(0xFF161B22),
+                        borderRadius: BorderRadius.circular(8),
+                        border: Border.all(color: Colors.white12),
+                      ),
+                      child: const Row(
+                        children: [
+                          Icon(Icons.sync_outlined, color: Colors.white38, size: 16),
+                          SizedBox(width: 8),
+                          Expanded(
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                Text(
+                                  'Update Health Information',
+                                  style: TextStyle(color: Colors.white54, fontSize: 11, fontWeight: FontWeight.bold),
+                                ),
+                                SizedBox(height: 2),
+                                Text(
+                                  'Future incremental update (Stage 8B). Available after in-person doctor visit.',
+                                  style: TextStyle(color: Colors.white38, fontSize: 10),
+                                ),
+                              ],
+                            ),
+                          ),
+                        ],
+                      ),
                     ),
                   ],
                 ),

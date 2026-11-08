@@ -661,8 +661,10 @@ def test_11_export_is_pure_and_idempotent_zero_db_mutations(client: TestClient, 
     report_repo = ModelReportRepository(db_session)
     count_before = len(report_repo.list_client_facing(cycle_id))
 
-    # Repeated downloads across all formats
+    # Repeated downloads across all formats (with artificial delay across second boundary)
+    import time
     res_pdf1 = client.get(f"/api/v1/client/referral/documents/{client_doc.report_id}/export?format=pdf")
+    time.sleep(1.05)
     res_pdf2 = client.get(f"/api/v1/client/referral/documents/{client_doc.report_id}/export?format=pdf")
     res_docx = client.get(f"/api/v1/client/referral/documents/{client_doc.report_id}/export?format=docx")
     res_md = client.get(f"/api/v1/client/referral/documents/{client_doc.report_id}/export?format=md")
