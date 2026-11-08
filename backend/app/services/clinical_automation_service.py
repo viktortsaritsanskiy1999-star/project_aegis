@@ -71,6 +71,7 @@ class AutomationJobType(str, Enum):
     WEEKLY_CONSILIUM_B = "weekly_consilium_step_b"
     WEEKLY_CONSILIUM_C = "weekly_consilium_step_c"
     LAB_REVISION = "lab_revision"
+    REFERRAL_DOCUMENT_GENERATION = "referral_document_generation"
 
 
 class AutomationJobStatus(str, Enum):
@@ -167,11 +168,15 @@ class ClinicalAutomationService:
         )
         from app.services.lab_scheduling_service import LabSchedulingService
         from app.services.lab_revision_consilium_service import LabRevisionConsiliumService
+        from app.services.referral_document_service import ReferralDocumentService
 
         self.lab_scheduling_service = LabSchedulingService(
             db=db, gateway=self.gateway, now_provider=self.now_provider
         )
         self.lab_revision_service = LabRevisionConsiliumService(
+            db=db, gateway=self.gateway, now_provider=self.now_provider
+        )
+        self.referral_document_service = ReferralDocumentService(
             db=db, gateway=self.gateway, now_provider=self.now_provider
         )
 
@@ -231,6 +236,8 @@ class ClinicalAutomationService:
             return f"weekly_consilium_step_c_{clean_cycle}_w1"
         if resolved_type == AutomationJobType.LAB_REVISION:
             return f"lab_revision_{clean_cycle}"
+        if resolved_type == AutomationJobType.REFERRAL_DOCUMENT_GENERATION:
+            return f"referral_doc_{clean_cycle}"
         return f"auto_{resolved_type.value}_{clean_cycle}"
 
     @staticmethod
@@ -706,6 +713,57 @@ class ClinicalAutomationService:
             next_attempt_at_utc=eff_available,
         )
 
+    def enqueue_referral_document_generation(
+        self,
+        cycle_id: str,
+        patient_id: Optional[str] = None,
+        referral_id: Optional[str] = None,
+        sprint_id: Optional[str] = None,
+        available_at_utc: Optional[datetime] = None,
+        max_attempts: int = DEFAULT_JOB_MAX_ATTEMPTS,
+    ) -> Optional[AutomationJobRecord]:
+        """
+        Enqueues Stage 8A.2 background Referral Document Generation (Flash -> Pro).
+        Strictly requires an active medical cycle and an active referral lifecycle state.
+        Deterministic idempotency_key prevents duplicate jobs for the same referral sprint.
+        """
+        clean_cycle = (cycle_id or "").strip()
+        if not clean_cycle:
+            return None
+        cycle = self.cycle_repo.get(clean_cycle)
+        if cycle is None or cycle.status != "active":
+            return None
+        effective_patient_id = (patient_id or cycle.patient_id or "").strip()
+        if not effective_patient_id:
+            return None
+
+        ref_state = self.weekly_service.get_referral_lifecycle_state(clean_cycle)
+        if not ref_state or ref_state.get("status") not in ("generating_document", "document_ready"):
+            return None
+
+        eff_ref_id = (referral_id or str(ref_state.get("referral_id") or "")).strip()
+        eff_sprint_id = (
+            sprint_id
+            or str(ref_state.get("pending_document_sprint_id") or ref_state.get("sprint_id") or "")
+        ).strip()
+        if not eff_ref_id:
+            return None
+
+        eff_available = (available_at_utc or self._now_utc()).isoformat()
+        idempotency_key = (
+            f"referral_doc_{clean_cycle}_{eff_ref_id}_{eff_sprint_id}"
+            if eff_sprint_id
+            else f"referral_doc_{clean_cycle}_{eff_ref_id}"
+        )
+        return self.enqueue_or_get_job(
+            patient_id=effective_patient_id,
+            cycle_id=clean_cycle,
+            job_type=AutomationJobType.REFERRAL_DOCUMENT_GENERATION,
+            idempotency_key=idempotency_key,
+            max_attempts=max_attempts,
+            next_attempt_at_utc=eff_available,
+        )
+
     def get_job_by_id(self, job_id: str) -> Optional[AutomationJobRecord]:
         row = (
             self.db.query(ModelReport)
@@ -965,6 +1023,16 @@ class ClinicalAutomationService:
                                     n += 1
                                     if n > 52:
                                         break
+
+            # Stage 8A.2: Discover unfinished Referral Document Generation (Flash -> Pro) for active cycles
+            if self.weekly_service.needs_referral_document_generation(cycle.cycle_id):
+                ref_doc_job = self.enqueue_referral_document_generation(
+                    cycle_id=cycle.cycle_id,
+                    patient_id=cycle.patient_id,
+                )
+                if ref_doc_job is not None:
+                    discovered.append(ref_doc_job)
+
         # Discover background Lab Revision tasks if enabled
         if self.enable_lab_revision:
             ready_tasks = self.lab_scheduling_service.get_ready_tasks_for_execution()
@@ -1694,21 +1762,38 @@ class ClinicalAutomationService:
             idempotency_key=core_idem,
         )
 
-        # Enqueue Step B immediately
+        # Enqueue Step B immediately (never blocked by Referral Document Generation)
         self.enqueue_weekly_consilium_b(
             cycle_id=job.cycle_id,
             patient_id=job.patient_id,
             sprint_number=week_num,
         )
 
-        return {
+        ref_state = self.weekly_service.get_referral_lifecycle_state(job.cycle_id)
+        has_active_referral = bool(ref_state and ref_state.get("status") in ("generating_document", "document_ready"))
+
+        # Stage 8A.2: Enqueue durable background Referral Document Generation (Flash -> Pro) if needed
+        referral_doc_job_id: Optional[str] = None
+        if has_active_referral and self.weekly_service.needs_referral_document_generation(job.cycle_id):
+            ref_doc_job = self.enqueue_referral_document_generation(
+                cycle_id=job.cycle_id,
+                patient_id=job.patient_id,
+            )
+            if ref_doc_job is not None:
+                referral_doc_job_id = ref_doc_job.job_id
+
+        result_meta: Dict[str, Any] = {
             "sprint_id": client_resp.sprint_id,
             "sprint_number": client_resp.sprint_number,
             "overall_report_id": client_resp.overall_report.report_id,
             "overall_report_version": client_resp.overall_report.version,
             "system_reports_count": len(client_resp.system_reports),
             "completed_at_utc": self._now_utc().isoformat(),
+            "has_active_referral": has_active_referral,
         }
+        if referral_doc_job_id is not None:
+            result_meta["referral_document_job_id"] = referral_doc_job_id
+        return result_meta
 
     async def _execute_weekly_consilium_b(
         self, job: AutomationJobRecord
@@ -1851,6 +1936,71 @@ class ClinicalAutomationService:
             "summary": rev_record.summary,
         }
 
+    async def _execute_referral_document_generation(
+        self, job: AutomationJobRecord
+    ) -> Dict[str, Any]:
+        """
+        Executes Stage 8A.2 background Referral Document Generation (Flash -> Pro):
+        1. Validates patient/cycle ownership.
+        2. If the medical cycle is already closed (e.g., due to Neo reassessment),
+           gracefully skips execution with ZERO Gemini calls and never publishes an
+           outdated referral into a new active cycle.
+        3. Executes ReferralDocumentService.generate_referral_document (idempotent).
+        4. Never re-runs Weekly Consilium on failure.
+        """
+        from app.services.referral_document_service import ReferralCycleInactiveError
+
+        cycle = self.cycle_repo.get(job.cycle_id)
+        if cycle is None or cycle.patient_id != job.patient_id:
+            raise ConsiliumCycleNotFoundError(
+                f"Cycle '{job.cycle_id}' not found for patient '{job.patient_id}'."
+            )
+
+        if cycle.status != "active":
+            return {
+                "skipped": True,
+                "reason": "cycle_not_active",
+                "cycle_status": cycle.status,
+            }
+
+        ref_state = self.weekly_service.get_referral_lifecycle_state(job.cycle_id)
+        if not ref_state or ref_state.get("status") not in ("generating_document", "document_ready"):
+            return {
+                "skipped": True,
+                "reason": "no_active_referral",
+            }
+
+        target_sprint_id: Optional[str] = None
+        ref_id = str(ref_state.get("referral_id") or "")
+        key_prefix = f"referral_doc_{job.cycle_id}_{ref_id}_"
+        if ref_id and job.idempotency_key.startswith(key_prefix):
+            extracted = job.idempotency_key[len(key_prefix):].strip()
+            if extracted:
+                target_sprint_id = extracted
+
+        try:
+            res = await self.referral_document_service.generate_referral_document(
+                cycle_id=job.cycle_id,
+                patient_id=job.patient_id,
+                sprint_id=target_sprint_id,
+            )
+        except ReferralCycleInactiveError:
+            return {
+                "skipped": True,
+                "reason": "cycle_not_active",
+            }
+
+        return {
+            "reused_existing": res.reused_existing,
+            "referral_id": res.referral_id,
+            "sprint_id": res.sprint_id,
+            "sprint_number": res.sprint_number,
+            "document_report_id": res.document_report_id,
+            "raw_document_report_id": res.raw_document_report_id,
+            "document_version": res.document_version,
+            "status": res.status,
+        }
+
     async def execute_claimed_job(self, claimed: AutomationJobRecord) -> AutomationJobRecord:
         if not claimed.lease_owner_id:
             raise ConsiliumConcurrencyConflictError(
@@ -1907,6 +2057,12 @@ class ClinicalAutomationService:
                     lease_owner_id,
                     lambda: self._execute_lab_revision(claimed),
                 )
+            elif claimed.job_type == AutomationJobType.REFERRAL_DOCUMENT_GENERATION:
+                result_meta = await self._execute_with_job_lease_renewal(
+                    claimed.job_id,
+                    lease_owner_id,
+                    lambda: self._execute_referral_document_generation(claimed),
+                )
             else:
                 raise ValueError(f"Unsupported automation job_type '{claimed.job_type}'.")
 
@@ -1923,6 +2079,21 @@ class ClinicalAutomationService:
                 exc,
                 retryable=retryable,
             )
+            if claimed.job_type == AutomationJobType.REFERRAL_DOCUMENT_GENERATION:
+                try:
+                    gen_state = (
+                        "retryable_failure"
+                        if (failed is not None and failed.status == AutomationJobStatus.RETRYABLE_FAILURE)
+                        else "terminal_failure"
+                    )
+                    self.weekly_service.record_referral_document_generation_status(
+                        cycle_id=claimed.cycle_id,
+                        generation_state=gen_state,
+                        error_type=type(exc).__name__,
+                        commit=True,
+                    )
+                except Exception:
+                    pass
             if failed is not None:
                 return failed
             raise

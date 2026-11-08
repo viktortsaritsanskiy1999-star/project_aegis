@@ -6,6 +6,7 @@ from app.routers.cascade import router as cascade_router
 from app.routers.vitals import router as vitals_router
 from app.routers.client_cascade import router as client_cascade_router
 from app.routers.client_chat import router as client_chat_router
+from app.routers.client_referral import router as client_referral_router
 
 __all__ = [
     "auth_router",
@@ -16,4 +17,5 @@ __all__ = [
     "vitals_router",
     "client_cascade_router",
     "client_chat_router",
+    "client_referral_router",
 ]

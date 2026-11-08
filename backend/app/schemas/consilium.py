@@ -3,7 +3,7 @@ from decimal import Decimal, InvalidOperation
 import math
 import re
 from enum import Enum
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Literal, Optional, Tuple
 from pydantic import BaseModel, Field, ConfigDict, field_validator, model_validator
 from app.schemas.reports import ClientModelReportResponse
 
@@ -539,6 +539,47 @@ class WeeklyFlashMasterOutput(BaseModel):
     user_system_reports: WeeklyUserSystemReportsMap
 
 
+class ProReferralDecision(BaseModel):
+    """
+    Structured referral decision produced exclusively by the Chief Physician (Pro)
+    during Weekly Consilium when in-person medical evaluation is clinically indicated.
+    """
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    recommended: bool = Field(default=False)
+    urgency: Literal["none", "routine", "priority"] = Field(default="none")
+    target_specialties: List[str] = Field(default_factory=list)
+    clinical_reason_for_referral: str = Field(default="")
+    observed_syndromes_or_trends: List[str] = Field(default_factory=list)
+    recommended_workup_for_doctor_discussion: List[str] = Field(default_factory=list)
+
+    @field_validator("urgency", mode="before")
+    @classmethod
+    def normalize_urgency(cls, v: Any) -> str:
+        if not v:
+            return "none"
+        norm = str(v).strip().lower()
+        if norm in ("none", "routine", "priority"):
+            return norm
+        if any(w in norm for w in ("prior", "urgent", "high")):
+            return "priority"
+        if any(w in norm for w in ("rout", "plan", "low", "med")):
+            return "routine"
+        return "none"
+
+    @model_validator(mode="after")
+    def validate_referral_consistency(self) -> "ProReferralDecision":
+        if self.recommended:
+            if self.urgency == "none":
+                object.__setattr__(self, "urgency", "routine")
+            if not self.target_specialties:
+                object.__setattr__(self, "target_specialties", ["General Practitioner"])
+        else:
+            if self.urgency != "none":
+                object.__setattr__(self, "urgency", "none")
+        return self
+
+
 class WeeklyProMasterOutput(BaseModel):
     """
     Structured output contract for Weekly Chief Physician (Pro):
@@ -547,6 +588,7 @@ class WeeklyProMasterOutput(BaseModel):
     - strategy_status ('updated' or 'continued')
     - weekly_overall_report (client_facing weekly overall summary for the Client Vault)
     - flash_quality_review (quality control & deterministic corrections for Flash's 8 weekly system updates)
+    - referral_decision (optional in-person medical referral recommendation)
     """
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
 
@@ -554,6 +596,7 @@ class WeeklyProMasterOutput(BaseModel):
     strategy_status: str = Field(default="updated", min_length=1)
     weekly_overall_report: ProUserOverallReport
     flash_quality_review: ProFlashQualityReview = Field(default_factory=ProFlashQualityReview)
+    referral_decision: Optional[ProReferralDecision] = Field(default=None)
 
     @field_validator("strategy_status", mode="after")
     @classmethod
@@ -1985,3 +2028,210 @@ class EcgVisionIntakeClientResponse(BaseModel):
         "Clinical interpretation, rhythm evaluation, and cardiac findings are synthesized exclusively "
         "during the medical consilium."
     )
+
+
+# ==============================================================================
+# STAGE 8A.2 — REFERRAL DOCUMENT GENERATION SCHEMAS (FLASH -> PRO)
+# ==============================================================================
+
+REFERRAL_DOCUMENT_CANONICAL_TITLE: str = "AEGIS — HEALTH OBSERVATION SUMMARY FOR YOUR DOCTOR"
+
+_FORBIDDEN_DIAGNOSTIC_OVERREACH_PATTERNS = (
+    re.compile(r"(?i)\bofficial\s+(?:medical|hospital|clinical)\s+discharge\s+summary\b"),
+    re.compile(r"(?i)\bconfirmed\s+(?:medical|clinical|definitive)\s+diagnosis\b"),
+    re.compile(r"(?i)\bdefinitive\s+diagnosis\s+(?:established|confirmed)\b"),
+)
+
+
+def _contains_unnegated_diagnostic_overreach(text: str) -> bool:
+    """
+    Returns True if text claims to be an official discharge summary or a confirmed
+    clinical diagnosis without a negating qualifier in the surrounding clause.
+    """
+    if not text:
+        return False
+    for pattern in _FORBIDDEN_DIAGNOSTIC_OVERREACH_PATTERNS:
+        for match in pattern.finditer(text):
+            start = max(0, match.start() - 45)
+            prefix = text[start:match.start()].lower()
+            if not any(
+                neg in prefix
+                for neg in ("not ", "not an ", "not a ", "neither ", "never ", "no ", "does not ", "is not ")
+            ):
+                return True
+    return False
+
+
+class ReferralClinicalFactItem(BaseModel):
+    """
+    Single attributed clinical fact or patient-reported statement extracted by
+    Gemini Flash Clinical History Extractor from server-authoritative records.
+    """
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    date_or_period: str = Field(..., min_length=1, max_length=120)
+    category: Literal[
+        "anamnesis",
+        "laboratory",
+        "ecg_or_exam",
+        "vitals_measurement",
+        "wellness_summary",
+        "mode2_episode",
+        "patient_reported_symptom",
+        "chief_physician_conclusion",
+    ]
+    finding: str = Field(..., min_length=1)
+    value_and_unit: Optional[str] = Field(default=None)
+    source_attribution: str = Field(..., min_length=1)
+    is_patient_self_reported: bool = Field(default=False)
+
+
+class ReferralClinicalHistoryExtraction(BaseModel):
+    """
+    Structured output of Step 1 (Gemini Flash — Clinical History Extractor) in the
+    Stage 8A.2 Referral Document cascade.
+    Strictly preserves dates, exact units, source attributions, and missing-data gaps.
+    """
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    observation_period_start: str = Field(..., min_length=1, max_length=64)
+    observation_period_end: str = Field(..., min_length=1, max_length=64)
+    observation_period_summary: str = Field(..., min_length=1)
+    anamnesis_and_baseline_facts: List[ReferralClinicalFactItem] = Field(default_factory=list)
+    objective_measurements_and_labs: List[ReferralClinicalFactItem] = Field(default_factory=list)
+    ecg_and_examination_findings: List[ReferralClinicalFactItem] = Field(default_factory=list)
+    patient_reported_complaints: List[ReferralClinicalFactItem] = Field(default_factory=list)
+    wellness_and_mode2_events: List[ReferralClinicalFactItem] = Field(default_factory=list)
+    observed_changes_and_recurring_patterns: List[str] = Field(default_factory=list)
+    prior_chief_physician_conclusions: List[str] = Field(default_factory=list)
+    approved_referral_reason_summary: str = Field(..., min_length=1)
+    data_gaps_and_uncertainties: List[str] = Field(default_factory=list)
+
+
+class ReferralDoctorDocumentOutput(BaseModel):
+    """
+    Structured output of Step 2 (Gemini Pro — Doctor Observation Document Author)
+    in the Stage 8A.2 Referral Document cascade.
+    Produces an English informational health observation summary for discussion
+    with a licensed clinician across 7 mandatory sections.
+    """
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    document_title: str = Field(
+        default=REFERRAL_DOCUMENT_CANONICAL_TITLE,
+        min_length=1,
+        max_length=200,
+    )
+    informational_disclaimer: str = Field(..., min_length=20)
+    recommended_specialties: List[str] = Field(..., min_length=1)
+    consultation_urgency: Literal["routine", "priority"]
+    executive_summary_for_patient: str = Field(..., min_length=10)
+
+    # Mandatory 7 clinical observation sections:
+    patient_and_observation_period: str = Field(..., min_length=10)
+    reason_for_in_person_consultation: str = Field(..., min_length=10)
+    objective_measurements_and_examination_results: List[str] = Field(..., min_length=1)
+    timeline_of_reported_symptoms_and_changes: List[str] = Field(..., min_length=1)
+    important_patterns_and_unresolved_concerns: List[str] = Field(..., min_length=1)
+    ai_observations_requiring_verification: List[str] = Field(..., min_length=1)
+    questions_and_examinations_for_clinician: List[str] = Field(..., min_length=1)
+
+    @field_validator("consultation_urgency", mode="before")
+    @classmethod
+    def _normalize_doc_urgency(cls, v: Any) -> str:
+        norm = str(v or "").strip().lower()
+        if norm in ("routine", "priority"):
+            return norm
+        if any(w in norm for w in ("prior", "urgent", "high")):
+            return "priority"
+        if any(w in norm for w in ("rout", "plan", "standard")):
+            return "routine"
+        return norm
+
+    @model_validator(mode="after")
+    def _validate_document_integrity_and_safety(self) -> "ReferralDoctorDocumentOutput":
+        norm_title = re.sub(r"\s*[-–—]\s*", " — ", self.document_title.strip()).upper()
+        if norm_title != REFERRAL_DOCUMENT_CANONICAL_TITLE:
+            raise ValueError(
+                f"Invalid document_title '{self.document_title}': must be '{REFERRAL_DOCUMENT_CANONICAL_TITLE}'."
+            )
+        object.__setattr__(self, "document_title", REFERRAL_DOCUMENT_CANONICAL_TITLE)
+
+        clean_specs = [s.strip() for s in self.recommended_specialties if s and s.strip()]
+        if not clean_specs:
+            raise ValueError("recommended_specialties must contain at least one non-empty clinician specialty.")
+        object.__setattr__(self, "recommended_specialties", clean_specs)
+
+        list_section_names = (
+            "objective_measurements_and_examination_results",
+            "timeline_of_reported_symptoms_and_changes",
+            "important_patterns_and_unresolved_concerns",
+            "ai_observations_requiring_verification",
+            "questions_and_examinations_for_clinician",
+        )
+        for sec_name in list_section_names:
+            items = getattr(self, sec_name)
+            cleaned = [it.strip() for it in items if isinstance(it, str) and len(it.strip()) >= 3]
+            if not cleaned:
+                raise ValueError(f"Section '{sec_name}' must contain at least one substantive entry.")
+            object.__setattr__(self, sec_name, cleaned)
+
+        all_text_blocks = [
+            self.informational_disclaimer,
+            self.executive_summary_for_patient,
+            self.patient_and_observation_period,
+            self.reason_for_in_person_consultation,
+            *self.objective_measurements_and_examination_results,
+            *self.timeline_of_reported_symptoms_and_changes,
+            *self.important_patterns_and_unresolved_concerns,
+            *self.ai_observations_requiring_verification,
+            *self.questions_and_examinations_for_clinician,
+        ]
+        combined_text = "\n".join(all_text_blocks)
+        if _contains_unnegated_diagnostic_overreach(combined_text):
+            raise ValueError(
+                "Referral document violates medical safety boundary: must not claim to be an "
+                "official discharge summary or a confirmed medical diagnosis."
+            )
+
+        return self
+
+    def render_english_markdown(self) -> str:
+        """
+        Renders the authoritative English structured document with all 7 mandatory
+        sections and explicit non-diagnostic informational framing.
+        """
+        specs_str = ", ".join(self.recommended_specialties)
+        urgency_label = (
+            "Priority outpatient evaluation recommended"
+            if self.consultation_urgency == "priority"
+            else "Routine planned outpatient evaluation recommended"
+        )
+
+        def _bullets(items: List[str]) -> str:
+            return "\n".join(f"- {item}" for item in items)
+
+        return (
+            f"# {REFERRAL_DOCUMENT_CANONICAL_TITLE}\n\n"
+            f"> **Informational Observation Notice:** {self.informational_disclaimer}\n"
+            f"> *(This document is an AI-generated health observation summary prepared solely to facilitate "
+            f"discussion with a licensed healthcare professional. It is NOT an official medical discharge "
+            f"summary and does NOT represent a confirmed clinical diagnosis.)*\n\n"
+            f"- **Recommended Clinician Specialties:** {specs_str}\n"
+            f"- **Recommended Timing:** {urgency_label} (`{self.consultation_urgency}`)\n\n"
+            f"## 1. Patient and Observation Period\n"
+            f"{self.patient_and_observation_period}\n\n"
+            f"## 2. Reason for Recommending an In-Person Consultation\n"
+            f"{self.reason_for_in_person_consultation}\n\n"
+            f"## 3. Objective Health Measurements and Examination Results\n"
+            f"{_bullets(self.objective_measurements_and_examination_results)}\n\n"
+            f"## 4. Timeline of Reported Symptoms and Observed Changes\n"
+            f"{_bullets(self.timeline_of_reported_symptoms_and_changes)}\n\n"
+            f"## 5. Important Patterns and Unresolved Concerns\n"
+            f"{_bullets(self.important_patterns_and_unresolved_concerns)}\n\n"
+            f"## 6. AI-Generated Observations Requiring Professional Verification\n"
+            f"{_bullets(self.ai_observations_requiring_verification)}\n\n"
+            f"## 7. Questions and Possible Examinations to Discuss with a Licensed Clinician\n"
+            f"{_bullets(self.questions_and_examinations_for_clinician)}\n"
+        )
+

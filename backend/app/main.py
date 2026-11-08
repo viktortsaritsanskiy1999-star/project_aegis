@@ -14,6 +14,7 @@ from app.routers import (
     vitals_router,
     client_cascade_router,
     client_chat_router,
+    client_referral_router,
 )
 from app.services.clinical_automation_service import ClinicalAutomationWorker
 
@@ -94,3 +95,4 @@ app.include_router(cascade_router)
 app.include_router(vitals_router)
 app.include_router(client_cascade_router)
 app.include_router(client_chat_router)
+app.include_router(client_referral_router)

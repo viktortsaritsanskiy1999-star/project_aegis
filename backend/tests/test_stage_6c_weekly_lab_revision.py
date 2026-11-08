@@ -420,6 +420,26 @@ async def _seed_active_cycle_with_baseline(
             row.content = c
             session.commit()
 
+    # Anchor all baseline reports to anchor_dt so that historical cutoff queries (as_of)
+    # evaluate consistently regardless of the host machine's wall-clock time.
+    eff_anchor = anchor_dt.replace(tzinfo=timezone.utc) if anchor_dt.tzinfo is None else anchor_dt
+    for rep in session.query(ModelReport).filter(ModelReport.cycle_id == cycle_id).all():
+        rep_dt = rep.created_at.replace(tzinfo=timezone.utc) if rep.created_at and rep.created_at.tzinfo is None else rep.created_at
+        if rep_dt is None or rep_dt > eff_anchor:
+            rep.created_at = anchor_dt
+        if rep.report_type == LABORATORY_LEDGER_REPORT_TYPE and rep.content:
+            c = dict(rep.content)
+            rec_dt = None
+            if c.get("recorded_at"):
+                try:
+                    rec_dt = datetime.fromisoformat(c["recorded_at"])
+                except Exception:
+                    pass
+            if rec_dt is None or (rec_dt.replace(tzinfo=timezone.utc) if rec_dt.tzinfo is None else rec_dt) > eff_anchor:
+                c["recorded_at"] = anchor_dt.isoformat()
+                rep.content = c
+    session.commit()
+
 
 def _seed_seven_day_athena_logs(
     session: Session,

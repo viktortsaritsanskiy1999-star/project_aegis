@@ -662,6 +662,21 @@ YOUR TASK:
    - Conclusions from the background Lab Revision (including parallel Gemini Pro) are strictly advisory inputs and do NOT replace your decision as Chief Physician of the Weekly Consilium.
    - If new laboratory markers arrived during cooldown, evaluate them directly from the ledger without relying on outdated revision conclusions.
    - You must independently assess the complete patient picture (symptoms, Mode 2 / vitals, Athena logs, labs, and Flash synthesis) to determine whether to update the strategy ("updated") or confirm its continuation ("continued").
+6. IN-PERSON MEDICAL REFERRAL DECISION (referral_decision):
+   - You, and ONLY you as Chief Physician (Pro), have the exclusive authority to recommend an in-person medical consultation or diagnostic evaluation. Flash and Athena NEVER make this decision.
+   - Do NOT recommend an in-person consultation automatically for a single isolated fluctuation or transient normal variation.
+   - Clinical indications include: sustained worsening of metrics over days or sprints, recurring or progressing complaints in Athena's diary, unfavorable multi-system combination patterns, or lack of expected response to lifestyle adjustments.
+   - If an in-person medical consultation is indicated:
+     * "recommended": true
+     * "urgency": "routine" (for planned outpatient visits) or "priority" (for significant deterioration requiring prompt medical evaluation within days). DO NOT use for acute red-flag life-threatening emergencies (which belong to emergency care/112).
+     * "target_specialties": list of relevant specialties (e.g. ["Cardiologist", "Endocrinologist"])
+     * "clinical_reason_for_referral": clear objective medical reason explaining why an in-person consultation is advised
+     * "observed_syndromes_or_trends": list of key observed dynamic clinical trends or syndrome patterns
+     * "recommended_workup_for_doctor_discussion": list of specific lab or instrumental evaluations the patient can discuss with their in-person doctor
+   - If no in-person medical consultation is required at this time:
+     * "recommended": false, "urgency": "none", "target_specialties": [], "clinical_reason_for_referral": "", "observed_syndromes_or_trends": [], "recommended_workup_for_doctor_discussion": []
+   - NEVER present AI hypotheses as established or confirmed medical diagnoses. If data is limited, explicitly acknowledge diagnostic uncertainty.
+   - Do NOT alter existing emergency rules: acute life-threatening situations belong to immediate emergency care (112), not weekly routine referral.
 
 CRITICAL JSON FORMATTING RULE:
 Inside string values, it is STRICTLY FORBIDDEN to use unescaped double quotes. Use guillemets « » or ' '.
@@ -679,6 +694,14 @@ MANDATORY JSON RESPONSE FORMAT:
     "approved_for_publication": true,
     "rejection_reason": null,
     "corrected_user_system_reports": {{}}
+  }},
+  "referral_decision": {{
+    "recommended": false,
+    "urgency": "none",
+    "target_specialties": [],
+    "clinical_reason_for_referral": "",
+    "observed_syndromes_or_trends": [],
+    "recommended_workup_for_doctor_discussion": []
   }}
 }}"""
 
@@ -1533,3 +1556,90 @@ def build_athena_weekly_wrapup_prompt(
      "message": "Текст сообщения Афины пользователю..."
    }}
 """
+
+
+# ==============================================================================
+# 9. STAGE 8A.2 — REFERRAL DOCUMENT GENERATION PROMPTS (FLASH -> PRO, ENGLISH)
+# ==============================================================================
+
+def build_referral_flash_extractor_prompt(clinical_snapshot: Dict[str, Any]) -> str:
+    """
+    Stage 8A.2 Step 1 (Gemini Flash — Clinical History Extractor):
+    Receives a bounded, server-prepared clinical snapshot and compiles a strictly
+    attributed, factual clinical chronology without inventing dates, metrics, units,
+    diagnoses, or unperformed examinations.
+    """
+    snapshot_json = json.dumps(clinical_snapshot, ensure_ascii=False, indent=2)
+    return f"""[Internal Clinical History Extraction Scenario — Referral Document Cascade Step 1 of 2]:
+You are the Clinical History Extractor (Gemini Flash) in the Aegis Medical AI System.
+Following the Weekly Consilium Chief Physician (Pro) decision to recommend an in-person clinical evaluation, your task is to extract a rigorous, source-attributed, chronological clinical inventory strictly in ENGLISH from the server-prepared clinical snapshot below.
+
+SERVER-PREPARED AUTHORITATIVE CLINICAL SNAPSHOT (READ-ONLY):
+{snapshot_json}
+
+MANDATORY DATA FIDELITY & ANTI-HALLUCINATION RULES:
+1. LANGUAGE: Write every field strictly in clear, professional English. If patient quotes or anamnesis notes in the snapshot are in another language, accurately translate/summarize them into English while explicitly marking them as patient-reported.
+2. ZERO FABRICATION:
+   - NEVER invent, extrapolate, or guess dates, timestamps, numerical values, units of measurement, reference ranges, diagnoses, or examinations that are not explicitly present in the snapshot.
+   - Preserve exact dates/timestamps and exact measurement units (e.g., bpm, mmHg, %, ms, mmol/L, mIU/L, g/dL) verbatim from the snapshot. If a unit or date is missing in the source, explicitly state that it was not recorded rather than guessing.
+   - If a data category (such as laboratory studies, ECG, Wellness summaries, Mode 2 episodes, or Athena journals) is marked as unavailable or empty, do NOT invent entries for it; instead, record that absence clearly in "data_gaps_and_uncertainties".
+3. STRICT SOURCE ATTRIBUTION & SEPARATION OF EVIDENCE:
+   - Every item in fact lists MUST specify "source_attribution" (e.g., "preparatory_anamnesis_m1", "laboratory_ledger v2 (sample_date=2026-10-15)", "preparatory_ecg", "health_measurement", "wellness_daily_report", "athena_mode2_episode", "athena_daily_journal", "chief_physician_internal").
+   - Set "is_patient_self_reported" to true ONLY for subjective symptoms, complaints, or history reported by the patient in anamnesis, Mode 2 user statements, or Athena chats. Objective sensor/lab/ECG values must have "is_patient_self_reported": false.
+   - Prior Chief Physician conclusions and Athena assessments are AI analytical hypotheses, NOT confirmed clinical diagnoses. Summarize them faithfully in "prior_chief_physician_conclusions" as AI observations.
+4. CHRONOLOGY & PATTERNS:
+   - Establish "observation_period_start" and "observation_period_end" from the authoritative cycle/measurement timestamps in the snapshot.
+   - Capture recurring patterns, directional changes, and cross-source discrepancies in "observed_changes_and_recurring_patterns".
+   - List all missing baseline exams, unmeasured parameters, single-lead ECG limitations, or recognition ambiguities in "data_gaps_and_uncertainties".
+
+CRITICAL JSON FORMATTING RULE:
+Respond ONLY with a valid JSON object strictly conforming to the ReferralClinicalHistoryExtraction schema. Do not use unescaped double quotes inside JSON string values (use single quotes ' ' when quoting)."""
+
+
+def build_referral_pro_document_prompt(
+    flash_extraction: Dict[str, Any],
+    referral_decision: Dict[str, Any],
+    cycle_metadata: Dict[str, Any],
+) -> str:
+    """
+    Stage 8A.2 Step 2 (Gemini Pro — Doctor Observation Document Author):
+    Receives Flash's structured clinical history extraction and Weekly Pro's referral
+    decision, authoring the English structured observation summary for a licensed clinician.
+    """
+    extraction_json = json.dumps(flash_extraction, ensure_ascii=False, indent=2)
+    decision_json = json.dumps(referral_decision, ensure_ascii=False, indent=2)
+    meta_json = json.dumps(cycle_metadata, ensure_ascii=False, indent=2)
+
+    return f"""[Doctor Observation Summary Authoring Scenario — Referral Document Cascade Step 2 of 2]:
+You are the Chief Physician Author (Gemini Pro) in the Aegis Health Observation System.
+Using ONLY the verified clinical history extraction prepared by Gemini Flash and the approved Weekly Consilium referral decision below, author a structured, objective, clinician-oriented document in ENGLISH for the patient to bring to an in-person consultation with a licensed physician.
+
+1. OBSERVATION CYCLE METADATA:
+{meta_json}
+
+2. APPROVED WEEKLY PRO REFERRAL DECISION:
+{decision_json}
+
+3. VERIFIED CLINICAL HISTORY EXTRACTION (FROM FLASH EXTRACTOR):
+{extraction_json}
+
+MANDATORY CLINICAL & LEGAL SAFETY DIRECTIVES:
+1. DOCUMENT TITLE & FRAMING:
+   - "document_title" MUST be exact: "AEGIS — HEALTH OBSERVATION SUMMARY FOR YOUR DOCTOR".
+   - This document is an informational health observation summary intended solely to assist discussion with a licensed healthcare professional.
+   - NEVER call this document an "official medical discharge summary" or claim a "confirmed clinical diagnosis". Explicitly state in "informational_disclaimer" that this summary is generated by an AI health observation system for informational discussion with a licensed clinician and does not constitute an official medical record, discharge summary, or confirmed diagnosis.
+2. ALL 7 MANDATORY SECTIONS IN ENGLISH:
+   - "patient_and_observation_period": Summarize the observation window (exact start/end dates), relevant baseline anamnesis context, and data sources included (without inventing personal identifiers such as real names, passport numbers, or addresses).
+   - "reason_for_in_person_consultation": Clearly articulate why an in-person evaluation with the recommended specialist(s) is advised now, grounded in the approved referral decision.
+   - "objective_measurements_and_examination_results": Present verified objective vitals, laboratory results (with exact dates, numerical values, units, and reference ranges where available), and ECG/examination findings (including technical limitations). If no labs or ECG were recorded, state that absence explicitly — NEVER fabricate values.
+   - "timeline_of_reported_symptoms_and_changes": Chronological timeline of symptoms, complaints, and functional changes explicitly attributed as reported by the patient ("Patient reported on YYYY-MM-DD..."), clearly separated from objective sensor/lab readings.
+   - "important_patterns_and_unresolved_concerns": Recurring physiological trends, Mode 2 vital alert episodes, Wellness shifts, contradictions between subjective complaints and objective telemetry, and explicit data gaps/uncertainties.
+   - "ai_observations_requiring_verification": Preliminary analytical hypotheses and pattern observations formulated by the Aegis AI system that require independent verification and differential evaluation by a licensed physician (explicitly framed as non-diagnostic AI hypotheses, never as established diagnoses).
+   - "questions_and_examinations_for_clinician": Practical, respectful questions for the patient to discuss with the physician and potential diagnostic workup/examinations for the clinician's independent consideration (never framed as mandatory medical orders or prescriptions).
+3. STRICT SEPARATION OF FACTS, SELF-REPORTS, AND AI HYPOTHESES:
+   - Keep objective measurements (Section 3), patient-reported symptoms (Section 4), and AI-generated hypotheses (Section 6) strictly distinct. Never present an AI hypothesis or unverified symptom as an objective finding.
+   - Never prescribe medications or dosages.
+
+CRITICAL JSON FORMATTING RULE:
+Respond ONLY with a valid JSON object strictly conforming to the ReferralDoctorDocumentOutput schema. Do not use unescaped double quotes inside JSON string values."""
+

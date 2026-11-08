@@ -23,6 +23,7 @@ from app.schemas.consilium import (
     AegisAgentRole,
     WeeklyFlashMasterOutput,
     WeeklyProMasterOutput,
+    ProReferralDecision,
     AthenaClinicalLogEntry,
     ActiveAthenaStrategyContext,
     AthenaSessionState,
@@ -56,6 +57,7 @@ ATHENA_ACTIVE_STRATEGY_REPORT_TYPE = "athena_active_strategy"
 WEEKLY_DEPUTY_INTERNAL_REPORT_TYPE = "weekly_deputy_internal"
 WEEKLY_CHIEF_INTERNAL_REPORT_TYPE = "weekly_chief_physician_internal"
 WEEKLY_OVERALL_CLIENT_REPORT_TYPE = "weekly_user_overall_report"
+REFERRAL_LIFECYCLE_STATE_REPORT_TYPE = "referral_lifecycle_state"
 
 WEEKLY_CONSILIUM_LOCK_TTL_SECONDS: int = 120
 WEEKLY_CONSILIUM_LOCK_HEARTBEAT_SECONDS: float = 15.0
@@ -759,6 +761,411 @@ class WeeklyConsiliumService:
             next_sprint_id=effective_next_sprint_id if has_boundary_elapsed else None,
             current_calendar_week=cal_week,
             current_calendar_day=cal_day,
+        )
+
+    # ==========================================================================
+    # STAGE 8A.1 / 8A.2 — REFERRAL LIFECYCLE STATE MANAGEMENT (SERVER-ONLY)
+    # ==========================================================================
+
+    def _get_latest_referral_lifecycle_report(self, cycle_id: str) -> Optional[ModelReport]:
+        """
+        Deterministically returns the highest-version SERVER_ONLY referral_lifecycle_state
+        row for cycle_id, regardless of repository list ordering.
+        """
+        reports = self.report_repo.list_server_only(
+            cycle_id=cycle_id,
+            report_type=REFERRAL_LIFECYCLE_STATE_REPORT_TYPE,
+        )
+        if not reports:
+            return None
+        return max(reports, key=lambda r: (int(r.version or 0), r.created_at or datetime.min.replace(tzinfo=timezone.utc)))
+
+    def get_referral_lifecycle_state(self, cycle_id: str) -> Optional[Dict[str, Any]]:
+        """
+        Retrieves the latest referral lifecycle state for cycle_id if one exists,
+        or None if no referral has been recorded for this cycle.
+        """
+        latest = self._get_latest_referral_lifecycle_report(cycle_id)
+        if latest is None or not latest.content:
+            return None
+        return dict(latest.content)
+
+    def needs_referral_document_generation(self, cycle_id: str) -> bool:
+        """
+        Returns True when the cycle has an active referral that requires server-side
+        Flash -> Pro document generation (either initial document missing/unverified,
+        or a concrete updated sprint decision pending a new document version).
+        """
+        state = self.get_referral_lifecycle_state(cycle_id)
+        if not state:
+            return False
+        status_val = state.get("status")
+        if status_val not in ("generating_document", "document_ready"):
+            return False
+
+        doc_id = state.get("document_report_id")
+        doc_exists = bool(
+            doc_id
+            and (doc_row := self.report_repo.get(str(doc_id))) is not None
+            and doc_row.cycle_id == cycle_id
+            and doc_row.privacy_level == PrivacyLevel.CLIENT_FACING.value
+        )
+        if not doc_exists:
+            return True
+
+        pending_sprint = state.get("pending_document_sprint_id")
+        generated_sprint = state.get("generated_for_sprint_id")
+        if pending_sprint and pending_sprint != generated_sprint:
+            return True
+        return False
+
+    def get_referral_state_for_athena(self, cycle_id: str) -> Dict[str, Any]:
+        """
+        Stage 8A.2 (Athena Compatibility Preparation for Stage 8A.4):
+        Computes authoritative server-side referral & document readiness state so Athena
+        can unambiguously distinguish:
+        - 'none': no referral recorded
+        - 'referral_accepted_generating_document': referral accepted, document is being created
+        - 'document_ready': verified client-facing referral_doctor_document is ready in Vault
+        - 'generation_temporarily_failed': referral accepted, latest document generation failed / retrying
+        - 'visit_confirmed': patient confirmed completed clinician visit
+        """
+        state = self.get_referral_lifecycle_state(cycle_id)
+        if not state:
+            return {
+                "has_active_referral": False,
+                "lifecycle_status": "none",
+                "athena_document_state": "none",
+                "document_generation_state": "none",
+                "document_report_id": None,
+                "referral_id": None,
+                "urgency": None,
+                "target_specialties": [],
+            }
+
+        status_val = str(state.get("status") or "none")
+        gen_state = str(state.get("document_generation_state") or "")
+        raw_doc_id = state.get("document_report_id")
+        verified_doc_id: Optional[str] = None
+        if raw_doc_id:
+            doc_row = self.report_repo.get(str(raw_doc_id))
+            if (
+                doc_row is not None
+                and doc_row.cycle_id == cycle_id
+                and doc_row.privacy_level == PrivacyLevel.CLIENT_FACING.value
+            ):
+                verified_doc_id = doc_row.report_id
+
+        if status_val == "visit_confirmed":
+            return {
+                "has_active_referral": False,
+                "lifecycle_status": "visit_confirmed",
+                "athena_document_state": "visit_confirmed",
+                "document_generation_state": "ready" if verified_doc_id else "none",
+                "document_report_id": verified_doc_id,
+                "referral_id": state.get("referral_id"),
+                "urgency": state.get("urgency"),
+                "target_specialties": list(state.get("target_specialties") or []),
+            }
+
+        is_failed = gen_state in ("retryable_failure", "terminal_failure")
+        effective_lifecycle_status = (
+            "document_ready"
+            if (status_val == "document_ready" and verified_doc_id is not None)
+            else "generating_document"
+        )
+
+        if is_failed:
+            athena_doc_state = "generation_temporarily_failed"
+            client_gen_state = "temporarily_failed"
+        elif verified_doc_id is not None and not state.get("pending_document_sprint_id"):
+            athena_doc_state = "document_ready"
+            client_gen_state = "ready"
+        elif verified_doc_id is not None and state.get("pending_document_sprint_id"):
+            # Previously ready document remains accessible while a newer version is generating
+            athena_doc_state = "document_ready"
+            client_gen_state = "generating"
+        else:
+            athena_doc_state = "referral_accepted_generating_document"
+            client_gen_state = "generating"
+
+        return {
+            "has_active_referral": status_val in ("generating_document", "document_ready"),
+            "lifecycle_status": effective_lifecycle_status,
+            "athena_document_state": athena_doc_state,
+            "document_generation_state": client_gen_state,
+            "document_report_id": verified_doc_id,
+            "referral_id": state.get("referral_id"),
+            "urgency": state.get("urgency"),
+            "target_specialties": list(state.get("target_specialties") or []),
+            "clinical_reason_for_referral": state.get("clinical_reason_for_referral"),
+            "created_at_utc": state.get("created_at_utc"),
+            "last_generation_error_type": state.get("last_generation_error_type"),
+            "last_generation_failed_at_utc": state.get("last_generation_failed_at_utc"),
+        }
+
+    def record_referral_document_generation_status(
+        self,
+        cycle_id: str,
+        generation_state: str,
+        error_type: Optional[str] = None,
+        commit: bool = True,
+    ) -> Optional[ModelReport]:
+        """
+        Records non-sensitive document generation progress or transient/terminal error
+        metadata in referral_lifecycle_state without corrupting any previously ready
+        document link or marking an ungenerated document as ready.
+        """
+        latest = self._get_latest_referral_lifecycle_report(cycle_id)
+        if latest is None or not latest.content:
+            return None
+        prior = dict(latest.content)
+        if prior.get("status") not in ("generating_document", "document_ready"):
+            return None
+
+        now_iso = self._now_utc().isoformat()
+        updated = dict(prior)
+        updated["document_generation_state"] = generation_state
+        if generation_state in ("retryable_failure", "terminal_failure"):
+            updated["last_generation_error_type"] = error_type or "GenerationError"
+            updated["last_generation_failed_at_utc"] = now_iso
+        elif generation_state in ("pending", "generating", "ready"):
+            updated["last_generation_error_type"] = None
+            updated["last_generation_failed_at_utc"] = None
+        updated["updated_at_utc"] = now_iso
+
+        return self.report_repo.create_next_version(
+            cycle_id=cycle_id,
+            sprint_id=latest.sprint_id,
+            model=self.gateway.pro_model,
+            report_type=REFERRAL_LIFECYCLE_STATE_REPORT_TYPE,
+            privacy_level=PrivacyLevel.SERVER_ONLY,
+            content=updated,
+            commit=commit,
+        )
+
+    def save_referral_lifecycle_state(
+        self,
+        cycle_id: str,
+        patient_id: str,
+        sprint_id: str,
+        sprint_number: int,
+        decision: ProReferralDecision,
+        commit: bool = True,
+    ) -> Optional[ModelReport]:
+        """
+        Public persistence helper for referral lifecycle state.
+        Executes within existing transaction or commits independently if requested.
+        """
+        rep = self._persist_referral_decision_uncommitted(
+            cycle_id=cycle_id,
+            patient_id=patient_id,
+            sprint_id=sprint_id,
+            sprint_number=sprint_number,
+            decision=decision,
+        )
+        if commit and rep is not None:
+            self.db.commit()
+        return rep
+
+    def _persist_referral_decision_uncommitted(
+        self,
+        cycle_id: str,
+        patient_id: str,
+        sprint_id: str,
+        sprint_number: int,
+        decision: ProReferralDecision,
+    ) -> Optional[ModelReport]:
+        """
+        Persists or updates the SERVER_ONLY referral_lifecycle_state for cycle_id.
+        Rules:
+        - If decision.recommended is False: does not alter active referral, returns None.
+        - If this exact sprint_id already recorded this referral version: skips duplicate.
+        - Inspects the single latest referral_lifecycle_state version:
+          * If latest status is active ('generating_document' or 'document_ready'):
+            updates it by creating the next version, preserving referral_id, created_at_utc,
+            existing document_report_id, and document_history_report_ids. Only schedules a
+            new document version (pending_document_sprint_id) if no ready document exists yet
+            or if the new decision introduces substantive clinical updates.
+          * If no referral exists or latest status is 'visit_confirmed':
+            provisions a new referral with a fresh UUID, status='generating_document'.
+        """
+        if not decision.recommended:
+            return None
+
+        # Ensure sprint row exists to satisfy foreign key constraint on model_reports.sprint_id
+        if sprint_id and self.sprint_repo.get(sprint_id) is None:
+            self.sprint_repo.create(
+                sprint_id=sprint_id,
+                cycle_id=cycle_id,
+                sprint_number=sprint_number,
+                status="active",
+                commit=False,
+            )
+
+        now_iso = self._now_utc().isoformat()
+        latest_report = self._get_latest_referral_lifecycle_report(cycle_id)
+
+        active_report: Optional[ModelReport] = None
+        if latest_report is not None:
+            latest_content = latest_report.content or {}
+            if latest_content.get("status") in ("generating_document", "document_ready"):
+                active_report = latest_report
+
+        if active_report is not None:
+            prior_content = dict(active_report.content or {})
+            # Avoid duplicate version if already recorded for this exact sprint
+            if prior_content.get("sprint_id") == sprint_id:
+                return active_report
+
+            referral_id = prior_content.get("referral_id") or str(uuid.uuid4())
+            created_at_utc = prior_content.get("created_at_utc") or now_iso
+            existing_doc_id = prior_content.get("document_report_id")
+            existing_raw_doc_id = prior_content.get("raw_document_report_id")
+            existing_doc_ready_at = prior_content.get("document_ready_at_utc")
+            existing_generated_sprint = prior_content.get("generated_for_sprint_id")
+            existing_history_ids = list(prior_content.get("document_history_report_ids") or [])
+            if existing_doc_id and existing_doc_id not in existing_history_ids:
+                existing_history_ids.append(existing_doc_id)
+
+            # Verify whether existing_doc_id actually points to a persisted CLIENT_FACING document
+            doc_verified = bool(
+                existing_doc_id
+                and (doc_row := self.report_repo.get(str(existing_doc_id))) is not None
+                and doc_row.cycle_id == cycle_id
+                and doc_row.privacy_level == PrivacyLevel.CLIENT_FACING.value
+            )
+            if not doc_verified:
+                existing_doc_id = None
+                existing_doc_ready_at = None
+
+            current_status = "document_ready" if doc_verified else "generating_document"
+            last_reminder_at = prior_content.get("last_reminder_at_utc")
+            reminder_count = int(prior_content.get("reminder_count", 0))
+
+            # Merge target specialties preserving order and uniqueness
+            prior_specs = list(prior_content.get("target_specialties") or [])
+            merged_specs: List[str] = list(prior_specs)
+            for s in decision.target_specialties:
+                if s not in merged_specs:
+                    merged_specs.append(s)
+
+            # Combine or upgrade urgency
+            prior_urgency = prior_content.get("urgency", "routine")
+            effective_urgency = "priority" if ("priority" in (prior_urgency, decision.urgency)) else decision.urgency
+
+            # Merge observed syndromes and workup recommendations
+            prior_trends = list(prior_content.get("observed_syndromes_or_trends") or [])
+            merged_trends: List[str] = list(prior_trends)
+            for t in decision.observed_syndromes_or_trends:
+                if t not in merged_trends:
+                    merged_trends.append(t)
+
+            prior_workup = list(prior_content.get("recommended_workup_for_doctor_discussion") or [])
+            merged_workup: List[str] = list(prior_workup)
+            for w in decision.recommended_workup_for_doctor_discussion:
+                if w not in merged_workup:
+                    merged_workup.append(w)
+
+            prior_reason = str(prior_content.get("clinical_reason_for_referral") or "").strip()
+            new_reason = str(decision.clinical_reason_for_referral or "").strip()
+            effective_reason = new_reason or prior_reason
+
+            has_substantive_update = (
+                merged_specs != prior_specs
+                or effective_urgency != prior_urgency
+                or merged_trends != prior_trends
+                or merged_workup != prior_workup
+                or (bool(new_reason) and new_reason != prior_reason)
+            )
+
+            if not doc_verified or has_substantive_update:
+                pending_doc_sprint: Optional[str] = sprint_id
+                doc_gen_state = "pending"
+            else:
+                pending_doc_sprint = prior_content.get("pending_document_sprint_id")
+                doc_gen_state = "ready" if not pending_doc_sprint else "pending"
+
+            updated_content: Dict[str, Any] = {
+                "referral_id": referral_id,
+                "cycle_id": cycle_id,
+                "patient_id": patient_id,
+                "sprint_id": sprint_id,
+                "sprint_number": sprint_number,
+                "referral_source": prior_content.get("referral_source") or "weekly_consilium_pro",
+                "status": current_status,
+                "urgency": effective_urgency,
+                "target_specialties": merged_specs,
+                "clinical_reason_for_referral": effective_reason,
+                "observed_syndromes_or_trends": merged_trends,
+                "recommended_workup_for_doctor_discussion": merged_workup,
+                "document_report_id": existing_doc_id,
+                "raw_document_report_id": existing_raw_doc_id,
+                "document_ready_at_utc": existing_doc_ready_at,
+                "generated_for_sprint_id": existing_generated_sprint,
+                "pending_document_sprint_id": pending_doc_sprint,
+                "document_history_report_ids": existing_history_ids,
+                "document_generation_state": doc_gen_state,
+                "last_generation_error_type": None,
+                "last_generation_failed_at_utc": None,
+                "last_reminder_at_utc": last_reminder_at,
+                "reminder_count": reminder_count,
+                "visit_confirmed_at_utc": None,
+                "visit_confirmation_turn_id": None,
+                "created_at_utc": created_at_utc,
+                "decision_date_utc": now_iso,
+                "updated_at_utc": now_iso,
+            }
+            return self.report_repo.create_next_version(
+                cycle_id=cycle_id,
+                sprint_id=sprint_id,
+                model=self.gateway.pro_model,
+                report_type=REFERRAL_LIFECYCLE_STATE_REPORT_TYPE,
+                privacy_level=PrivacyLevel.SERVER_ONLY,
+                content=updated_content,
+                commit=False,
+            )
+
+        # New referral (either first referral in cycle or previous was 'visit_confirmed')
+        new_referral_id = str(uuid.uuid4())
+        new_content: Dict[str, Any] = {
+            "referral_id": new_referral_id,
+            "cycle_id": cycle_id,
+            "patient_id": patient_id,
+            "sprint_id": sprint_id,
+            "sprint_number": sprint_number,
+            "referral_source": "weekly_consilium_pro",
+            "status": "generating_document",
+            "urgency": decision.urgency,
+            "target_specialties": list(decision.target_specialties),
+            "clinical_reason_for_referral": decision.clinical_reason_for_referral,
+            "observed_syndromes_or_trends": list(decision.observed_syndromes_or_trends),
+            "recommended_workup_for_doctor_discussion": list(decision.recommended_workup_for_doctor_discussion),
+            "document_report_id": None,
+            "raw_document_report_id": None,
+            "document_ready_at_utc": None,
+            "generated_for_sprint_id": None,
+            "pending_document_sprint_id": sprint_id,
+            "document_history_report_ids": [],
+            "document_generation_state": "pending",
+            "last_generation_error_type": None,
+            "last_generation_failed_at_utc": None,
+            "last_reminder_at_utc": None,
+            "reminder_count": 0,
+            "visit_confirmed_at_utc": None,
+            "visit_confirmation_turn_id": None,
+            "created_at_utc": now_iso,
+            "decision_date_utc": now_iso,
+            "updated_at_utc": now_iso,
+        }
+        return self.report_repo.create_next_version(
+            cycle_id=cycle_id,
+            sprint_id=sprint_id,
+            model=self.gateway.pro_model,
+            report_type=REFERRAL_LIFECYCLE_STATE_REPORT_TYPE,
+            privacy_level=PrivacyLevel.SERVER_ONLY,
+            content=new_content,
+            commit=False,
         )
 
     # ==========================================================================
@@ -2393,9 +2800,24 @@ class WeeklyConsiliumService:
                             "updated_weekly_strategy": pro_output.updated_weekly_strategy,
                             "strategy_status": pro_output.strategy_status,
                             "flash_quality_review": pro_output.flash_quality_review.model_dump(),
+                            "referral_decision": (
+                                pro_output.referral_decision.model_dump()
+                                if pro_output.referral_decision is not None
+                                else None
+                            ),
                         },
                         commit=False,
                     )
+
+                    # Stage 8A.1: Manage server_only referral lifecycle state if recommended by Chief Physician Pro
+                    if pro_output.referral_decision and pro_output.referral_decision.recommended:
+                        self._persist_referral_decision_uncommitted(
+                            cycle_id=cycle_id,
+                            patient_id=cycle.patient_id,
+                            sprint_id=resolved_sprint_id,
+                            sprint_number=resolved_sprint_number,
+                            decision=pro_output.referral_decision,
+                        )
 
                     # Save new active Athena strategy version linked to cycle_id, sprint_id, and version
                     next_strategy_ver = (
@@ -2516,6 +2938,9 @@ class WeeklyConsiliumService:
                             "evaluated_lab_revision_version": lab_rev_data.get("latest_eval_ver"),
                             "lab_revision_report_id": lab_rev_data.get("latest_report_id"),
                             "lab_revision_status": lab_rev_data.get("status_code"),
+                            "referral_recommended": bool(
+                                pro_output.referral_decision and pro_output.referral_decision.recommended
+                            ),
                         },
                         commit=False,
                     )

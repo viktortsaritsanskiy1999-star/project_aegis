@@ -1,5 +1,5 @@
 from datetime import datetime, timezone
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Dict, List, Literal, Optional
 from fastapi import (
     APIRouter,
     Depends,
@@ -134,6 +134,20 @@ class ClientAnamnesisIntakeRequest(BaseModel):
     cycle_id: Optional[str] = Field(default=None, description="Optional; server authoritative session takes precedence")
 
 
+class ClientReferralStatus(BaseModel):
+    """Client-safe view of active referral status without internal clinical reasoning."""
+    model_config = ConfigDict(extra="forbid")
+
+    has_active_referral: bool = False
+    status: Literal["none", "generating_document", "document_ready", "visit_confirmed"] = "none"
+    document_generation_state: Literal["none", "generating", "ready", "temporarily_failed"] = "none"
+    urgency: Optional[str] = None
+    target_specialties: List[str] = Field(default_factory=list)
+    clinical_reason_summary: Optional[str] = None
+    document_report_id: Optional[str] = None
+    created_at_utc: Optional[str] = None
+
+
 class ClientCascadeStatusResponse(BaseModel):
     """Status summary of client clinical pipeline readiness for authenticated patient."""
     model_config = ConfigDict(extra="forbid")
@@ -158,6 +172,8 @@ class ClientCascadeStatusResponse(BaseModel):
     active_routine_question_text: Optional[str] = None
     routine_question_reminders_count: int = 0
     can_send_routine_reminder: bool = False
+    has_active_referral: bool = False
+    referral_status: ClientReferralStatus = Field(default_factory=ClientReferralStatus)
 
 
 class ClientWeeklyConsiliumRunRequest(BaseModel):
@@ -308,6 +324,11 @@ def get_client_cascade_status(
             next_sprint_id=None,
             current_calendar_week=None,
             current_calendar_day=None,
+            has_active_referral=False,
+            referral_status=ClientReferralStatus(
+                has_active_referral=False,
+                status="none",
+            ),
         )
 
     cycle_id = active_cycle.cycle_id
@@ -325,6 +346,27 @@ def get_client_cascade_status(
     has_unreviewed = ledger_state.has_unreviewed_lab_changes
 
     weekly_state = weekly_service.get_weekly_sprint_lifecycle_state(cycle_id)
+
+    ref_athena_state = weekly_service.get_referral_state_for_athena(cycle_id)
+    if ref_athena_state.get("lifecycle_status") != "none":
+        has_active_ref = bool(ref_athena_state.get("has_active_referral", False))
+        client_referral = ClientReferralStatus(
+            has_active_referral=has_active_ref,
+            status=ref_athena_state.get("lifecycle_status", "none"),
+            document_generation_state=ref_athena_state.get("document_generation_state", "none"),
+            urgency=ref_athena_state.get("urgency"),
+            target_specialties=ref_athena_state.get("target_specialties") or [],
+            clinical_reason_summary=ref_athena_state.get("clinical_reason_for_referral"),
+            document_report_id=ref_athena_state.get("document_report_id"),
+            created_at_utc=ref_athena_state.get("created_at_utc"),
+        )
+    else:
+        has_active_ref = False
+        client_referral = ClientReferralStatus(
+            has_active_referral=False,
+            status="none",
+            document_generation_state="none",
+        )
 
     athena_service = AthenaChatService(db=db, gateway=gateway, now_provider=now_provider)
     active_q = athena_service.get_active_routine_question(cycle_id)
@@ -357,6 +399,8 @@ def get_client_cascade_status(
         active_routine_question_text=active_q_text,
         routine_question_reminders_count=reminders_cnt,
         can_send_routine_reminder=can_remind,
+        has_active_referral=has_active_ref,
+        referral_status=client_referral,
     )
 
 
@@ -789,6 +833,7 @@ async def run_client_primary_consilium(
     ),
 )
 async def run_client_weekly_consilium(
+    request: Request,
     response: Response,
     payload: Optional[ClientWeeklyConsiliumRunRequest] = None,
     cycle: MedicalCycle = Depends(resolve_active_cycle_for_patient),
@@ -907,12 +952,29 @@ async def run_client_weekly_consilium(
             )
 
     try:
-        return await service.run_weekly_consilium(
+        weekly_result = await service.run_weekly_consilium(
             cycle_id=cycle.cycle_id,
             sprint_id=target_sprint_id,
             report_date=report_date,
             idempotency_key=idempotency_key,
         )
+        if service.needs_referral_document_generation(cycle.cycle_id):
+            try:
+                automation_service = ClinicalAutomationService(
+                    db=db,
+                    gateway=gateway,
+                    now_provider=now_provider,
+                )
+                automation_service.enqueue_referral_document_generation(
+                    cycle_id=cycle.cycle_id,
+                    patient_id=cycle.patient_id,
+                )
+                worker = getattr(request.app.state, "automation_worker", None)
+                if worker is not None and hasattr(worker, "notify"):
+                    worker.notify()
+            except Exception:
+                pass
+        return weekly_result
     except ConsiliumCycleNotFoundError as exc:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,

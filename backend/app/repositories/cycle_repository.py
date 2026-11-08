@@ -37,6 +37,21 @@ class MedicalCycleRepository:
             .order_by(MedicalCycle.started_at.desc())
         ).scalars().first()
 
+    def list_by_patient(self, patient_id: str) -> List[MedicalCycle]:
+        """Returns all clinical cycles owned by the specified patient, ordered by start date desc."""
+        clean_patient_id = (patient_id or "").strip()
+        if not clean_patient_id:
+            return []
+        return list(
+            self.db.execute(
+                select(MedicalCycle)
+                .where(MedicalCycle.patient_id == clean_patient_id)
+                .order_by(MedicalCycle.started_at.desc(), MedicalCycle.created_at.desc())
+            )
+            .scalars()
+            .all()
+        )
+
     def get_or_create_active_for_patient(
         self,
         patient_id: str,
