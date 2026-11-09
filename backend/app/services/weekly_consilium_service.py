@@ -52,6 +52,14 @@ from app.services.primary_consilium_service import (
 )
 
 
+class ConsiliumCycleInactiveError(ConsiliumError):
+    """
+    Stage 8B.1: Raised when an in-flight or background Consilium attempts to commit
+    state onto a cycle that has transitioned out of 'active' (e.g. closed/completed
+    due to Neo reassessment start). Subclasses ConsiliumError.
+    """
+
+
 ATHENA_CLINICAL_LOG_REPORT_TYPE = "athena_clinical_log"
 ATHENA_CHAT_HISTORY_REPORT_TYPE = "athena_chat_history"
 ATHENA_ACTIVE_STRATEGY_REPORT_TYPE = "athena_active_strategy"
@@ -2884,7 +2892,7 @@ class WeeklyConsiliumService:
         if not cycle:
             raise ConsiliumCycleNotFoundError(f"Medical cycle '{cycle_id}' not found.")
         if cycle.status != "active":
-            raise ConsiliumError(
+            raise ConsiliumCycleInactiveError(
                 f"Cannot run Weekly Consilium on non-active cycle '{cycle_id}' (status='{cycle.status}')."
             )
 
@@ -3355,6 +3363,15 @@ class WeeklyConsiliumService:
                         },
                         commit=False,
                     )
+
+                    # Stage 8B.1: Multi-layer fencing against in-flight execution races
+                    fresh_cycle = self.cycle_repo.get_fresh(cycle_id)
+                    if fresh_cycle is None or fresh_cycle.status != "active":
+                        self.db.rollback()
+                        raise ConsiliumCycleInactiveError(
+                            f"Weekly Consilium aborting commit for cycle '{cycle_id}': "
+                            f"cycle is no longer active (status='{getattr(fresh_cycle, 'status', None)}')."
+                        )
 
                     self.db.commit()
                 except Exception:

@@ -19,25 +19,60 @@ class MedicalCycleRepository:
     def __init__(self, db: Session):
         self.db = db
 
-    def get(self, cycle_id: str) -> Optional[MedicalCycle]:
-        return self.db.execute(
-            select(MedicalCycle).where(MedicalCycle.cycle_id == cycle_id)
-        ).scalar_one_or_none()
+    def get(self, cycle_id: str, populate_existing: bool = False) -> Optional[MedicalCycle]:
+        stmt = select(MedicalCycle).where(MedicalCycle.cycle_id == cycle_id)
+        if populate_existing:
+            stmt = stmt.execution_options(populate_existing=True)
+        return self.db.execute(stmt).scalar_one_or_none()
+
+    def get_fresh(self, cycle_id: str) -> Optional[MedicalCycle]:
+        """Loads or reloads the MedicalCycle row directly from the database, bypassing ORM identity-map caching."""
+        return self.get(cycle_id, populate_existing=True)
 
     def get_active(self) -> Optional[MedicalCycle]:
         return self.db.execute(
             select(MedicalCycle).where(MedicalCycle.status == "active").order_by(MedicalCycle.started_at.desc())
         ).scalars().first()
 
-    def get_active_for_patient(self, patient_id: str) -> Optional[MedicalCycle]:
-        """Resolves the current active clinical cycle owned by the specified patient."""
+    def get_active_for_patient(
+        self, patient_id: str, include_pending_reassessment: bool = True
+    ) -> Optional[MedicalCycle]:
+        """Resolves the current active (or pending_reassessment) clinical cycle owned by the specified patient."""
+        clean_patient_id = (patient_id or "").strip()
+        if not clean_patient_id:
+            return None
+        if include_pending_reassessment:
+            return self.db.execute(
+                select(MedicalCycle)
+                .where(
+                    MedicalCycle.patient_id == clean_patient_id,
+                    MedicalCycle.status.in_(("active", "pending_reassessment")),
+                )
+                .order_by(MedicalCycle.started_at.desc(), MedicalCycle.created_at.desc())
+            ).scalars().first()
         return self.db.execute(
             select(MedicalCycle)
-            .where(MedicalCycle.patient_id == patient_id, MedicalCycle.status == "active")
-            .order_by(MedicalCycle.started_at.desc())
+            .where(MedicalCycle.patient_id == clean_patient_id, MedicalCycle.status == "active")
+            .order_by(MedicalCycle.started_at.desc(), MedicalCycle.created_at.desc())
         ).scalars().first()
 
-    def list_by_patient(self, patient_id: str) -> List[MedicalCycle]:
+    def get_pending_reassessment_for_patient(self, patient_id: str) -> Optional[MedicalCycle]:
+        """Resolves an existing cycle in pending_reassessment status owned by the specified patient."""
+        clean_patient_id = (patient_id or "").strip()
+        if not clean_patient_id:
+            return None
+        return self.db.execute(
+            select(MedicalCycle)
+            .where(
+                MedicalCycle.patient_id == clean_patient_id,
+                MedicalCycle.status == "pending_reassessment",
+            )
+            .order_by(MedicalCycle.started_at.desc(), MedicalCycle.created_at.desc())
+        ).scalars().first()
+
+    def list_by_patient(
+        self, patient_id: str, limit: int = 100, offset: int = 0
+    ) -> List[MedicalCycle]:
         """Returns all clinical cycles owned by the specified patient, ordered by start date desc."""
         clean_patient_id = (patient_id or "").strip()
         if not clean_patient_id:
@@ -47,6 +82,8 @@ class MedicalCycleRepository:
                 select(MedicalCycle)
                 .where(MedicalCycle.patient_id == clean_patient_id)
                 .order_by(MedicalCycle.started_at.desc(), MedicalCycle.created_at.desc())
+                .offset(offset)
+                .limit(limit)
             )
             .scalars()
             .all()
@@ -146,16 +183,6 @@ class MedicalCycleRepository:
         if final_check is not None:
             return final_check, False
         raise RuntimeError(f"Failed to resolve or provision active cycle for patient '{clean_patient_id}'.")
-
-    def list_by_patient(self, patient_id: str, limit: int = 100, offset: int = 0) -> List[MedicalCycle]:
-        """Lists all medical cycles belonging to the specified patient."""
-        return list(self.db.execute(
-            select(MedicalCycle)
-            .where(MedicalCycle.patient_id == patient_id)
-            .order_by(MedicalCycle.started_at.desc())
-            .offset(offset)
-            .limit(limit)
-        ).scalars().all())
 
     def create(
         self,
@@ -276,7 +303,7 @@ class MedicalCycleRepository:
         cycle.status = status
         if status in ("completed", "archived"):
             cycle.closed_at = closed_at or datetime.now(timezone.utc)
-        elif status == "active":
+        elif status in ("active", "pending_reassessment"):
             cycle.closed_at = None
 
         self.db.commit()

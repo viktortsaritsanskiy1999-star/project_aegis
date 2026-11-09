@@ -418,3 +418,42 @@ class GeminiGateway:
             raise GeminiValidationError(
                 f"Model response failed structured schema validation for {response_schema.__name__}: {val_err}"
             ) from val_err
+
+    async def run_neo_system_specialist(
+        self,
+        prompt: str,
+    ) -> Any:
+        """Executes Gemini Flash-Lite for an organ specialist in Neo mode."""
+        from app.schemas.consilium import NeoSystemAgentOutput
+
+        return await self.generate_structured(
+            prompt=prompt,
+            response_schema=NeoSystemAgentOutput,
+            model=GeminiModelRole.FLASH_LITE,
+        )
+
+    async def run_neo_flash_master(
+        self,
+        prompt: str,
+    ) -> Any:
+        """Executes Gemini Flash in Neo mode for Deputy Chief Physician intersystem synthesis & longitudinal audit."""
+        from app.schemas.consilium import NeoFlashMasterOutput
+
+        return await self.generate_structured(
+            prompt=prompt,
+            response_schema=NeoFlashMasterOutput,
+            model=GeminiModelRole.FLASH,
+        )
+
+    async def run_neo_pro_master(
+        self,
+        prompt: str,
+    ) -> Any:
+        """Executes Gemini Pro in Neo mode for Chief Physician clinical verdict & quality gate."""
+        from app.schemas.consilium import NeoProMasterOutput
+
+        return await self.generate_structured(
+            prompt=prompt,
+            response_schema=NeoProMasterOutput,
+            model=GeminiModelRole.PRO,
+        )

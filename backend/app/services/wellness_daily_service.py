@@ -32,7 +32,10 @@ from app.schemas.wellness import (
 )
 from app.services.consilium_prompts import build_wellness_daily_analysis_prompt
 from app.services.gemini_gateway import GeminiGateway, GeminiGatewayError, GeminiModelRole
-from app.services.weekly_consilium_service import WeeklyConsiliumService
+from app.services.weekly_consilium_service import (
+    WeeklyConsiliumService,
+    ConsiliumCycleInactiveError,
+)
 
 logger = logging.getLogger("aegis.wellness_daily")
 
@@ -153,6 +156,14 @@ class WellnessDailyService:
             timezone=clean_tz,
             updated_at_utc=self._now_utc().isoformat(),
         )
+
+        cycle = self.cycle_repo.get_fresh(clean_cycle)
+        if cycle is not None and cycle.status != "active":
+            if commit:
+                self.db.rollback()
+            raise ConsiliumCycleInactiveError(
+                f"Cannot save wellness daily report for inactive cycle '{clean_cycle}' (status='{cycle.status}')."
+            )
 
         self.report_repo.create_next_version(
             cycle_id=clean_cycle,
@@ -804,6 +815,14 @@ class WellnessDailyService:
                 created_at_utc=now_iso,
             )
 
+            cycle = self.cycle_repo.get_fresh(clean_cycle)
+            if cycle is not None and cycle.status != "active":
+                if commit:
+                    self.db.rollback()
+                raise ConsiliumCycleInactiveError(
+                    f"Cannot save wellness daily report for inactive cycle '{clean_cycle}' (status='{cycle.status}')."
+                )
+
             self.report_repo.create_next_version(
                 cycle_id=clean_cycle,
                 model="aegis-wellness-analyzer",
@@ -845,6 +864,14 @@ class WellnessDailyService:
             assessment=interpretation.summary_for_athena,
             created_at_utc=now_iso,
         )
+
+        cycle = self.cycle_repo.get_fresh(clean_cycle)
+        if cycle is not None and cycle.status != "active":
+            if commit:
+                self.db.rollback()
+            raise ConsiliumCycleInactiveError(
+                f"Cannot save wellness daily report for inactive cycle '{clean_cycle}' (status='{cycle.status}')."
+            )
 
         self.report_repo.create_next_version(
             cycle_id=clean_cycle,

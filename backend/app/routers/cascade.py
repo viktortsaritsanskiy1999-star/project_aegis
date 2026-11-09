@@ -130,6 +130,7 @@ async def run_primary_consilium_endpoint(
             cycle_id=payload.cycle_id,
             report_date=payload.report_date,
             allow_version_bump=True,
+            mode=payload.mode,
         )
     except ConsiliumCycleNotFoundError as exc:
         raise HTTPException(
@@ -154,6 +155,11 @@ async def run_primary_consilium_endpoint(
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail=f"Gemini cascade execution failed: {exc}",
+        )
+    except ConsiliumError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(exc),
         )
 
 

@@ -7,7 +7,7 @@ import re
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Set, Tuple
 import uuid
 
-from fastapi import HTTPException
+from fastapi import HTTPException, status
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import text as sql_text, update
 from sqlalchemy.exc import IntegrityError, OperationalError
@@ -36,7 +36,10 @@ from app.services.primary_consilium_service import (
     ConsiliumContextMissingError,
     ConsiliumConcurrencyConflictError,
 )
-from app.services.weekly_consilium_service import WeeklyConsiliumService
+from app.services.weekly_consilium_service import (
+    WeeklyConsiliumService,
+    ConsiliumCycleInactiveError,
+)
 from app.services.wellness_daily_service import WellnessDailyService
 
 logger = logging.getLogger("aegis.clinical_automation")
@@ -868,6 +871,66 @@ class ClinicalAutomationService:
             }
             row.content = content
             row.version = int(row.version or 1) + 1
+            stmt = (
+                update(ModelReport)
+                .where(ModelReport.report_id == row.report_id)
+                .values(content=content, version=int(row.version or 1))
+            )
+            self.db.execute(stmt)
+            cancelled += 1
+
+        if commit and cancelled > 0:
+            self.db.commit()
+        return cancelled
+
+    def cancel_all_pending_jobs_for_cycle(
+        self,
+        cycle_id: str,
+        *,
+        reason: str = "neo_cycle_transition",
+        commit: bool = True,
+    ) -> int:
+        """
+        Stage 8B.1: Atomically marks all PENDING and RETRYABLE_FAILURE automation jobs
+        for `cycle_id` as COMPLETED with `skipped=True` so jobs belonging to an old cycle
+        never execute after cycle closure or transition to Neo reassessment.
+        """
+        clean_cycle = cycle_id.strip()
+        rows = (
+            self.db.query(ModelReport)
+            .filter(ModelReport.cycle_id == clean_cycle)
+            .filter(ModelReport.model == AUTOMATION_SCHEDULER_MODEL)
+            .filter(ModelReport.report_type.like(f"{AUTOMATION_JOB_REPORT_PREFIX}%"))
+            .populate_existing()
+            .all()
+        )
+        now_iso = self._now_utc().isoformat()
+        cancelled = 0
+        for row in rows:
+            content = dict(row.content or {})
+            if content.get("status") not in (
+                AutomationJobStatus.PENDING.value,
+                AutomationJobStatus.RETRYABLE_FAILURE.value,
+            ):
+                continue
+
+            content["status"] = AutomationJobStatus.COMPLETED.value
+            content["lease_owner_id"] = None
+            content["lease_expires_at_utc"] = None
+            content["updated_at_utc"] = now_iso
+            content["result_metadata"] = {
+                "skipped": True,
+                "reason": reason,
+                "cancelled_at_utc": now_iso,
+            }
+            row.content = content
+            row.version = int(row.version or 1) + 1
+            stmt = (
+                update(ModelReport)
+                .where(ModelReport.report_id == row.report_id)
+                .values(content=content, version=int(row.version or 1))
+            )
+            self.db.execute(stmt)
             cancelled += 1
 
         if commit and cancelled > 0:
@@ -1634,6 +1697,12 @@ class ClinicalAutomationService:
             raise ConsiliumCycleNotFoundError(
                 f"Active cycle '{job.cycle_id}' not found for patient '{job.patient_id}'."
             )
+        if cycle.status != "active":
+            return {
+                "skipped": True,
+                "reason": "cycle_not_active",
+                "cycle_status": cycle.status,
+            }
 
         if not self.primary_service.is_primary_consilium_completed(job.cycle_id):
             raise ConsiliumContextMissingError(
@@ -1652,37 +1721,43 @@ class ClinicalAutomationService:
         # 1. If weekly plan is enabled, generate and save Athena's 7-day Weekly Plan (Stage 1)
         plan_id = None
         q1_available_at = None
-        if self.enable_weekly_plan:
-            from app.services.athena_weekly_plan_service import AthenaWeeklyPlanService
-            plan_service = AthenaWeeklyPlanService(
-                db=self.db, gateway=self.gateway, now_provider=self.now_provider
-            )
-            plan = await plan_service.create_or_get_weekly_plan(job.cycle_id, week_number=1)
-            plan_id = plan.plan_id
+        try:
+            if self.enable_weekly_plan:
+                from app.services.athena_weekly_plan_service import AthenaWeeklyPlanService
+                plan_service = AthenaWeeklyPlanService(
+                    db=self.db, gateway=self.gateway, now_provider=self.now_provider
+                )
+                plan = await plan_service.create_or_get_weekly_plan(job.cycle_id, week_number=1)
+                plan_id = plan.plan_id
 
-        # 2. Execute or reuse initial greeting at T0
-        existing_greeting = self.athena_service.find_existing_post_primary_initial_greeting(
-            job.cycle_id
-        )
-        if existing_greeting is not None:
-            anchor_dt = self.weekly_service.find_schedule_anchor_timestamp(job.cycle_id)
-            reused = True
-            msg_id = existing_greeting.message_id
-            effective_anchor = anchor_dt or self._now_utc()
-        else:
-            response = await self.athena_service.handle_turn(
-                patient_id=job.patient_id,
-                cycle_id=job.cycle_id,
-                request=AthenaChatRequest(
-                    message="Start accompaniment",
-                    event_type="initial_greeting",
-                    idempotency_key=job.idempotency_key,
-                ),
+            # 2. Execute or reuse initial greeting at T0
+            existing_greeting = self.athena_service.find_existing_post_primary_initial_greeting(
+                job.cycle_id
             )
-            anchor_dt = self.weekly_service.find_schedule_anchor_timestamp(job.cycle_id)
-            reused = False
-            msg_id = response.message_id
-            effective_anchor = anchor_dt or self._now_utc()
+            if existing_greeting is not None:
+                anchor_dt = self.weekly_service.find_schedule_anchor_timestamp(job.cycle_id)
+                reused = True
+                msg_id = existing_greeting.message_id
+                effective_anchor = anchor_dt or self._now_utc()
+            else:
+                response = await self.athena_service.handle_turn(
+                    patient_id=job.patient_id,
+                    cycle_id=job.cycle_id,
+                    request=AthenaChatRequest(
+                        message="Start accompaniment",
+                        event_type="initial_greeting",
+                        idempotency_key=job.idempotency_key,
+                    ),
+                )
+                anchor_dt = self.weekly_service.find_schedule_anchor_timestamp(job.cycle_id)
+                reused = False
+                msg_id = response.message_id
+                effective_anchor = anchor_dt or self._now_utc()
+        except ConsiliumCycleInactiveError:
+            return {
+                "skipped": True,
+                "reason": "cycle_not_active",
+            }
 
         # 3. Schedule first planned question at T0 + 30 seconds if weekly plan enabled
         if self.enable_weekly_plan:
@@ -1719,6 +1794,12 @@ class ClinicalAutomationService:
             raise ConsiliumCycleNotFoundError(
                 f"Active cycle '{job.cycle_id}' not found for patient '{job.patient_id}'."
             )
+        if cycle.status != "active":
+            return {
+                "skipped": True,
+                "reason": "cycle_not_active",
+                "cycle_status": cycle.status,
+            }
 
         active_consilium_lock = self.weekly_service._get_active_in_flight_lock(job.cycle_id)
         if active_consilium_lock is not None:
@@ -1736,15 +1817,21 @@ class ClinicalAutomationService:
                 "question_text": active_q.get("question_text"),
             }
 
-        response = await self.athena_service.handle_turn(
-            patient_id=job.patient_id,
-            cycle_id=job.cycle_id,
-            request=AthenaChatRequest(
-                message="Ask first planned question",
-                event_type="first_planned_question",
-                idempotency_key=job.idempotency_key,
-            ),
-        )
+        try:
+            response = await self.athena_service.handle_turn(
+                patient_id=job.patient_id,
+                cycle_id=job.cycle_id,
+                request=AthenaChatRequest(
+                    message="Ask first planned question",
+                    event_type="first_planned_question",
+                    idempotency_key=job.idempotency_key,
+                ),
+            )
+        except ConsiliumCycleInactiveError:
+            return {
+                "skipped": True,
+                "reason": "cycle_not_active",
+            }
         return {
             "reused_existing": False,
             "message_id": response.message_id,
@@ -1770,6 +1857,12 @@ class ClinicalAutomationService:
             raise ConsiliumCycleNotFoundError(
                 f"Active cycle '{job.cycle_id}' not found for patient '{job.patient_id}'."
             )
+        if cycle.status != "active":
+            return {
+                "skipped": True,
+                "reason": "cycle_not_active",
+                "cycle_status": cycle.status,
+            }
 
         if not self.primary_service.is_primary_consilium_completed(job.cycle_id):
             raise ConsiliumContextMissingError(
@@ -1791,12 +1884,18 @@ class ClinicalAutomationService:
         cal_week = int(m.group(1))
         cal_day = int(m.group(2))
 
-        journal_rec, saved_row, reused = await self.journal_service.close_daily_journal(
-            cycle_id=job.cycle_id,
-            calendar_week=cal_week,
-            calendar_day=cal_day,
-            as_of=self._now_utc(),
-        )
+        try:
+            journal_rec, saved_row, reused = await self.journal_service.close_daily_journal(
+                cycle_id=job.cycle_id,
+                calendar_week=cal_week,
+                calendar_day=cal_day,
+                as_of=self._now_utc(),
+            )
+        except ConsiliumCycleInactiveError:
+            return {
+                "skipped": True,
+                "reason": "cycle_not_active",
+            }
         return {
             "reused_existing": reused,
             "journal_id": journal_rec.journal_id,
@@ -1820,6 +1919,12 @@ class ClinicalAutomationService:
             raise ConsiliumCycleNotFoundError(
                 f"Active cycle '{job.cycle_id}' not found for patient '{job.patient_id}'."
             )
+        if cycle.status != "active":
+            return {
+                "skipped": True,
+                "reason": "cycle_not_active",
+                "cycle_status": cycle.status,
+            }
 
         if not self.primary_service.is_primary_consilium_completed(job.cycle_id):
             raise ConsiliumContextMissingError(
@@ -1841,12 +1946,18 @@ class ClinicalAutomationService:
         cal_week = int(m.group(1))
         cal_day = int(m.group(2))
 
-        report, is_new = await self.wellness_service.process_wellness_for_day(
-            cycle_id=job.cycle_id,
-            calendar_week=cal_week,
-            calendar_day=cal_day,
-            as_of=self._now_utc(),
-        )
+        try:
+            report, is_new = await self.wellness_service.process_wellness_for_day(
+                cycle_id=job.cycle_id,
+                calendar_week=cal_week,
+                calendar_day=cal_day,
+                as_of=self._now_utc(),
+            )
+        except ConsiliumCycleInactiveError:
+            return {
+                "skipped": True,
+                "reason": "cycle_not_active",
+            }
 
         # Immediate trigger of Athena Daily Journal upon saving Wellness report
         if self.enable_daily_journal:
@@ -1882,6 +1993,12 @@ class ClinicalAutomationService:
             raise ConsiliumCycleNotFoundError(
                 f"Active cycle '{job.cycle_id}' not found for patient '{job.patient_id}'."
             )
+        if cycle.status != "active":
+            return {
+                "skipped": True,
+                "reason": "cycle_not_active",
+                "cycle_status": cycle.status,
+            }
         if not self.primary_service.is_primary_consilium_completed(job.cycle_id):
             raise ConsiliumContextMissingError(
                 f"Cannot execute weekly consilium for cycle '{job.cycle_id}': "
@@ -1904,11 +2021,17 @@ class ClinicalAutomationService:
 
         sprint_id = f"sprint_{job.cycle_id}_w{week_num}"
         core_idem = f"weekly_consilium_core_{job.cycle_id}_w{week_num}"
-        client_resp = await self.weekly_service.run_weekly_consilium(
-            cycle_id=job.cycle_id,
-            sprint_id=sprint_id,
-            idempotency_key=core_idem,
-        )
+        try:
+            client_resp = await self.weekly_service.run_weekly_consilium(
+                cycle_id=job.cycle_id,
+                sprint_id=sprint_id,
+                idempotency_key=core_idem,
+            )
+        except ConsiliumCycleInactiveError:
+            return {
+                "skipped": True,
+                "reason": "cycle_not_active",
+            }
 
         # Enqueue Step B immediately (never blocked by Referral Document Generation)
         self.enqueue_weekly_consilium_b(
@@ -1960,6 +2083,12 @@ class ClinicalAutomationService:
             raise ConsiliumCycleNotFoundError(
                 f"Active cycle '{job.cycle_id}' not found for patient '{job.patient_id}'."
             )
+        if cycle.status != "active":
+            return {
+                "skipped": True,
+                "reason": "cycle_not_active",
+                "cycle_status": cycle.status,
+            }
 
         m = re.search(r'_w(\d+)$', job.idempotency_key)
         week_num = int(m.group(1)) if m else 1
@@ -1982,10 +2111,16 @@ class ClinicalAutomationService:
             db=self.db, gateway=self.gateway, now_provider=self.now_provider
         )
         next_week = week_num + 1
-        plan = await plan_svc.create_or_get_weekly_plan(
-            cycle_id=job.cycle_id,
-            week_number=next_week,
-        )
+        try:
+            plan = await plan_svc.create_or_get_weekly_plan(
+                cycle_id=job.cycle_id,
+                week_number=next_week,
+            )
+        except ConsiliumCycleInactiveError:
+            return {
+                "skipped": True,
+                "reason": "cycle_not_active",
+            }
 
         # Enqueue Step C immediately
         self.enqueue_weekly_consilium_c(
@@ -2018,6 +2153,12 @@ class ClinicalAutomationService:
             raise ConsiliumCycleNotFoundError(
                 f"Active cycle '{job.cycle_id}' not found for patient '{job.patient_id}'."
             )
+        if cycle.status != "active":
+            return {
+                "skipped": True,
+                "reason": "cycle_not_active",
+                "cycle_status": cycle.status,
+            }
 
         m = re.search(r'_w(\d+)$', job.idempotency_key)
         week_num = int(m.group(1)) if m else 1
@@ -2029,11 +2170,24 @@ class ClinicalAutomationService:
                 f"Cannot execute Step C: Weekly Consilium Step A not completed for week {week_num}."
             )
 
-        chat_resp = await self.athena_service.send_weekly_wrapup_message(
-            cycle_id=job.cycle_id,
-            sprint_number=week_num,
-            idempotency_key=f"athena_weekly_wrapup_{job.cycle_id}_w{week_num}",
-        )
+        try:
+            chat_resp = await self.athena_service.send_weekly_wrapup_message(
+                cycle_id=job.cycle_id,
+                sprint_number=week_num,
+                idempotency_key=f"athena_weekly_wrapup_{job.cycle_id}_w{week_num}",
+            )
+        except (ConsiliumCycleInactiveError, HTTPException) as exc:
+            if isinstance(exc, HTTPException) and exc.status_code == status.HTTP_409_CONFLICT:
+                return {
+                    "skipped": True,
+                    "reason": "cycle_not_active",
+                }
+            if isinstance(exc, ConsiliumCycleInactiveError):
+                return {
+                    "skipped": True,
+                    "reason": "cycle_not_active",
+                }
+            raise
 
         return {
             "message_id": chat_resp.message_id,
@@ -2058,16 +2212,28 @@ class ClinicalAutomationService:
             raise ConsiliumCycleNotFoundError(
                 f"Active cycle '{job.cycle_id}' not found for patient '{job.patient_id}'."
             )
+        if cycle.status != "active":
+            return {
+                "skipped": True,
+                "reason": "cycle_not_active",
+                "cycle_status": cycle.status,
+            }
 
         pending_task = self.lab_scheduling_service.get_pending_task(job.cycle_id)
         target_version = pending_task.target_ledger_version if pending_task else None
         source_doc_ids = pending_task.pending_document_ids if pending_task else None
 
-        rev_record = await self.lab_revision_service.execute_lab_revision_consilium(
-            cycle_id=job.cycle_id,
-            target_ledger_version=target_version,
-            source_document_ids=source_doc_ids,
-        )
+        try:
+            rev_record = await self.lab_revision_service.execute_lab_revision_consilium(
+                cycle_id=job.cycle_id,
+                target_ledger_version=target_version,
+                source_document_ids=source_doc_ids,
+            )
+        except ConsiliumCycleInactiveError:
+            return {
+                "skipped": True,
+                "reason": "cycle_not_active",
+            }
 
         # Mark revision task completed in LabSchedulingService and initiate 72h cooldown
         self.lab_scheduling_service.complete_revision_task(

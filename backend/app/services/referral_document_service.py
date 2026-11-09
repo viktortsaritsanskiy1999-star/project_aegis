@@ -890,7 +890,7 @@ class ReferralDocumentService:
                 )
 
             # Fence check against concurrent Neo cycle closure during Gemini HTTP calls
-            fresh_cycle = self.cycle_repo.get(clean_cycle_id)
+            fresh_cycle = self.cycle_repo.get_fresh(clean_cycle_id)
             if fresh_cycle is None or fresh_cycle.status != "active":
                 self.db.rollback()
                 raise ReferralCycleInactiveError(
@@ -989,6 +989,14 @@ class ReferralDocumentService:
                 created_at=now_dt,
                 commit=False,
             )
+
+            fresh_cycle = self.cycle_repo.get_fresh(clean_cycle_id)
+            if fresh_cycle is None or fresh_cycle.status != "active":
+                self.db.rollback()
+                raise ReferralCycleInactiveError(
+                    f"Cycle '{clean_cycle_id}' became inactive during referral document generation; "
+                    "aborting publication to prevent stale active referral state."
+                )
 
             self.db.commit()
         except Exception:

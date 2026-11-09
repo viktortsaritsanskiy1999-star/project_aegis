@@ -46,7 +46,10 @@ from app.services.consilium_prompts import (
     build_athena_system_prompt,
 )
 from app.services.gemini_gateway import GeminiGateway, GeminiModelRole
-from app.services.weekly_consilium_service import WeeklyConsiliumService
+from app.services.weekly_consilium_service import (
+    WeeklyConsiliumService,
+    ConsiliumCycleInactiveError,
+)
 
 logger = logging.getLogger("aegis.athena_daily_journal")
 
@@ -1452,6 +1455,14 @@ class AthenaDailyJournalService:
         cal_day = journal_record.calendar_day
         report_id = f"rep_journal_{cycle_id}_w{cal_week}_d{cal_day}"[:64]
         sprint_id = f"sprint_{cycle_id}_w{cal_week}"[:64]
+
+        cycle = self.cycle_repo.get_fresh(cycle_id)
+        if cycle is not None and cycle.status != "active":
+            if commit:
+                self.db.rollback()
+            raise ConsiliumCycleInactiveError(
+                f"Cannot save daily journal for inactive cycle '{cycle_id}' (status='{cycle.status}')."
+            )
 
         now_dt = self._now_utc()
         content_dict = journal_record.model_dump(mode="json")

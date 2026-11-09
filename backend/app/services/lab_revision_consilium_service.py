@@ -71,6 +71,7 @@ from app.services.primary_consilium_service import (
     CYCLE_CONSILIUM_COORDINATION_LOCK_REPORT_TYPE,
 )
 from app.services.weekly_consilium_service import (
+    ConsiliumCycleInactiveError,
     ATHENA_ACTIVE_STRATEGY_REPORT_TYPE,
     WEEKLY_DEPUTY_INTERNAL_REPORT_TYPE,
     WEEKLY_CHIEF_INTERNAL_REPORT_TYPE,
@@ -2414,6 +2415,15 @@ class LabRevisionConsiliumService:
                     )
                     validated_overall = ClientModelReportResponse.model_validate(saved_overall_report)
 
+                    # Re-verify cycle active status right before DB commit
+                    fresh_cycle = self.cycle_repo.get_fresh(cycle_id)
+                    if fresh_cycle is None or fresh_cycle.status != "active":
+                        self.db.rollback()
+                        raise ConsiliumCycleInactiveError(
+                            f"Lab-Revision Consilium aborting commit for cycle '{cycle_id}': "
+                            f"cycle is no longer active (status='{getattr(fresh_cycle, 'status', None)}')."
+                        )
+
                     self.db.commit()
                 except BaseException:
                     self.db.rollback()
@@ -2861,6 +2871,15 @@ class LabRevisionConsiliumService:
                         content=record.model_dump(),
                         commit=False,
                     )
+
+                    # Re-verify cycle active status right before DB commit
+                    fresh_cycle = self.cycle_repo.get_fresh(cycle_id)
+                    if fresh_cycle is None or fresh_cycle.status != "active":
+                        self.db.rollback()
+                        raise ConsiliumCycleInactiveError(
+                            f"Lab-Revision Consilium aborting commit for cycle '{cycle_id}': "
+                            f"cycle is no longer active (status='{getattr(fresh_cycle, 'status', None)}')."
+                        )
 
                     self.db.commit()
                     return record

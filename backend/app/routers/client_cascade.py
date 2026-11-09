@@ -33,6 +33,7 @@ from app.schemas.consilium import (
     AnamnesisQuestionnaireAnswers,
     AnamnesisIntakeClientResponse,
     ClientVitalsThresholds,
+    ConsiliumMode,
     EcgVisionIntakeClientResponse,
     LabLedgerStateResponse,
     LabVisionIntakeClientResponse,
@@ -174,6 +175,8 @@ class ClientCascadeStatusResponse(BaseModel):
     can_send_routine_reminder: bool = False
     has_active_referral: bool = False
     referral_status: ClientReferralStatus = Field(default_factory=ClientReferralStatus)
+    is_neo_reassessment: bool = False
+    reassessment_status: Optional[str] = None
 
 
 class ClientWeeklyConsiliumRunRequest(BaseModel):
@@ -222,8 +225,12 @@ def _recover_primary_consilium_client_response(
         if sys_reps:
             system_reports[sys_key] = ClientModelReportResponse.model_validate(sys_reps[0])
 
+    primary_service = PrimaryConsiliumService(db=db)
+    mode = primary_service.detect_consilium_mode(cycle_id)
+
     return PrimaryConsiliumClientResponse(
         cycle_id=cycle_id,
+        mode=mode,
         report_date=report_date or datetime.now(timezone.utc).strftime("%Y-%m-%d"),
         overall_report=overall_validated,
         system_reports=system_reports,
@@ -377,6 +384,16 @@ def get_client_cascade_status(
     max_reminders = int(active_q.get("max_reminders", 2)) if has_unanswered_q else 2
     can_remind = has_unanswered_q and (reminders_cnt < max_reminders)
 
+    is_neo = active_cycle.status == "pending_reassessment"
+    if not is_neo:
+        lineage_reps = report_repo.list_server_only(cycle_id=cycle_id, report_type="neo_cycle_lineage")
+        if lineage_reps:
+            is_neo = True
+    if is_neo:
+        reassess_status = "prepared" if primary_service.is_neo_consilium_prepared(cycle_id) else "pending_reassessment"
+    else:
+        reassess_status = None
+
     return ClientCascadeStatusResponse(
         patient_id=session.patient_id,
         device_id=session.device_id,
@@ -401,6 +418,8 @@ def get_client_cascade_status(
         can_send_routine_reminder=can_remind,
         has_active_referral=has_active_ref,
         referral_status=client_referral,
+        is_neo_reassessment=is_neo,
+        reassessment_status=reassess_status,
     )
 
 
@@ -770,11 +789,12 @@ async def run_client_primary_consilium(
         except Exception:
             pass
 
-    # 1. Result Recovery Guard: If Primary Consilium is completed, recover existing reports immediately
-    if service.is_primary_consilium_completed(cycle.cycle_id):
+    # 1. Result Recovery Guard: If Primary Consilium is completed or Neo is prepared, recover existing reports immediately
+    if service.is_primary_consilium_completed(cycle.cycle_id) or service.is_neo_consilium_prepared(cycle.cycle_id):
         recovered = service.recover_completed_response(cycle.cycle_id)
         if recovered is not None:
-            _enqueue_and_notify_post_primary()
+            if recovered.mode == ConsiliumMode.INITIAL:
+                _enqueue_and_notify_post_primary()
             response.headers["X-Aegis-Idempotent-Replay"] = "true"
             return recovered
 
@@ -784,7 +804,8 @@ async def run_client_primary_consilium(
             cycle_id=cycle.cycle_id,
             idempotency_key=idempotency_key,
         )
-        _enqueue_and_notify_post_primary()
+        if result.mode == ConsiliumMode.INITIAL:
+            _enqueue_and_notify_post_primary()
         return result
     except ConsiliumCycleNotFoundError as exc:
         raise HTTPException(

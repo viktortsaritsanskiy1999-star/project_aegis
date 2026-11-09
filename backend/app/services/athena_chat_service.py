@@ -47,6 +47,7 @@ from app.services.primary_consilium_service import (
     RAW_USER_ANAMNESIS_REPORT_TYPE,
 )
 from app.services.weekly_consilium_service import (
+    ConsiliumCycleInactiveError,
     WeeklyConsiliumService,
     ATHENA_CHAT_HISTORY_REPORT_TYPE,
     WEEKLY_OVERALL_CLIENT_REPORT_TYPE,
@@ -504,6 +505,14 @@ class AthenaChatService:
                     self.db.expire_all()
 
                 try:
+                    fresh_cycle = self.cycle_repo.get_fresh(resolved_cycle_id)
+                    if fresh_cycle is None or fresh_cycle.status != "active":
+                        self.db.rollback()
+                        raise ConsiliumCycleInactiveError(
+                            f"Cannot persist Athena turn for inactive cycle '{resolved_cycle_id}' "
+                            f"(status='{getattr(fresh_cycle, 'status', None)}')."
+                        )
+
                     base_turn_ver = self.report_repo.get_latest_version_number(
                         cycle_id=resolved_cycle_id,
                         report_type=ATHENA_CHAT_TURN_REPORT_TYPE,
@@ -990,7 +999,14 @@ class AthenaChatService:
                     final_routine_status = turn_routine_status
                     final_reminders_count = turn_reminders_count
 
-                    # Single atomic commit for all artifacts of the turn
+                    # Re-verify cycle active status right before DB commit
+                    fresh_cycle = self.cycle_repo.get_fresh(resolved_cycle_id)
+                    if fresh_cycle is None or fresh_cycle.status != "active":
+                        self.db.rollback()
+                        raise ConsiliumCycleInactiveError(
+                            f"Cannot commit Athena turn for inactive cycle '{resolved_cycle_id}' (status='{getattr(fresh_cycle, 'status', None)}')."
+                        )
+
                     self.db.commit()
                     break
                 except (ReportVersionConflictError, IntegrityError, OperationalError) as exc:
@@ -1052,6 +1068,11 @@ class AthenaChatService:
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail=f"Medical cycle '{clean_cycle_id}' not found.",
             )
+        if cycle.status != "active":
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"Cannot send weekly wrapup for inactive cycle '{clean_cycle_id}' (status='{cycle.status}').",
+            )
 
         clean_idem = (
             idempotency_key.strip()
@@ -1060,6 +1081,13 @@ class AthenaChatService:
         )
 
         async with self._get_cycle_lock(clean_cycle_id):
+            fresh_cycle = self.cycle_repo.get_fresh(clean_cycle_id)
+            if fresh_cycle is None or fresh_cycle.status != "active":
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail=f"Cannot send weekly wrapup for inactive cycle '{clean_cycle_id}'.",
+                )
+
             # Check idempotency
             existing_turn = self._find_idempotent_turn(clean_cycle_id, clean_idem)
             if existing_turn is not None:
@@ -1123,6 +1151,14 @@ class AthenaChatService:
             )
             clean_reply = wrapup_output.message.strip()
 
+            # Fencing check after Gemini Flash generation against concurrent Neo cycle closure
+            fresh_cycle = self.cycle_repo.get_fresh(clean_cycle_id)
+            if fresh_cycle is None or fresh_cycle.status != "active":
+                self.db.rollback()
+                raise ConsiliumCycleInactiveError(
+                    f"Cannot send weekly wrapup for inactive cycle '{clean_cycle_id}' (status='{getattr(fresh_cycle, 'status', None)}')."
+                )
+
             message_id = f"msg_{uuid.uuid4().hex[:16]}"
             target_sprint_id = f"sprint_{clean_cycle_id}_w{sprint_number}"
             eff_sprint_id = target_sprint_id if self.weekly_service.sprint_repo.get(target_sprint_id) is not None else None
@@ -1184,6 +1220,14 @@ class AthenaChatService:
                         reason="covered_by_weekly_wrapup",
                         commit=False,
                     )
+
+            # Re-verify cycle active status right before DB commit
+            fresh_cycle = self.cycle_repo.get_fresh(clean_cycle_id)
+            if fresh_cycle is None or fresh_cycle.status != "active":
+                self.db.rollback()
+                raise ConsiliumCycleInactiveError(
+                    f"Cannot commit weekly wrapup for inactive cycle '{clean_cycle_id}' (status='{getattr(fresh_cycle, 'status', None)}')."
+                )
 
             self.db.commit()
 
@@ -1367,6 +1411,12 @@ class AthenaChatService:
                         sent_at_utc=turn_now_iso,
                         commit=False,
                     )
+
+                    # Re-verify cycle active status right before DB commit
+                    fresh_cycle = self.cycle_repo.get_fresh(clean_cycle_id)
+                    if fresh_cycle is None or fresh_cycle.status != "active":
+                        self.db.rollback()
+                        return None
 
                     self.db.commit()
                     break

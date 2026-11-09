@@ -28,7 +28,7 @@ class MedicalCycle(Base):
         nullable=True,
         index=True,
     )
-    status: Mapped[str] = mapped_column(String(32), default="active", index=True)  # active, completed, archived
+    status: Mapped[str] = mapped_column(String(32), default="active", index=True)  # active, completed, archived, pending_reassessment
     started_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
     closed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))

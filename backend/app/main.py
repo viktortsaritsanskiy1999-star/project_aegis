@@ -9,6 +9,7 @@ from app.routers import (
     auth_router,
     health_router,
     cycles_router,
+    cycles_plural_router,
     reports_router,
     cascade_router,
     vitals_router,
@@ -90,6 +91,7 @@ app = FastAPI(
 app.include_router(health_router)
 app.include_router(auth_router)
 app.include_router(cycles_router)
+app.include_router(cycles_plural_router)
 app.include_router(reports_router)
 app.include_router(cascade_router)
 app.include_router(vitals_router)

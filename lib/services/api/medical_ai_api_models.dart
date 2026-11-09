@@ -291,6 +291,8 @@ class ClientCascadeStatusResponse {
   final bool canSendRoutineReminder;
   final bool hasActiveReferral;
   final ClientReferralStatus referralStatus;
+  final bool isNeoReassessment;
+  final String? reassessmentStatus;
 
   const ClientCascadeStatusResponse({
     required this.patientId,
@@ -316,6 +318,8 @@ class ClientCascadeStatusResponse {
     this.canSendRoutineReminder = false,
     this.hasActiveReferral = false,
     this.referralStatus = const ClientReferralStatus(),
+    this.isNeoReassessment = false,
+    this.reassessmentStatus,
   });
 
   factory ClientCascadeStatusResponse.fromJson(Map<String, dynamic> json) {
@@ -345,6 +349,8 @@ class ClientCascadeStatusResponse {
       referralStatus: json['referral_status'] is Map
           ? ClientReferralStatus.fromJson(Map<String, dynamic>.from(json['referral_status'] as Map))
           : const ClientReferralStatus(),
+      isNeoReassessment: json['is_neo_reassessment'] == true,
+      reassessmentStatus: json['reassessment_status'] as String?,
     );
   }
 
@@ -372,6 +378,8 @@ class ClientCascadeStatusResponse {
     'can_send_routine_reminder': canSendRoutineReminder,
     'has_active_referral': hasActiveReferral,
     'referral_status': referralStatus.toJson(),
+    'is_neo_reassessment': isNeoReassessment,
+    if (reassessmentStatus != null) 'reassessment_status': reassessmentStatus,
   };
 }
 

@@ -8,8 +8,11 @@ from sqlalchemy.orm import Session
 
 from app.models.health_measurement import HealthMeasurement
 from app.models.model_report import ModelReport
+from app.repositories.cycle_repository import MedicalCycleRepository
 from app.repositories.report_repository import ModelReportRepository
 from app.repositories.sprint_repository import WeeklySprintRepository
+from app.services.primary_consilium_service import ConsiliumError
+from app.services.weekly_consilium_service import ConsiliumCycleInactiveError
 from app.schemas.chat import (
     AthenaGoalItem,
     AthenaGoalProgressionDecision,
@@ -58,6 +61,7 @@ class AthenaWeeklyPlanService:
         self.now_provider = now_provider or (lambda: datetime.now(timezone.utc))
         self.report_repo = ModelReportRepository(db)
         self.sprint_repo = WeeklySprintRepository(db)
+        self.cycle_repo = MedicalCycleRepository(db)
 
     def _now_utc(self) -> datetime:
         dt = self.now_provider()
@@ -264,6 +268,13 @@ class AthenaWeeklyPlanService:
 
         if not normalized_plan.goals:
             raise GeminiValidationError("Athena weekly plan must contain at least 1 goal.")
+
+        # Stage 8B.1: Fencing check against in-flight cycle closure
+        cycle = self.cycle_repo.get_fresh(clean_cycle)
+        if cycle is not None and cycle.status != "active":
+            raise ConsiliumCycleInactiveError(
+                f"Cannot persist weekly plan for inactive cycle '{clean_cycle}' (status='{cycle.status}')."
+            )
 
         # Persist safely under SERVER_ONLY
         cand_sprint = f"sprint_{clean_cycle}_w{week_number}"

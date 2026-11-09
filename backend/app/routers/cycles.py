@@ -2,16 +2,26 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 from app.database import get_db
 from app.repositories.cycle_repository import CycleOwnershipConflictError, MedicalCycleRepository
-from app.schemas.cycle import MedicalCycleCreate, MedicalCycleResponse
+from app.schemas.cycle import (
+    MedicalCycleCreate,
+    MedicalCycleResponse,
+    StartNeoReassessmentResponse,
+)
 from app.security.auth import (
     AuthSession,
     DeviceSession,
     ServiceAdminSession,
+    require_device_session,
     require_scopes,
     require_service_admin_session,
 )
+from app.services.neo_cycle_service import (
+    NeoCycleService,
+    NeoReassessmentNotAllowedError,
+)
 
 router = APIRouter(prefix="/api/v1/cycle", tags=["Medical Cycles"])
+plural_router = APIRouter(prefix="/api/v1/cycles", tags=["Medical Cycles"])
 
 
 @router.post(
@@ -101,3 +111,33 @@ def archive_cycle(
             detail=f"Medical cycle '{cycle_id}' not found.",
         )
     return cycle
+
+
+@router.post(
+    "/start-neo-reassessment",
+    response_model=StartNeoReassessmentResponse,
+    summary="Start Neo reassessment cycle for authenticated patient (Patient-Isolated)",
+    description=(
+        "Safely closes the patient's existing completed cycle, invalidates pending jobs, "
+        "and transitions the patient into a new pending_reassessment cycle without deleting historical data. "
+        "Strictly requires authenticated DeviceSession; patient_id is authoritative from session."
+    ),
+)
+@plural_router.post(
+    "/start-neo-reassessment",
+    response_model=StartNeoReassessmentResponse,
+    summary="Start Neo reassessment cycle for authenticated patient (Patient-Isolated, Plural Alias)",
+    include_in_schema=False,
+)
+def start_neo_reassessment_endpoint(
+    db: Session = Depends(get_db),
+    session: DeviceSession = Depends(require_device_session),
+) -> StartNeoReassessmentResponse:
+    service = NeoCycleService(db=db)
+    try:
+        return service.start_neo_reassessment(session.patient_id)
+    except NeoReassessmentNotAllowedError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=str(exc),
+        ) from exc

@@ -30,6 +30,17 @@ SYSTEM_TITLES: Dict[str, str] = {
 }
 
 
+class ConsiliumMode(str, Enum):
+    """
+    Execution mode for the Primary Consilium orchestrator.
+    - INITIAL: Baseline evaluation for a brand-new patient with no prior clinical history in Aegis.
+    - NEO_REASSESSMENT: Comprehensive re-evaluation of a returning patient with historical context
+      from completed prior cycles, evaluating longitudinal delta while maintaining clean-slate objectivity.
+    """
+    INITIAL = "initial"
+    NEO_REASSESSMENT = "neo_reassessment"
+
+
 class AegisAgentRole(str, Enum):
     """
     Distinct logical AI agent roles in Project Aegis.
@@ -407,6 +418,52 @@ class ProMasterOutput(BaseModel):
 
 
 # =====================================================================
+# 4B. NEO CONSILIUM (REASSESSMENT) SCHEMAS
+# =====================================================================
+
+class NeoSystemAgentOutput(SystemAgentOutput):
+    """
+    Structured output contract for each of the 8 Flash-Lite organ specialists in Neo mode.
+    Inherits 100% schema parity with SystemAgentOutput (system_view, system_logic, training_sandbox).
+    """
+    pass
+
+
+class NeoFlashMasterOutput(FlashMasterOutput):
+    """
+    Structured output contract for Deputy Chief Physician (Gemini Flash) in Neo mode.
+    Inherits 100% schema parity with FlashMasterOutput (flash_general_shelf, flash_training_shelf, user_system_reports).
+    """
+    pass
+
+
+class NeoProMasterOutput(ProMasterOutput):
+    """
+    Structured output contract for Chief Physician (Gemini Pro) in Neo mode.
+    Inherits 100% schema parity with ProMasterOutput (vitals_thresholds, pro_general_shelf, pro_training_shelf, user_overall_report, flash_quality_review).
+    """
+    pass
+
+
+class NeoConsiliumMetadata(BaseModel):
+    """
+    Metadata capturing the Neo Consilium execution lineage and historical context boundaries.
+    Stored under SERVER_ONLY privacy level in neo_consilium_execution_log.
+    """
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    mode: ConsiliumMode = Field(default=ConsiliumMode.NEO_REASSESSMENT)
+    new_cycle_id: str = Field(..., min_length=3, max_length=64)
+    previous_cycle_id: Optional[str] = Field(default=None, max_length=64)
+    prior_cycles_count: int = Field(default=0, ge=0)
+    prior_cycle_ids: List[str] = Field(default_factory=list)
+    historical_character_count: int = Field(default=0, ge=0)
+    is_historical_condensed: bool = Field(default=False)
+    abnormal_labs_count: int = Field(default=0, ge=0)
+    referrals_count: int = Field(default=0, ge=0)
+
+
+# =====================================================================
 # 5. API REQUEST / RESPONSE SCHEMAS FOR PRIMARY CONSILIUM
 # =====================================================================
 
@@ -424,6 +481,10 @@ class PrimaryConsiliumRunRequest(BaseModel):
         default=None,
         max_length=32,
         description="Optional ISO date string (YYYY-MM-DD) for user-facing dated entries.",
+    )
+    mode: Optional[ConsiliumMode] = Field(
+        default=None,
+        description="Optional consilium mode: 'initial' or 'neo_reassessment'. Auto-detected if omitted.",
     )
 
 
@@ -451,6 +512,7 @@ class PrimaryConsiliumClientResponse(BaseModel):
     overall_report: ClientModelReportResponse
     system_reports: Dict[str, ClientModelReportResponse]
     vitals_thresholds: ClientVitalsThresholds
+    mode: ConsiliumMode = Field(default=ConsiliumMode.INITIAL)
 
 
 # =====================================================================

@@ -1,4 +1,4 @@
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Any, Callable, Dict, List, Optional
 from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from sqlalchemy.orm import Session
@@ -38,6 +38,14 @@ def get_gemini_gateway() -> GeminiGateway:
 
 def get_server_now_provider() -> Callable[[], datetime]:
     return lambda: datetime.now(timezone.utc)
+
+
+def _to_utc_datetime(dt: Optional[datetime]) -> Optional[datetime]:
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
 
 
 def _build_mode2_summary_response(ep: Any) -> Mode2EpisodeSummaryResponse:
@@ -90,7 +98,49 @@ async def ingest_measurement_endpoint(
 
     # Verify cycle existence & patient ownership BEFORE inspecting cycle.status or deduplicating
     cycle = verify_cycle_access_for_session(db, session, payload.cycle_id)
-    if cycle.status != "active":
+    is_archival_delayed = False
+
+    server_now = datetime.now(timezone.utc)
+    meas_dt = _to_utc_datetime(payload.measured_at)
+    if meas_dt > server_now + timedelta(minutes=1):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Measurement timestamp '{meas_dt.isoformat()}' is in the future.",
+        )
+
+    if cycle.status == "completed":
+        closed_dt = _to_utc_datetime(cycle.closed_at or cycle.updated_at)
+        if closed_dt is None:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Completed cycle '{payload.cycle_id}' lacks closure timestamp.",
+            )
+        if meas_dt > closed_dt:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=(
+                    f"Delayed measurement timestamp '{meas_dt.isoformat()}' postdates cycle closure "
+                    f"'{closed_dt.isoformat()}' for completed cycle '{payload.cycle_id}'. "
+                    "New measurements must be submitted to the active reassessment cycle."
+                ),
+            )
+        if not payload.is_historical and cycle.started_at:
+            started_dt = _to_utc_datetime(cycle.started_at)
+            if started_dt and meas_dt < (started_dt - timedelta(minutes=5)):
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=(
+                        f"Non-historical measurement timestamp '{meas_dt.isoformat()}' predates cycle start "
+                        f"'{started_dt.isoformat()}' for completed cycle '{payload.cycle_id}'."
+                    ),
+                )
+        is_archival_delayed = True
+    elif cycle.status == "archived":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Medical cycle '{payload.cycle_id}' is archived (status='archived').",
+        )
+    elif cycle.status not in ("active", "pending_reassessment"):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Medical cycle '{payload.cycle_id}' is not active (status='{cycle.status}').",
@@ -110,8 +160,8 @@ async def ingest_measurement_endpoint(
             detail=str(ve),
         )
 
-    # Mode 2: Trigger operational vitals monitoring for new live measurements if enabled
-    if is_new and not rec.is_historical and settings.enable_mode2_monitoring:
+    # Mode 2: Trigger operational vitals monitoring for new live measurements if enabled (skipped for delayed archival)
+    if is_new and not rec.is_historical and not is_archival_delayed and settings.enable_mode2_monitoring:
         mode2_svc = Mode2VitalsMonitoringService(db=db, gateway=gateway, now_provider=now_provider)
         await mode2_svc.process_measurement(
             cycle_id=rec.cycle_id or payload.cycle_id,
@@ -168,7 +218,53 @@ async def ingest_batch_endpoint(
 ) -> HealthMeasurementBatchResponse:
     # Verify cycle existence & patient ownership BEFORE inspecting cycle.status or batch items
     cycle = verify_cycle_access_for_session(db, session, payload.cycle_id)
-    if cycle.status != "active":
+    is_archival_delayed = False
+
+    server_now = datetime.now(timezone.utc)
+    for idx, m in enumerate(payload.measurements):
+        m_dt = _to_utc_datetime(m.measured_at)
+        if m_dt > server_now + timedelta(minutes=1):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Batch item at index {idx} with timestamp '{m_dt.isoformat()}' is in the future.",
+            )
+
+    if cycle.status == "completed":
+        closed_dt = _to_utc_datetime(cycle.closed_at or cycle.updated_at)
+        if closed_dt is None:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Completed cycle '{payload.cycle_id}' lacks closure timestamp.",
+            )
+        for idx, m in enumerate(payload.measurements):
+            meas_dt = _to_utc_datetime(m.measured_at)
+            if meas_dt > closed_dt:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=(
+                        f"Delayed batch item at index {idx} with timestamp '{meas_dt.isoformat()}' "
+                        f"postdates cycle closure '{closed_dt.isoformat()}' for completed cycle '{payload.cycle_id}'. "
+                        "New measurements must be submitted to the active reassessment cycle."
+                    ),
+                )
+            is_hist = bool(m.is_historical or payload.as_historical)
+            if not is_hist and cycle.started_at:
+                started_dt = _to_utc_datetime(cycle.started_at)
+                if started_dt and meas_dt < (started_dt - timedelta(minutes=5)):
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail=(
+                            f"Non-historical batch item at index {idx} with timestamp '{meas_dt.isoformat()}' "
+                            f"predates cycle start '{started_dt.isoformat()}' for completed cycle '{payload.cycle_id}'."
+                        ),
+                    )
+        is_archival_delayed = True
+    elif cycle.status == "archived":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Medical cycle '{payload.cycle_id}' is archived (status='archived').",
+        )
+    elif cycle.status not in ("active", "pending_reassessment"):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Medical cycle '{payload.cycle_id}' is not active (status='{cycle.status}').",
@@ -219,8 +315,8 @@ async def ingest_batch_endpoint(
     recorded_count = sum(1 for f in is_new_flags if f)
     deduplicated_count = len(is_new_flags) - recorded_count
 
-    # Mode 2: Trigger operational vitals monitoring for new live measurements if enabled
-    if settings.enable_mode2_monitoring:
+    # Mode 2: Trigger operational vitals monitoring for new live measurements if enabled (skipped for delayed archival)
+    if not is_archival_delayed and settings.enable_mode2_monitoring:
         mode2_svc = Mode2VitalsMonitoringService(db=db, gateway=gateway, now_provider=now_provider)
         for rec, is_new in zip(records, is_new_flags):
             if is_new and not rec.is_historical:

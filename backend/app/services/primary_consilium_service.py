@@ -14,6 +14,7 @@ from app.repositories.report_repository import ModelReportRepository
 from app.schemas.consilium import (
     SYSTEM_KEYS,
     SYSTEM_TITLES,
+    ConsiliumMode,
     AegisAgentRole,
     AnamnesisModelOutput,
     AnamnesisQuestionnaireAnswers,
@@ -21,17 +22,24 @@ from app.schemas.consilium import (
     SystemAgentOutput,
     FlashMasterOutput,
     ProMasterOutput,
+    NeoSystemAgentOutput,
+    NeoFlashMasterOutput,
+    NeoProMasterOutput,
+    NeoConsiliumMetadata,
     ClientVitalsThresholds,
     PrimaryConsiliumClientResponse,
 )
 from app.schemas.privacy import PrivacyLevel
-from app.schemas.reports import ClientModelReportResponse
+from app.schemas.reports import ClientReportContent, ClientModelReportResponse
 from app.services.consilium_prompts import (
     build_anamnesis_prompt,
     build_anamnesis_m1_context_from_answers,
     build_system_agent_prompt,
     build_flash_master_prompt,
     build_pro_master_prompt,
+    build_neo_system_agent_prompt,
+    build_neo_flash_master_prompt,
+    build_neo_pro_master_prompt,
 )
 from app.services.gemini_gateway import GeminiGateway, GeminiModelRole
 
@@ -45,6 +53,8 @@ PRIMARY_CONSILIUM_EXECUTION_LOG_REPORT_TYPE = "primary_consilium_execution_log"
 PRIMARY_CONSILIUM_LOCK_TTL_SECONDS = 300
 PRIMARY_CONSILIUM_LOCK_HEARTBEAT_SECONDS = 2.0
 CYCLE_CONSILIUM_COORDINATION_LOCK_REPORT_TYPE = "cycle_consilium_coordination_lock"
+NEO_CYCLE_LINEAGE_REPORT_TYPE = "neo_cycle_lineage"
+NEO_CONSILIUM_EXECUTION_LOG_REPORT_TYPE = "neo_consilium_execution_log"
 
 
 class ConsiliumError(Exception):
@@ -514,8 +524,11 @@ class PrimaryConsiliumService:
             if sys_reps:
                 system_reports[sys_key] = ClientModelReportResponse.model_validate(sys_reps[0])
 
+        mode = self.detect_consilium_mode(cycle_id)
+
         return PrimaryConsiliumClientResponse(
             cycle_id=cycle_id,
+            mode=mode,
             report_date=report_date or self._now_utc().strftime("%Y-%m-%d"),
             overall_report=overall_validated,
             system_reports=system_reports,
@@ -526,11 +539,28 @@ class PrimaryConsiliumService:
             ),
         )
 
+    def is_neo_consilium_prepared(self, cycle_id: str) -> bool:
+        """
+        Returns True if Neo Consilium has already been executed and prepared
+        for this medical cycle (i.e. neo_consilium_execution_log exists in server_only storage).
+        """
+        logs = self.report_repo.list_server_only(
+            cycle_id=cycle_id,
+            report_type=NEO_CONSILIUM_EXECUTION_LOG_REPORT_TYPE,
+        )
+        return len(logs) > 0
+
     def is_primary_consilium_completed(self, cycle_id: str) -> bool:
         """
         Returns True if Primary Consilium has already been successfully executed
         and published for this medical cycle.
+        For Neo cycles, returns False while the cycle is in 'pending_reassessment' status
+        (unconfirmed prepared assessment until Stage 8B.2C activation).
         """
+        cycle = self.cycle_repo.get(cycle_id)
+        if cycle and cycle.status == "pending_reassessment":
+            return False
+
         client_facing = self.report_repo.get_latest_version_number(
             cycle_id=cycle_id,
             report_type="user_overall_report",
@@ -544,6 +574,41 @@ class PrimaryConsiliumService:
             privacy_level=PrivacyLevel.SERVER_ONLY,
         )
         return internal > 0
+
+    def validate_consilium_mode(
+        self,
+        cycle: Any,
+        requested_mode: Optional[ConsiliumMode] = None,
+    ) -> ConsiliumMode:
+        """
+        Validates and resolves the authoritative ConsiliumMode for `cycle`.
+        Enforces strict server-side rules:
+        - If cycle has neo_cycle_lineage or status == 'pending_reassessment', server_mode is NEO_REASSESSMENT.
+        - Otherwise, server_mode is INITIAL.
+        - If requested_mode is specified and contradicts server_mode, raises ConsiliumError (explicit rejection).
+        - If server_mode is NEO_REASSESSMENT but cycle.status != 'pending_reassessment', raises ConsiliumError.
+        - If cycle is completed, raises ConsiliumError if attempting to rerun.
+        """
+        server_mode = self.detect_consilium_mode(cycle.cycle_id)
+
+        if requested_mode is not None and requested_mode != server_mode:
+            raise ConsiliumError(
+                f"Requested consilium mode '{requested_mode.value}' contradicts "
+                f"server-determined mode '{server_mode.value}' for cycle '{cycle.cycle_id}'."
+            )
+
+        if server_mode == ConsiliumMode.NEO_REASSESSMENT:
+            if cycle.status != "pending_reassessment":
+                raise ConsiliumError(
+                    f"Neo reassessment can only be executed when cycle status is 'pending_reassessment' "
+                    f"(current status: '{cycle.status}' for cycle '{cycle.cycle_id}')."
+                )
+        elif cycle.status == "completed":
+            raise ConsiliumError(
+                f"Medical cycle '{cycle.cycle_id}' is completed and cannot be re-executed."
+            )
+
+        return server_mode
 
     def get_latest_raw_anamnesis(self, cycle_id: str) -> Optional[ModelReport]:
         reports = self.report_repo.list_server_only(
@@ -955,6 +1020,89 @@ class PrimaryConsiliumService:
         return "\n".join(lines)
 
     # ==========================================================================
+    # NEO REASSESSMENT SUPPORT (STAGE 8B.2A)
+    # ==========================================================================
+
+    def detect_consilium_mode(self, cycle_id: str) -> ConsiliumMode:
+        """
+        Determines whether the given medical cycle runs in INITIAL or NEO_REASSESSMENT mode.
+        A cycle is in NEO_REASSESSMENT mode if:
+        1. It contains a server_only 'neo_cycle_lineage' report (created during start_neo_reassessment).
+        2. Or its status is 'pending_reassessment'.
+        Otherwise, returns ConsiliumMode.INITIAL.
+        """
+        cycle = self.cycle_repo.get(cycle_id)
+        if not cycle:
+            raise ConsiliumCycleNotFoundError(f"Medical cycle '{cycle_id}' not found.")
+
+        lineage_reports = self.report_repo.list_server_only(
+            cycle_id=cycle_id,
+            report_type=NEO_CYCLE_LINEAGE_REPORT_TYPE,
+        )
+        if lineage_reports:
+            return ConsiliumMode.NEO_REASSESSMENT
+
+        if cycle.status == "pending_reassessment":
+            return ConsiliumMode.NEO_REASSESSMENT
+
+        return ConsiliumMode.INITIAL
+
+    def get_historical_context_for_cycle(
+        self, cycle_id: str, max_characters: int = 8000
+    ) -> Any:
+        """
+        Assembles bounded longitudinal historical context across all prior completed cycles
+        for the cycle's patient, excluding cycle_id.
+        """
+        cycle = self.cycle_repo.get(cycle_id)
+        if not cycle:
+            raise ConsiliumCycleNotFoundError(f"Medical cycle '{cycle_id}' not found.")
+
+        from app.services.historical_context_service import HistoricalContextService
+
+        hist_service = HistoricalContextService(self.db, self.now_provider)
+        return hist_service.build_historical_context(
+            patient_id=cycle.patient_id,
+            exclude_cycle_id=cycle_id,
+            max_characters=max_characters,
+        )
+
+    def build_neo_system_prompt(
+        self,
+        system_key: str,
+        input_package: Dict[str, Any],
+        historical_context: Optional[str] = None,
+    ) -> str:
+        """Builds the prompt for an organ specialist in Neo reassessment mode."""
+        return build_neo_system_agent_prompt(
+            system_key=system_key,
+            input_package=input_package,
+            historical_context=historical_context,
+        )
+
+    def build_neo_flash_prompt(
+        self,
+        initial_context: str,
+        historical_context: str,
+    ) -> str:
+        """Builds the prompt for Deputy Chief Physician in Neo reassessment mode."""
+        return build_neo_flash_master_prompt(
+            initial_context=initial_context,
+            historical_context=historical_context,
+        )
+
+    def build_neo_pro_prompt(
+        self,
+        full_master_context: str,
+        historical_context: str,
+    ) -> str:
+        """Builds the prompt for Chief Physician in Neo reassessment mode."""
+        return build_neo_pro_master_prompt(
+            full_master_context=full_master_context,
+            historical_context=historical_context,
+        )
+
+    # ==========================================================================
     # PRIMARY CONSILIUM ORCHESTRATION (8 FLASH-LITE -> DEPUTY FLASH -> PRO)
     # ==========================================================================
 
@@ -964,43 +1112,39 @@ class PrimaryConsiliumService:
         report_date: Optional[str] = None,
         idempotency_key: Optional[str] = None,
         allow_version_bump: bool = False,
+        mode: Optional[ConsiliumMode] = None,
     ) -> PrimaryConsiliumClientResponse:
         """
-        Executes the server-side Primary Consilium for `cycle_id`:
-        1. Reads saved preparatory context (Anamnesis M1, Vision OCR labs, Vision ECG, Vitals).
-           Never invokes Anamnesis M1 or Vision internally.
-        2. Acquires in-process `asyncio.Lock` and cross-process SQLite execution lease with owner fencing.
-        3. Sequentially runs the 8 Flash-Lite organ specialists with background heartbeat lease renewal.
-        4. Runs Deputy Chief Physician (Gemini Flash) with lease renewal for intersystem synthesis, audit,
-           and 8 draft user_system_reports.
-        5. Runs Chief Physician (Gemini Pro) with lease renewal for final clinical strategy (Athena handoff),
-           personal heart rate thresholds, user_overall_report, and quality control of Flash's
-           8 user_system_reports.
-        6. Enforces Pro's quality gate: if approved_for_publication is False, aborts before
-           any client_facing report is created. Otherwise applies Pro's corrections over Flash's
-           draft user_system_reports.
-        7. Atomically inside a single database transaction:
-           - Verifies and deletes the cross-process execution lease;
-           - Persists versioned server_only reports (8 organ + deputy + chief);
-           - Persists server_only authoritative execution log;
-           - Persists client_facing reports (8 systems + overall).
+        Executes the server-side Medical Consilium for `cycle_id`:
+        - INITIAL mode: 8 Gemini Flash-Lite -> 1 Gemini Flash -> 1 Gemini Pro.
+        - NEO_REASSESSMENT mode: 8 Gemini Flash-Lite (parallel) -> 1 Gemini Flash (Neo Deputy) -> 1 Gemini Pro (Neo Chief).
+        Reads saved preparatory context (Anamnesis M1, Vision OCR labs, Vision ECG, Vitals)
+        and historical context (for Neo) without re-running Anamnesis or Vision internally.
         """
         cycle = self.cycle_repo.get(cycle_id)
         if not cycle:
             raise ConsiliumCycleNotFoundError(f"Medical cycle '{cycle_id}' not found.")
 
-        if self.is_primary_consilium_completed(cycle_id):
-            from app.services.lab_revision_consilium_service import LabRevisionConsiliumService
+        consilium_mode = self.validate_consilium_mode(cycle, requested_mode=mode)
 
-            lab_service = LabRevisionConsiliumService(db=self.db, gateway=self.gateway)
-            ledger_state = lab_service.get_lab_ledger_state(cycle_id)
-            if ledger_state.has_unreviewed_lab_changes:
-                raise ConsiliumError(
-                    f"Primary Consilium has already been completed for cycle '{cycle_id}', and new laboratory "
-                    f"markers (ledger v{ledger_state.ledger_version}) are pending review. "
-                    "These markers cannot be evaluated via Primary Consilium; run Full Lab-Revision Consilium instead."
-                )
-            if not allow_version_bump:
+        if consilium_mode == ConsiliumMode.INITIAL:
+            if self.is_primary_consilium_completed(cycle_id):
+                from app.services.lab_revision_consilium_service import LabRevisionConsiliumService
+
+                lab_service = LabRevisionConsiliumService(db=self.db, gateway=self.gateway)
+                ledger_state = lab_service.get_lab_ledger_state(cycle_id)
+                if ledger_state.has_unreviewed_lab_changes:
+                    raise ConsiliumError(
+                        f"Primary Consilium has already been completed for cycle '{cycle_id}', and new laboratory "
+                        f"markers (ledger v{ledger_state.ledger_version}) are pending review. "
+                        "These markers cannot be evaluated via Primary Consilium; run Full Lab-Revision Consilium instead."
+                    )
+                if not allow_version_bump:
+                    recovered = self.recover_completed_response(cycle_id)
+                    if recovered is not None:
+                        return recovered
+        elif consilium_mode == ConsiliumMode.NEO_REASSESSMENT:
+            if self.is_neo_consilium_prepared(cycle_id) and not allow_version_bump:
                 recovered = self.recover_completed_response(cycle_id)
                 if recovered is not None:
                     return recovered
@@ -1014,10 +1158,16 @@ class PrimaryConsiliumService:
         cycle_lock = self._get_cycle_lock(cycle_id)
         async with cycle_lock:
             # Re-check after acquiring in-process lock (handles intra-process concurrent callers)
-            if self.is_primary_consilium_completed(cycle_id) and not allow_version_bump:
-                recovered = self.recover_completed_response(cycle_id)
-                if recovered is not None:
-                    return recovered
+            if consilium_mode == ConsiliumMode.INITIAL:
+                if self.is_primary_consilium_completed(cycle_id) and not allow_version_bump:
+                    recovered = self.recover_completed_response(cycle_id)
+                    if recovered is not None:
+                        return recovered
+            elif consilium_mode == ConsiliumMode.NEO_REASSESSMENT:
+                if self.is_neo_consilium_prepared(cycle_id) and not allow_version_bump:
+                    recovered = self.recover_completed_response(cycle_id)
+                    if recovered is not None:
+                        return recovered
 
             lease_owner_id = self._acquire_cross_process_lease(
                 cycle_id=cycle_id,
@@ -1040,66 +1190,144 @@ class PrimaryConsiliumService:
                 )
                 ecg_context_dict = ecg_context.to_dict()
 
-                # 2. Execute 8 Organ Specialists (Gemini Flash-Lite)
-                system_outputs: Dict[str, SystemAgentOutput] = {}
-                for system_key in SYSTEM_KEYS:
-                    organ_fact = getattr(anamnesis_m1.system_logic, system_key)
-                    input_package = {
-                        "system_key": system_key,
-                        "facts": organ_fact.data,
-                        "first_model_short_summary": organ_fact.internal_comment,
-                        "shared_labs_table": shared_labs_table,
-                        "laboratory_history": laboratory_history,
-                        "vitals_stream": vitals_stream,
-                        "ecg_context": ecg_context_dict,
-                    }
-                    system_prompt = build_system_agent_prompt(system_key, input_package)
-                    organ_result: SystemAgentOutput = await self._execute_with_lease_renewal(
+                if consilium_mode == ConsiliumMode.NEO_REASSESSMENT:
+                    # Neo Reassessment Path: Fresh + Longitudinal Historical Context
+                    historical_summary = self.get_historical_context_for_cycle(cycle_id)
+
+                    # Step 2: 8 Organ Specialists (Gemini Flash-Lite) executed in parallel
+                    async def _run_single_neo_specialist(system_key: str) -> NeoSystemAgentOutput:
+                        organ_fact = getattr(anamnesis_m1.system_logic, system_key)
+                        input_package = {
+                            "system_key": system_key,
+                            "facts": organ_fact.data,
+                            "first_model_short_summary": organ_fact.internal_comment,
+                            "shared_labs_table": shared_labs_table,
+                            "laboratory_history": laboratory_history,
+                            "vitals_stream": vitals_stream,
+                            "ecg_context": ecg_context_dict,
+                        }
+                        system_prompt = self.build_neo_system_prompt(
+                            system_key=system_key,
+                            input_package=input_package,
+                            historical_context=historical_summary.formatted_markdown,
+                        )
+                        return await self.gateway.generate_structured(
+                            prompt=system_prompt,
+                            response_schema=NeoSystemAgentOutput,
+                            model=GeminiModelRole.FLASH_LITE,
+                        )
+
+                    async def _run_all_neo_specialists() -> Dict[str, NeoSystemAgentOutput]:
+                        tasks = [_run_single_neo_specialist(k) for k in SYSTEM_KEYS]
+                        results = await asyncio.gather(*tasks)
+                        return dict(zip(SYSTEM_KEYS, results))
+
+                    system_outputs: Dict[str, Any] = await self._execute_with_lease_renewal(
                         cycle_id,
                         lease_owner_id,
-                        lambda p=system_prompt: self.gateway.generate_structured(
-                            prompt=p,
-                            response_schema=SystemAgentOutput,
-                            model=GeminiModelRole.FLASH_LITE,
+                        _run_all_neo_specialists,
+                    )
+
+                    # Step 3: Deputy Chief Physician (Gemini Flash) with Neo prompt
+                    initial_master_context = self._assemble_context_for_flash(
+                        anamnesis=anamnesis_m1,
+                        shared_labs_table=shared_labs_table,
+                        vitals_stream=vitals_stream,
+                        system_outputs=system_outputs,
+                        laboratory_history=laboratory_history,
+                        ecg_context=ecg_context,
+                    )
+                    flash_prompt = self.build_neo_flash_prompt(
+                        initial_context=initial_master_context,
+                        historical_context=historical_summary.formatted_markdown,
+                    )
+                    flash_output: NeoFlashMasterOutput = await self._execute_with_lease_renewal(
+                        cycle_id,
+                        lease_owner_id,
+                        lambda: self.gateway.generate_structured(
+                            prompt=flash_prompt,
+                            response_schema=NeoFlashMasterOutput,
+                            model=GeminiModelRole.FLASH,
                         ),
                     )
-                    system_outputs[system_key] = organ_result
 
-                # 3. Execute Deputy Chief Physician (Gemini Flash)
-                initial_master_context = self._assemble_context_for_flash(
-                    anamnesis=anamnesis_m1,
-                    shared_labs_table=shared_labs_table,
-                    vitals_stream=vitals_stream,
-                    system_outputs=system_outputs,
-                    laboratory_history=laboratory_history,
-                    ecg_context=ecg_context,
-                )
-                flash_prompt = build_flash_master_prompt(initial_master_context)
-                flash_output: FlashMasterOutput = await self._execute_with_lease_renewal(
-                    cycle_id,
-                    lease_owner_id,
-                    lambda: self.gateway.generate_structured(
-                        prompt=flash_prompt,
-                        response_schema=FlashMasterOutput,
-                        model=GeminiModelRole.FLASH,
-                    ),
-                )
+                    # Step 4: Chief Physician (Gemini Pro) with Neo prompt
+                    full_master_context = self._assemble_context_for_pro(
+                        initial_master_context=initial_master_context,
+                        flash_output=flash_output,
+                    )
+                    pro_prompt = self.build_neo_pro_prompt(
+                        full_master_context=full_master_context,
+                        historical_context=historical_summary.formatted_markdown,
+                    )
+                    pro_output: NeoProMasterOutput = await self._execute_with_lease_renewal(
+                        cycle_id,
+                        lease_owner_id,
+                        lambda: self.gateway.generate_structured(
+                            prompt=pro_prompt,
+                            response_schema=NeoProMasterOutput,
+                            model=GeminiModelRole.PRO,
+                        ),
+                    )
+                else:
+                    # Initial Consilium Path
+                    system_outputs = {}
+                    for system_key in SYSTEM_KEYS:
+                        organ_fact = getattr(anamnesis_m1.system_logic, system_key)
+                        input_package = {
+                            "system_key": system_key,
+                            "facts": organ_fact.data,
+                            "first_model_short_summary": organ_fact.internal_comment,
+                            "shared_labs_table": shared_labs_table,
+                            "laboratory_history": laboratory_history,
+                            "vitals_stream": vitals_stream,
+                            "ecg_context": ecg_context_dict,
+                        }
+                        system_prompt = build_system_agent_prompt(system_key, input_package)
+                        organ_result: SystemAgentOutput = await self._execute_with_lease_renewal(
+                            cycle_id,
+                            lease_owner_id,
+                            lambda p=system_prompt: self.gateway.generate_structured(
+                                prompt=p,
+                                response_schema=SystemAgentOutput,
+                                model=GeminiModelRole.FLASH_LITE,
+                            ),
+                        )
+                        system_outputs[system_key] = organ_result
 
-                # 4. Execute Chief Physician (Gemini Pro)
-                full_master_context = self._assemble_context_for_pro(
-                    initial_master_context=initial_master_context,
-                    flash_output=flash_output,
-                )
-                pro_prompt = build_pro_master_prompt(full_master_context)
-                pro_output: ProMasterOutput = await self._execute_with_lease_renewal(
-                    cycle_id,
-                    lease_owner_id,
-                    lambda: self.gateway.generate_structured(
-                        prompt=pro_prompt,
-                        response_schema=ProMasterOutput,
-                        model=GeminiModelRole.PRO,
-                    ),
-                )
+                    initial_master_context = self._assemble_context_for_flash(
+                        anamnesis=anamnesis_m1,
+                        shared_labs_table=shared_labs_table,
+                        vitals_stream=vitals_stream,
+                        system_outputs=system_outputs,
+                        laboratory_history=laboratory_history,
+                        ecg_context=ecg_context,
+                    )
+                    flash_prompt = build_flash_master_prompt(initial_master_context)
+                    flash_output: FlashMasterOutput = await self._execute_with_lease_renewal(
+                        cycle_id,
+                        lease_owner_id,
+                        lambda: self.gateway.generate_structured(
+                            prompt=flash_prompt,
+                            response_schema=FlashMasterOutput,
+                            model=GeminiModelRole.FLASH,
+                        ),
+                    )
+
+                    full_master_context = self._assemble_context_for_pro(
+                        initial_master_context=initial_master_context,
+                        flash_output=flash_output,
+                    )
+                    pro_prompt = build_pro_master_prompt(full_master_context)
+                    pro_output: ProMasterOutput = await self._execute_with_lease_renewal(
+                        cycle_id,
+                        lease_owner_id,
+                        lambda: self.gateway.generate_structured(
+                            prompt=pro_prompt,
+                            response_schema=ProMasterOutput,
+                            model=GeminiModelRole.PRO,
+                        ),
+                    )
 
                 # 5. Chief Physician Quality Gate (BEFORE any client_facing report is created)
                 if not pro_output.flash_quality_review.approved_for_publication:
@@ -1156,17 +1384,21 @@ class PrimaryConsiliumService:
                         commit=False,
                     )
 
+                deputy_content = {
+                    "agent_role": AegisAgentRole.DEPUTY_CHIEF_PHYSICIAN.value,
+                    "flash_general_shelf": flash_output.flash_general_shelf,
+                    "flash_training_shelf": flash_output.flash_training_shelf,
+                    "draft_user_system_reports": flash_output.user_system_reports.to_dict(),
+                }
+                if consilium_mode == ConsiliumMode.NEO_REASSESSMENT:
+                    deputy_content["mode"] = ConsiliumMode.NEO_REASSESSMENT.value
+
                 self.report_repo.create_next_version(
                     cycle_id=cycle_id,
                     model=self.gateway.flash_model,
                     report_type="deputy_chief_physician_internal",
                     privacy_level=PrivacyLevel.SERVER_ONLY,
-                    content={
-                        "agent_role": AegisAgentRole.DEPUTY_CHIEF_PHYSICIAN.value,
-                        "flash_general_shelf": flash_output.flash_general_shelf,
-                        "flash_training_shelf": flash_output.flash_training_shelf,
-                        "draft_user_system_reports": flash_output.user_system_reports.to_dict(),
-                    },
+                    content=deputy_content,
                     commit=False,
                 )
 
@@ -1174,37 +1406,69 @@ class PrimaryConsiliumService:
                     lab_context.ledger_version if not lab_context.is_synthetic_fallback else 0
                 )
 
+                chief_content = {
+                    "agent_role": AegisAgentRole.CHIEF_PHYSICIAN.value,
+                    "pro_general_shelf": pro_output.pro_general_shelf,
+                    "pro_training_shelf": pro_output.pro_training_shelf,
+                    "vitals_thresholds": pro_output.vitals_thresholds.model_dump(),
+                    "flash_quality_review": pro_output.flash_quality_review.model_dump(),
+                    "evaluated_ledger_version": evaluated_ledger_version,
+                    "is_synthetic_fallback": bool(lab_context.is_synthetic_fallback),
+                }
+                if consilium_mode == ConsiliumMode.NEO_REASSESSMENT:
+                    chief_content["mode"] = ConsiliumMode.NEO_REASSESSMENT.value
+                    chief_content["is_activated"] = False
+
                 self.report_repo.create_next_version(
                     cycle_id=cycle_id,
                     model=self.gateway.pro_model,
                     report_type="chief_physician_internal",
                     privacy_level=PrivacyLevel.SERVER_ONLY,
-                    content={
-                        "agent_role": AegisAgentRole.CHIEF_PHYSICIAN.value,
-                        "pro_general_shelf": pro_output.pro_general_shelf,
-                        "pro_training_shelf": pro_output.pro_training_shelf,
-                        "vitals_thresholds": pro_output.vitals_thresholds.model_dump(),
-                        "flash_quality_review": pro_output.flash_quality_review.model_dump(),
-                        "evaluated_ledger_version": evaluated_ledger_version,
-                        "is_synthetic_fallback": bool(lab_context.is_synthetic_fallback),
-                    },
+                    content=chief_content,
                     commit=False,
                 )
 
                 now_utc = self._now_utc()
-                # Authoritative execution log report
-                self.report_repo.create_next_version(
-                    cycle_id=cycle_id,
-                    model=self.gateway.pro_model,
-                    report_type=PRIMARY_CONSILIUM_EXECUTION_LOG_REPORT_TYPE,
-                    privacy_level=PrivacyLevel.SERVER_ONLY,
-                    content={
+                if consilium_mode == ConsiliumMode.NEO_REASSESSMENT:
+                    neo_meta = NeoConsiliumMetadata(
+                        mode=ConsiliumMode.NEO_REASSESSMENT,
+                        new_cycle_id=cycle_id,
+                        previous_cycle_id=historical_summary.prior_cycle_ids[-1] if historical_summary.prior_cycle_ids else None,
+                        prior_cycles_count=historical_summary.prior_cycles_count,
+                        prior_cycle_ids=historical_summary.prior_cycle_ids,
+                        historical_character_count=historical_summary.character_count,
+                        is_historical_condensed=historical_summary.is_condensed,
+                        abnormal_labs_count=historical_summary.abnormal_labs_count,
+                        referrals_count=historical_summary.referrals_count,
+                    )
+                    log_content = {
+                        "status": "prepared",
+                        "is_prepared": True,
+                        "is_activated": False,
                         "completed_at_utc": now_utc.isoformat(),
                         "lease_owner_id": lease_owner_id,
                         "idempotency_key": idempotency_key,
                         "evaluated_ledger_version": evaluated_ledger_version,
                         "report_date": resolved_date,
-                    },
+                        "metadata": neo_meta.model_dump(),
+                    }
+                    log_report_type = NEO_CONSILIUM_EXECUTION_LOG_REPORT_TYPE
+                else:
+                    log_content = {
+                        "completed_at_utc": now_utc.isoformat(),
+                        "lease_owner_id": lease_owner_id,
+                        "idempotency_key": idempotency_key,
+                        "evaluated_ledger_version": evaluated_ledger_version,
+                        "report_date": resolved_date,
+                    }
+                    log_report_type = PRIMARY_CONSILIUM_EXECUTION_LOG_REPORT_TYPE
+
+                self.report_repo.create_next_version(
+                    cycle_id=cycle_id,
+                    model=self.gateway.pro_model,
+                    report_type=log_report_type,
+                    privacy_level=PrivacyLevel.SERVER_ONLY,
+                    content=log_content,
                     created_at=now_utc,
                     commit=False,
                 )
@@ -1213,47 +1477,51 @@ class PrimaryConsiliumService:
                 for system_key in SYSTEM_KEYS:
                     verified_summary = final_user_system_texts[system_key]
                     system_title = f"{SYSTEM_TITLES[system_key]} Overview"
+                    sys_content = {
+                        "title": system_title,
+                        "summary": verified_summary,
+                        "report_date": resolved_date,
+                        "system_key": system_key,
+                        "has_changes": True,
+                        "entries": [
+                            {
+                                "date": resolved_date,
+                                "summary": verified_summary,
+                                "has_changes": True,
+                            }
+                        ],
+                    }
+                    ClientReportContent.model_validate(sys_content)
                     saved_sys_report = self.report_repo.create_next_version(
                         cycle_id=cycle_id,
                         model=self.gateway.flash_model,
                         report_type=f"system_user_report_{system_key}",
                         privacy_level=PrivacyLevel.CLIENT_FACING,
-                        content={
-                            "title": system_title,
-                            "summary": verified_summary,
-                            "report_date": resolved_date,
-                            "system_key": system_key,
-                            "has_changes": True,
-                            "entries": [
-                                {
-                                    "date": resolved_date,
-                                    "summary": verified_summary,
-                                    "has_changes": True,
-                                }
-                            ],
-                        },
+                        content=sys_content,
                         commit=False,
                     )
                     client_system_reports[system_key] = ClientModelReportResponse.model_validate(
                         saved_sys_report
                     )
 
+                overall_content = {
+                    "title": pro_output.user_overall_report.title,
+                    "summary": pro_output.user_overall_report.summary,
+                    "report_date": resolved_date,
+                    "highlights": list(pro_output.user_overall_report.highlights),
+                    "metrics": {
+                        "min_pessimum_bpm": pro_output.vitals_thresholds.min_pessimum_bpm,
+                        "max_pessimum_bpm": pro_output.vitals_thresholds.max_pessimum_bpm,
+                        "max_spike_delta_bpm": pro_output.vitals_thresholds.max_spike_delta_bpm,
+                    },
+                }
+                ClientReportContent.model_validate(overall_content)
                 saved_overall_report = self.report_repo.create_next_version(
                     cycle_id=cycle_id,
                     model=self.gateway.pro_model,
                     report_type="user_overall_report",
                     privacy_level=PrivacyLevel.CLIENT_FACING,
-                    content={
-                        "title": pro_output.user_overall_report.title,
-                        "summary": pro_output.user_overall_report.summary,
-                        "report_date": resolved_date,
-                        "highlights": list(pro_output.user_overall_report.highlights),
-                        "metrics": {
-                            "min_pessimum_bpm": pro_output.vitals_thresholds.min_pessimum_bpm,
-                            "max_pessimum_bpm": pro_output.vitals_thresholds.max_pessimum_bpm,
-                            "max_spike_delta_bpm": pro_output.vitals_thresholds.max_spike_delta_bpm,
-                        },
-                    },
+                    content=overall_content,
                     commit=False,
                 )
                 validated_overall = ClientModelReportResponse.model_validate(saved_overall_report)
@@ -1266,6 +1534,7 @@ class PrimaryConsiliumService:
 
         return PrimaryConsiliumClientResponse(
             cycle_id=cycle_id,
+            mode=consilium_mode,
             report_date=resolved_date,
             overall_report=validated_overall,
             system_reports=client_system_reports,
