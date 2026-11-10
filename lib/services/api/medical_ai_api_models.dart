@@ -779,6 +779,9 @@ class PrimaryConsiliumClientResponse {
   final ClientModelReportResponse overallReport;
   final Map<String, ClientModelReportResponse> systemReports;
   final ClientVitalsThresholds vitalsThresholds;
+  final String mode;
+
+  bool get isNeoReassessment => mode == 'neo_reassessment';
 
   const PrimaryConsiliumClientResponse({
     required this.cycleId,
@@ -786,6 +789,7 @@ class PrimaryConsiliumClientResponse {
     required this.overallReport,
     this.systemReports = const {},
     required this.vitalsThresholds,
+    this.mode = 'initial',
   });
 
   factory PrimaryConsiliumClientResponse.fromJson(Map<String, dynamic> json) {
@@ -809,6 +813,7 @@ class PrimaryConsiliumClientResponse {
       vitalsThresholds: ClientVitalsThresholds.fromJson(
         Map<String, dynamic>.from(json['vitals_thresholds'] as Map? ?? {}),
       ),
+      mode: json['mode'] as String? ?? 'initial',
     );
   }
 
@@ -818,6 +823,7 @@ class PrimaryConsiliumClientResponse {
     'overall_report': overallReport.toJson(),
     'system_reports': systemReports.map((k, v) => MapEntry(k, v.toJson())),
     'vitals_thresholds': vitalsThresholds.toJson(),
+    'mode': mode,
   };
 }
 
@@ -1868,5 +1874,118 @@ class ClientReferralDocumentDetailResponse {
     'available_formats': availableFormats,
     'cycle_status': cycleStatus,
     'document_version': documentVersion,
+  };
+}
+
+/// ============================================================================
+/// STAGE 8B: NEO REASSESSMENT API MODELS
+/// ============================================================================
+
+/// Response from `POST /api/v1/cycles/start-neo-reassessment`.
+class StartNeoReassessmentResponse {
+  final String patientId;
+  final String cycleId;
+  final String previousCycleId;
+  final String status;
+  final String reassessmentStatus;
+  final bool isPendingReassessment;
+  final String createdAtUtc;
+  final String message;
+
+  const StartNeoReassessmentResponse({
+    required this.patientId,
+    required this.cycleId,
+    required this.previousCycleId,
+    required this.status,
+    required this.reassessmentStatus,
+    required this.isPendingReassessment,
+    required this.createdAtUtc,
+    required this.message,
+  });
+
+  factory StartNeoReassessmentResponse.fromJson(Map<String, dynamic> json) {
+    return StartNeoReassessmentResponse(
+      patientId: json['patient_id'] as String? ?? '',
+      cycleId: json['cycle_id'] as String? ?? '',
+      previousCycleId: json['previous_cycle_id'] as String? ?? '',
+      status: json['status'] as String? ?? 'pending_reassessment',
+      reassessmentStatus: json['reassessment_status'] as String? ?? 'pending_reassessment',
+      isPendingReassessment: json['is_pending_reassessment'] as bool? ?? true,
+      createdAtUtc: json['created_at_utc'] as String? ?? '',
+      message: json['message'] as String? ?? '',
+    );
+  }
+
+  Map<String, dynamic> toJson() => {
+    'patient_id': patientId,
+    'cycle_id': cycleId,
+    'previous_cycle_id': previousCycleId,
+    'status': status,
+    'reassessment_status': reassessmentStatus,
+    'is_pending_reassessment': isPendingReassessment,
+    'created_at_utc': createdAtUtc,
+    'message': message,
+  };
+}
+
+/// Request payload for `POST /api/v1/client/cascade/activate-neo`.
+class NeoActivationRequest {
+  final String? cycleId;
+
+  const NeoActivationRequest({this.cycleId});
+
+  Map<String, dynamic> toJson() => {
+    if (cycleId != null) 'cycle_id': cycleId,
+  };
+}
+
+/// Authoritative response from `POST /api/v1/client/cascade/activate-neo`.
+class NeoActivationResponse {
+  final bool success;
+  final String cycleId;
+  final String status;
+  final String activatedAtUtc;
+  final int strategyVersion;
+  final String scheduleAnchorT0Utc;
+  final String nextWeeklyConsiliumDueUtc;
+  final bool postPrimaryInitEnqueued;
+  final bool isIdempotentReplay;
+
+  const NeoActivationResponse({
+    required this.success,
+    required this.cycleId,
+    required this.status,
+    required this.activatedAtUtc,
+    required this.strategyVersion,
+    required this.scheduleAnchorT0Utc,
+    required this.nextWeeklyConsiliumDueUtc,
+    required this.postPrimaryInitEnqueued,
+    required this.isIdempotentReplay,
+  });
+
+  factory NeoActivationResponse.fromJson(Map<String, dynamic> json) {
+    return NeoActivationResponse(
+      success: json['success'] as bool? ?? true,
+      cycleId: json['cycle_id'] as String? ?? '',
+      status: json['status'] as String? ?? 'active',
+      activatedAtUtc: json['activated_at_utc'] as String? ?? '',
+      strategyVersion: (json['strategy_version'] as num?)?.toInt() ?? 1,
+      scheduleAnchorT0Utc: json['schedule_anchor_t0_utc'] as String? ?? '',
+      nextWeeklyConsiliumDueUtc: json['next_weekly_consilium_due_utc'] as String? ?? '',
+      postPrimaryInitEnqueued: json['post_primary_init_enqueued'] as bool? ?? true,
+      isIdempotentReplay: json['is_idempotent_replay'] as bool? ?? false,
+    );
+  }
+
+  Map<String, dynamic> toJson() => {
+    'success': success,
+    'cycle_id': cycleId,
+    'status': status,
+    'activated_at_utc': activatedAtUtc,
+    'strategy_version': strategyVersion,
+    'schedule_anchor_t0_utc': scheduleAnchorT0Utc,
+    'next_weekly_consilium_due_utc': nextWeeklyConsiliumDueUtc,
+    'post_primary_init_enqueued': postPrimaryInitEnqueued,
+    'is_idempotent_replay': isIdempotentReplay,
   };
 }

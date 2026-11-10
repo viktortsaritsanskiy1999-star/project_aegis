@@ -269,6 +269,7 @@ class ClinicalAutomationService:
         idempotency_key: Optional[str] = None,
         max_attempts: int = DEFAULT_JOB_MAX_ATTEMPTS,
         next_attempt_at_utc: Optional[str] = None,
+        commit: bool = True,
     ) -> AutomationJobRecord:
         clean_patient = (patient_id or "").strip()
         clean_cycle = (cycle_id or "").strip()
@@ -298,13 +299,19 @@ class ClinicalAutomationService:
             )
 
         if resolved_type == AutomationJobType.POST_PRIMARY_INIT:
-            if not self.primary_service.is_primary_consilium_completed(clean_cycle):
+            if not (
+                self.primary_service.is_primary_consilium_completed(clean_cycle)
+                or self.primary_service.is_neo_consilium_activated(clean_cycle)
+            ):
                 raise ConsiliumContextMissingError(
                     f"Cannot enqueue post-Primary initialization for cycle '{clean_cycle}': "
                     "manual Primary Consilium has not been completed yet."
                 )
         elif resolved_type == AutomationJobType.FIRST_PLANNED_QUESTION:
-            if not self.primary_service.is_primary_consilium_completed(clean_cycle):
+            if not (
+                self.primary_service.is_primary_consilium_completed(clean_cycle)
+                or self.primary_service.is_neo_consilium_activated(clean_cycle)
+            ):
                 raise ConsiliumContextMissingError(
                     f"Cannot enqueue first planned question for cycle '{clean_cycle}': "
                     "manual Primary Consilium has not been completed yet."
@@ -411,8 +418,9 @@ class ClinicalAutomationService:
                 created_at=now_dt,
             )
             self.db.add(row)
-            self.db.commit()
-            self.db.refresh(row)
+            if commit:
+                self.db.commit()
+                self.db.refresh(row)
             return self._row_to_job_record(row)
         except (IntegrityError, OperationalError):
             self.db.rollback()
@@ -432,11 +440,13 @@ class ClinicalAutomationService:
         cycle_id: str,
         patient_id: Optional[str] = None,
         max_attempts: int = DEFAULT_JOB_MAX_ATTEMPTS,
+        commit: bool = True,
     ) -> Optional[AutomationJobRecord]:
         """
         Safely enqueues the post-Primary initialization job (`post_primary_init`)
-        ONLY if the manual Primary Consilium is already completed for `cycle_id`
+        ONLY if the manual Primary Consilium or Neo Consilium is already completed for `cycle_id`
         and the cycle is associated with a valid `patient_id`.
+        Supports commit=False for atomic transactional outbox enqueues.
         """
         clean_cycle = (cycle_id or "").strip()
         if not clean_cycle:
@@ -447,7 +457,10 @@ class ClinicalAutomationService:
         effective_patient_id = (patient_id or cycle.patient_id or "").strip()
         if not effective_patient_id:
             return None
-        if not self.primary_service.is_primary_consilium_completed(clean_cycle):
+        if not (
+            self.primary_service.is_primary_consilium_completed(clean_cycle)
+            or self.primary_service.is_neo_consilium_activated(clean_cycle)
+        ):
             return None
         return self.enqueue_or_get_job(
             patient_id=effective_patient_id,
@@ -457,6 +470,7 @@ class ClinicalAutomationService:
                 clean_cycle, AutomationJobType.POST_PRIMARY_INIT
             ),
             max_attempts=max_attempts,
+            commit=commit,
         )
 
     def enqueue_first_planned_question(
@@ -466,6 +480,7 @@ class ClinicalAutomationService:
         patient_id: Optional[str] = None,
         available_at_utc: datetime,
         max_attempts: int = DEFAULT_JOB_MAX_ATTEMPTS,
+        commit: bool = True,
     ) -> Optional[AutomationJobRecord]:
         """
         Enqueues the first planned question (first_planned_question) at T0 + 30 seconds.
@@ -480,7 +495,10 @@ class ClinicalAutomationService:
         effective_patient_id = (patient_id or cycle.patient_id or "").strip()
         if not effective_patient_id:
             return None
-        if not self.primary_service.is_primary_consilium_completed(clean_cycle):
+        if not (
+            self.primary_service.is_primary_consilium_completed(clean_cycle)
+            or self.primary_service.is_neo_consilium_activated(clean_cycle)
+        ):
             return None
         if self.weekly_service.find_schedule_anchor_timestamp(clean_cycle) is None:
             return None
@@ -493,6 +511,7 @@ class ClinicalAutomationService:
             idempotency_key=idempotency_key,
             max_attempts=max_attempts,
             next_attempt_at_utc=available_at_utc.isoformat(),
+            commit=commit,
         )
 
     def enqueue_daily_journal_closure(
@@ -1056,7 +1075,10 @@ class ClinicalAutomationService:
         for cycle in active_cycles:
             if not cycle.patient_id or not cycle.patient_id.strip():
                 continue
-            if not self.primary_service.is_primary_consilium_completed(cycle.cycle_id):
+            if not (
+                self.primary_service.is_primary_consilium_completed(cycle.cycle_id)
+                or self.primary_service.is_neo_consilium_activated(cycle.cycle_id)
+            ):
                 # First Primary Consilium is strictly manual — never auto-enqueue after intake
                 continue
             job = self.enqueue_post_primary_init(
@@ -1066,10 +1088,12 @@ class ClinicalAutomationService:
             if job is not None:
                 discovered.append(job)
 
-            # Discover first_planned_question if weekly plan enabled and anchor T0 established
-            if self.enable_weekly_plan:
+            # Discover first_planned_question if anchor T0 established and initial greeting exists
+            is_neo = self.athena_service._is_neo_cycle(cycle.cycle_id)
+            if self.enable_weekly_plan or is_neo:
                 anchor_dt = self.weekly_service.find_schedule_anchor_timestamp(cycle.cycle_id)
-                if anchor_dt is not None:
+                existing_greeting = self.athena_service.find_existing_post_primary_initial_greeting(cycle.cycle_id)
+                if anchor_dt is not None and existing_greeting is not None:
                     has_unanswered = self.athena_service.has_unanswered_routine_question(cycle.cycle_id)
                     q1_key = f"first_planned_q_{cycle.cycle_id}"
                     existing_q1_job = self.get_job(
@@ -1759,14 +1783,23 @@ class ClinicalAutomationService:
                 "reason": "cycle_not_active",
             }
 
-        # 3. Schedule first planned question at T0 + 30 seconds if weekly plan enabled
-        if self.enable_weekly_plan:
+        # 3. Schedule first planned question at T0 + 30 seconds (independent of enable_weekly_plan for Neo)
+        is_neo = self.athena_service._is_neo_cycle(job.cycle_id)
+        if self.enable_weekly_plan or is_neo:
             q1_available_at = effective_anchor + timedelta(seconds=30)
-            self.enqueue_first_planned_question(
+            q1_job = self.enqueue_first_planned_question(
                 cycle_id=job.cycle_id,
                 patient_id=job.patient_id,
                 available_at_utc=q1_available_at,
             )
+
+            # If T0 + 30 seconds has already arrived by the time greeting completes,
+            # safely execute the overdue first planned question immediately, preserving message order.
+            now_dt = self._now_utc()
+            if q1_job is not None and now_dt >= q1_available_at:
+                claimed_q1 = self.claim_job(q1_job.job_id)
+                if claimed_q1 is not None:
+                    await self.execute_claimed_job(claimed_q1)
 
         res_meta: Dict[str, Any] = {
             "reused_existing": reused,

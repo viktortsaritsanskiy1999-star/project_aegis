@@ -1542,7 +1542,10 @@ class AthenaChatService:
             if (
                 isinstance(msg, dict)
                 and msg.get("sender") == "user"
-                and msg.get("text") == "[Initialization]: First introduction"
+                and msg.get("text") in (
+                    "[Initialization]: First introduction",
+                    "[Initialization]: Neo reassessment introduction",
+                )
                 and idx + 1 < len(history)
             ):
                 reply_msg = history[idx + 1]
@@ -1559,6 +1562,23 @@ class AthenaChatService:
                         created_at=ts,
                     )
         return None
+
+    def _is_neo_cycle(self, cycle_id: str) -> bool:
+        """
+        Determines whether `cycle_id` is a Neo reassessment cycle.
+        Checks for `neo_cycle_lineage` or `neo_consilium_execution_log` server-only reports.
+        """
+        lineage = self.report_repo.list_server_only(
+            cycle_id=cycle_id,
+            report_type="neo_cycle_lineage",
+        )
+        if lineage:
+            return True
+        neo_logs = self.report_repo.list_server_only(
+            cycle_id=cycle_id,
+            report_type="neo_consilium_execution_log",
+        )
+        return len(neo_logs) > 0
 
     def _find_idempotent_turn(self, cycle_id: str, idempotency_key: str) -> Optional[AthenaChatResponse]:
         reports = self.report_repo.list_server_only(
@@ -2116,9 +2136,14 @@ Study the history of past answers and the current step of the Pro route.
             return prompt, user_record
 
         if event_type == "initial_greeting":
-            from app.services.consilium_prompts import build_athena_initial_greeting_prompt
-            prompt = build_athena_initial_greeting_prompt()
-            user_record = "[Initialization]: First introduction"
+            if self._is_neo_cycle(cycle_id):
+                from app.services.consilium_prompts import build_athena_neo_greeting_prompt
+                prompt = build_athena_neo_greeting_prompt()
+                user_record = "[Initialization]: Neo reassessment introduction"
+            else:
+                from app.services.consilium_prompts import build_athena_initial_greeting_prompt
+                prompt = build_athena_initial_greeting_prompt()
+                user_record = "[Initialization]: First introduction"
             return prompt, user_record
 
         if event_type == "first_planned_question":

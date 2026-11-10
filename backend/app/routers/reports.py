@@ -32,7 +32,10 @@ def get_client_reports(
     session: AuthSession = Depends(require_scopes("cycle:read", "reports:read")),
 ) -> List[ClientModelReportResponse]:
     # Enforce patient cycle ownership BEFORE reading any reports
-    verify_cycle_access_for_session(db, session, cycle_id)
+    cycle = verify_cycle_access_for_session(db, session, cycle_id)
+    if cycle.status == "pending_reassessment":
+        # Prepared Neo reports are not published as active client reports until activation
+        return []
 
     repo = ModelReportRepository(db)
     reports = repo.list_client_facing(cycle_id=cycle_id, report_type=report_type)
@@ -65,6 +68,7 @@ def get_single_client_report(
             cycle is None
             or cycle.patient_id is None
             or cycle.patient_id != session.patient_id
+            or cycle.status == "pending_reassessment"
         ):
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,

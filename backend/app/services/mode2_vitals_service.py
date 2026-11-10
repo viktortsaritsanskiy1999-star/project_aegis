@@ -279,9 +279,39 @@ class Mode2VitalsMonitoringService:
 
     def resolve_thresholds(self, cycle_id: str) -> Dict[str, Any]:
         """
-        Extracts personal vitals thresholds established by Pro in user_overall_report.
-        If absent, applies safe fallback bounds. Always includes hard safety bounds.
+        Extracts personal vitals thresholds established by Pro.
+        Authoritative medical source: chief_physician_internal (SERVER_ONLY).
+        Secondary presentation fallback: user_overall_report (CLIENT_FACING).
+        If absent, applies safe fallback bounds. Always includes hard invariant safety bounds.
         """
+        # 1. Authoritative internal source: chief_physician_internal
+        chief_reports = self.report_repo.list_server_only(
+            cycle_id=cycle_id,
+            report_type="chief_physician_internal",
+        )
+        if chief_reports and chief_reports[0].content:
+            vt = chief_reports[0].content.get("vitals_thresholds") or {}
+            min_bpm = vt.get("min_pessimum_bpm")
+            max_bpm = vt.get("max_pessimum_bpm")
+            spike_bpm = vt.get("max_spike_delta_bpm")
+            if min_bpm is not None and max_bpm is not None:
+                try:
+                    return {
+                        "source": "pro",
+                        "source_report_type": "chief_physician_internal",
+                        "min_pessimum_bpm": int(min_bpm),
+                        "max_pessimum_bpm": int(max_bpm),
+                        "max_spike_delta_bpm": int(spike_bpm if spike_bpm is not None else FALLBACK_MAX_SPIKE_DELTA_BPM),
+                        "critical_bradycardia_bpm": CRITICAL_BRADYCARDIA_BPM,
+                        "critical_tachycardia_bpm": CRITICAL_TACHYCARDIA_BPM,
+                        "extreme_tachycardia_bpm": EXTREME_TACHYCARDIA_BPM,
+                        "critical_spo2": CRITICAL_SPO2,
+                        "warning_spo2": WARNING_SPO2,
+                    }
+                except (ValueError, TypeError):
+                    pass
+
+        # 2. Secondary fallback: user_overall_report
         overall_reports = self.report_repo.list_client_facing(
             cycle_id=cycle_id,
             report_type="user_overall_report",
@@ -289,20 +319,25 @@ class Mode2VitalsMonitoringService:
         if overall_reports and overall_reports[0].content:
             metrics = overall_reports[0].content.get("metrics") or {}
             if "min_pessimum_bpm" in metrics and "max_pessimum_bpm" in metrics:
-                return {
-                    "source": "pro",
-                    "min_pessimum_bpm": int(metrics.get("min_pessimum_bpm", FALLBACK_MIN_PESSIMUM_BPM)),
-                    "max_pessimum_bpm": int(metrics.get("max_pessimum_bpm", FALLBACK_MAX_PESSIMUM_BPM)),
-                    "max_spike_delta_bpm": int(metrics.get("max_spike_delta_bpm", FALLBACK_MAX_SPIKE_DELTA_BPM)),
-                    "critical_bradycardia_bpm": CRITICAL_BRADYCARDIA_BPM,
-                    "critical_tachycardia_bpm": CRITICAL_TACHYCARDIA_BPM,
-                    "extreme_tachycardia_bpm": EXTREME_TACHYCARDIA_BPM,
-                    "critical_spo2": CRITICAL_SPO2,
-                    "warning_spo2": WARNING_SPO2,
-                }
+                try:
+                    return {
+                        "source": "pro",
+                        "source_report_type": "user_overall_report",
+                        "min_pessimum_bpm": int(metrics.get("min_pessimum_bpm", FALLBACK_MIN_PESSIMUM_BPM)),
+                        "max_pessimum_bpm": int(metrics.get("max_pessimum_bpm", FALLBACK_MAX_PESSIMUM_BPM)),
+                        "max_spike_delta_bpm": int(metrics.get("max_spike_delta_bpm", FALLBACK_MAX_SPIKE_DELTA_BPM)),
+                        "critical_bradycardia_bpm": CRITICAL_BRADYCARDIA_BPM,
+                        "critical_tachycardia_bpm": CRITICAL_TACHYCARDIA_BPM,
+                        "extreme_tachycardia_bpm": EXTREME_TACHYCARDIA_BPM,
+                        "critical_spo2": CRITICAL_SPO2,
+                        "warning_spo2": WARNING_SPO2,
+                    }
+                except (ValueError, TypeError):
+                    pass
 
         return {
             "source": "fallback",
+            "source_report_type": "default_bounds",
             "min_pessimum_bpm": FALLBACK_MIN_PESSIMUM_BPM,
             "max_pessimum_bpm": FALLBACK_MAX_PESSIMUM_BPM,
             "max_spike_delta_bpm": FALLBACK_MAX_SPIKE_DELTA_BPM,

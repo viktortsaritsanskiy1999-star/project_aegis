@@ -548,7 +548,23 @@ class PrimaryConsiliumService:
             cycle_id=cycle_id,
             report_type=NEO_CONSILIUM_EXECUTION_LOG_REPORT_TYPE,
         )
-        return len(logs) > 0
+        if not logs:
+            return False
+        content = logs[0].content or {}
+        return bool(content.get("is_prepared", True))
+
+    def is_neo_consilium_activated(self, cycle_id: str) -> bool:
+        """
+        Returns True if Neo Consilium has been formally activated for this medical cycle.
+        """
+        logs = self.report_repo.list_server_only(
+            cycle_id=cycle_id,
+            report_type=NEO_CONSILIUM_EXECUTION_LOG_REPORT_TYPE,
+        )
+        if not logs:
+            return False
+        content = logs[0].content or {}
+        return bool(content.get("is_activated", False)) or content.get("status") == "activated"
 
     def is_primary_consilium_completed(self, cycle_id: str) -> bool:
         """

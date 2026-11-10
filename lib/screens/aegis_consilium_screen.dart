@@ -194,10 +194,12 @@ class _AegisConsiliumScreenState extends State<AegisConsiliumScreen> {
         return;
       }
 
-      // Ready to execute
+      // Ready to execute or activate prepared Neo consilium
       setState(() {
         _state = ConsiliumScreenState.readyToRun;
-        _statusExplanation = "Medical cycle context verified. Ready to activate neural synthesis.";
+        _statusExplanation = (status.isNeoReassessment && status.reassessmentStatus == 'prepared')
+            ? "Neo Consilium prepared. Ready to activate new clinical strategy."
+            : "Medical cycle context verified. Ready to activate neural synthesis.";
       });
     } on AegisNetworkException catch (e) {
       if (mounted && _requestEpoch == epoch && auth.confirmedAttributionPatientId == patientId) {
@@ -342,6 +344,48 @@ class _AegisConsiliumScreenState extends State<AegisConsiliumScreen> {
         return;
       }
 
+      // If Neo is already prepared, activate directly without repeating 10 models
+      if (status.isNeoReassessment && status.reassessmentStatus == 'prepared') {
+        setState(() {
+          _statusExplanation = "Activating prepared Neo Consilium and publishing new clinical strategy...";
+        });
+        await apiClient.activateNeoConsilium(
+          cycleId: cycleId,
+          idempotencyKey: 'neo_act_$cycleId',
+        );
+
+        if (!mounted ||
+            _requestEpoch != epoch ||
+            auth.confirmedAttributionPatientId != patientId ||
+            vault.sessionEpoch != initialVaultEpoch) {
+          return;
+        }
+
+        final reports = await apiClient.getClientReports(cycleId: cycleId);
+        final bool saved = await vault.recordClientReports(
+          cycleId: cycleId,
+          reports: reports,
+          expectedPatientId: patientId,
+        );
+        if (!saved) {
+          setState(() {
+            _state = ConsiliumScreenState.error;
+            _statusExplanation = "Failed to securely persist consilium results to local storage.";
+          });
+          return;
+        }
+        vault.setNeedsNeoWelcome(true);
+        _stableIdempotencyKey = null;
+        _activeConsiliumCycleId = null;
+        if (mounted) {
+          Navigator.pushReplacement(
+            context,
+            MaterialPageRoute(builder: (context) => const AtlasScreen()),
+          );
+        }
+        return;
+      }
+
       // 2. Stable idempotency key for this medical cycle across retries
       if (_activeConsiliumCycleId != cycleId || _stableIdempotencyKey == null) {
         _activeConsiliumCycleId = cycleId;
@@ -362,6 +406,26 @@ class _AegisConsiliumScreenState extends State<AegisConsiliumScreen> {
           auth.confirmedAttributionPatientId != patientId ||
           vault.sessionEpoch != initialVaultEpoch) {
         return;
+      }
+
+      // If Neo mode, atomically activate prepared consilium before publishing to client
+      if (response.isNeoReassessment || status.isNeoReassessment) {
+        setState(() {
+          _statusExplanation = "Activating reassessment and publishing new clinical strategy...";
+        });
+        await apiClient.activateNeoConsilium(
+          cycleId: response.cycleId,
+          idempotencyKey: 'neo_act_${response.cycleId}',
+        );
+
+        if (!mounted ||
+            _requestEpoch != epoch ||
+            auth.confirmedAttributionPatientId != patientId ||
+            vault.sessionEpoch != initialVaultEpoch) {
+          return;
+        }
+
+        vault.setNeedsNeoWelcome(true);
       }
 
       final allReports = <ClientModelReportResponse>[

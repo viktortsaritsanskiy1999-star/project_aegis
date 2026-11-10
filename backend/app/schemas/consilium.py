@@ -463,6 +463,49 @@ class NeoConsiliumMetadata(BaseModel):
     referrals_count: int = Field(default=0, ge=0)
 
 
+class NeoActivationRequest(BaseModel):
+    """
+    Client request payload for activating a prepared Neo Consilium cycle.
+    `cycle_id` is optional and validated against session ownership with Zero Oracle Leakage.
+    """
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    cycle_id: Optional[str] = Field(
+        default=None,
+        min_length=3,
+        max_length=64,
+        description="Optional target cycle_id. If omitted, resolved from authenticated patient's pending cycle.",
+    )
+
+
+class NeoAdminActivationRequest(BaseModel):
+    """
+    Admin request payload to activate a prepared Neo Consilium cycle.
+    """
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    cycle_id: str = Field(..., min_length=3, max_length=64)
+
+
+class NeoActivationResponse(BaseModel):
+    """
+    Authoritative response schema returned upon successful atomic Neo activation.
+    Guarantees idempotency and reflects active cycle state, new strategy version,
+    and anchor T0 without exposing internal private model reports.
+    """
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    success: bool = True
+    cycle_id: str = Field(..., min_length=3, max_length=64)
+    status: str = Field(default="active", max_length=32)
+    activated_at_utc: str = Field(..., max_length=64)
+    strategy_version: int = Field(default=1, ge=1)
+    schedule_anchor_t0_utc: str = Field(..., max_length=64)
+    next_weekly_consilium_due_utc: str = Field(..., max_length=64)
+    post_primary_init_enqueued: bool = True
+    is_idempotent_replay: bool = False
+
+
 # =====================================================================
 # 5. API REQUEST / RESPONSE SCHEMAS FOR PRIMARY CONSILIUM
 # =====================================================================

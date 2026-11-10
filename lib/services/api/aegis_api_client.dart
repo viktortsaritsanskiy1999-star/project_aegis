@@ -1217,6 +1217,78 @@ class AegisApiClient {
     }
   }
 
+  /// Start a new Neo reassessment cycle for authenticated patient (`POST /api/v1/cycles/start-neo-reassessment`).
+  /// Idempotently returns existing pending_reassessment cycle if already provisioned.
+  Future<StartNeoReassessmentResponse> startNeoReassessment({
+    String? accessToken,
+  }) async {
+    final uri = Uri.parse('$baseUrl/api/v1/cycles/start-neo-reassessment');
+    try {
+      final response = await _sendWithAuthRetry(
+        sendRequest: (token) async {
+          final headers = await _buildHeaders(accessToken: token);
+          _log('POST $uri');
+          return await _client.post(uri, headers: headers).timeout(timeout);
+        },
+        explicitAccessToken: accessToken,
+      );
+
+      if (response.statusCode == 200 || response.statusCode == 201) {
+        final data = json.decode(response.body) as Map<String, dynamic>;
+        return StartNeoReassessmentResponse.fromJson(data);
+      }
+      _handleErrorResponse(response);
+    } on TimeoutException catch (e) {
+      _log('Timeout on $uri: $e');
+      throw AegisTimeoutException('Start neo reassessment timed out after ${timeout.inSeconds}s');
+    } on SocketException catch (e) {
+      _log('Socket error on $uri: $e');
+      throw AegisNetworkException('Network connection failed: ${e.message}');
+    } on http.ClientException catch (e) {
+      _log('Client error on $uri: $e');
+      throw AegisNetworkException('HTTP client error: ${e.message}');
+    }
+  }
+
+  /// Atomically activate prepared Neo Consilium for authenticated patient (`POST /api/v1/client/cascade/activate-neo`).
+  /// Requires `cascade:run` scope. Idempotent replay returns 200.
+  Future<NeoActivationResponse> activateNeoConsilium({
+    String? cycleId,
+    String? idempotencyKey,
+    String? accessToken,
+  }) async {
+    final uri = Uri.parse('$baseUrl/api/v1/client/cascade/activate-neo');
+    try {
+      final response = await _sendWithAuthRetry(
+        sendRequest: (token) async {
+          final headers = await _buildHeaders(accessToken: token);
+          if (idempotencyKey != null && idempotencyKey.trim().isNotEmpty) {
+            headers['Idempotency-Key'] = idempotencyKey.trim();
+          }
+          final body = json.encode(NeoActivationRequest(cycleId: cycleId).toJson());
+          _log('POST $uri (body: $body)');
+          return await _client.post(uri, headers: headers, body: body).timeout(timeout);
+        },
+        explicitAccessToken: accessToken,
+      );
+
+      if (response.statusCode == 200) {
+        final data = json.decode(response.body) as Map<String, dynamic>;
+        return NeoActivationResponse.fromJson(data);
+      }
+      _handleErrorResponse(response);
+    } on TimeoutException catch (e) {
+      _log('Timeout on $uri: $e');
+      throw AegisTimeoutException('Activate neo consilium timed out after ${timeout.inSeconds}s');
+    } on SocketException catch (e) {
+      _log('Socket error on $uri: $e');
+      throw AegisNetworkException('Network connection failed: ${e.message}');
+    } on http.ClientException catch (e) {
+      _log('Client error on $uri: $e');
+      throw AegisNetworkException('HTTP client error: ${e.message}');
+    }
+  }
+
   void close() {
     _client.close();
   }

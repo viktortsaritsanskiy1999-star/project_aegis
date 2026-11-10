@@ -37,12 +37,15 @@ from app.schemas.consilium import (
     EcgVisionIntakeClientResponse,
     LabLedgerStateResponse,
     LabVisionIntakeClientResponse,
+    NeoActivationRequest,
+    NeoActivationResponse,
     PrimaryConsiliumClientResponse,
     WeeklyConsiliumClientResponse,
     SYSTEM_KEYS,
 )
 from app.schemas.reports import ClientModelReportResponse
 from app.security.auth import (
+    GENERIC_CYCLE_ACCESS_DENIED_DETAIL,
     DeviceSession,
     require_device_session,
     require_scopes,
@@ -82,6 +85,13 @@ from app.services.ecg_vision_service import (
 )
 from app.services.clinical_automation_service import ClinicalAutomationService
 from app.services.athena_chat_service import AthenaChatService
+from app.services.neo_activation_service import (
+    NeoConsiliumActivationService,
+    NeoActivationError,
+    NeoActivationPreconditionError,
+    NeoActivationCycleNotFoundError,
+    NeoActivationAccessDeniedError,
+)
 
 router = APIRouter(prefix="/api/v1/client", tags=["Client Medical Operations"])
 
@@ -390,7 +400,12 @@ def get_client_cascade_status(
         if lineage_reps:
             is_neo = True
     if is_neo:
-        reassess_status = "prepared" if primary_service.is_neo_consilium_prepared(cycle_id) else "pending_reassessment"
+        if primary_service.is_neo_consilium_activated(cycle_id):
+            reassess_status = "activated"
+        elif primary_service.is_neo_consilium_prepared(cycle_id):
+            reassess_status = "prepared"
+        else:
+            reassess_status = "pending_reassessment"
     else:
         reassess_status = None
 
@@ -1023,6 +1038,111 @@ async def run_client_weekly_consilium(
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail=f"Gemini Weekly cascade execution failed: {exc}",
+        ) from exc
+    except ConsiliumError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=str(exc),
+        ) from exc
+
+
+@router.post(
+    "/cascade/activate-neo",
+    response_model=NeoActivationResponse,
+    summary="Atomically activate prepared Neo Consilium for authenticated patient (Patient-Isolated)",
+    description=(
+        "Patient-scoped endpoint that atomically transitions an existing prepared Neo cycle "
+        "from 'pending_reassessment' to 'active'. Publishes Athena active strategy, sets schedule anchor T0, "
+        "activates new Pro personal vitals thresholds, and enqueues post-primary Athena greeting without repeating "
+        "the 10-model consilium cascade. Safe, idempotent, zero oracle leakage."
+    ),
+)
+async def activate_client_neo_consilium(
+    request: Request,
+    response: Response,
+    payload: Optional[NeoActivationRequest] = None,
+    db: Session = Depends(get_db),
+    session: DeviceSession = Depends(require_device_session),
+    _scope: DeviceSession = Depends(require_scopes(SCOPE_CASCADE_RUN)),
+    gateway: GeminiGateway = Depends(get_gemini_gateway),
+    now_provider: Callable[[], datetime] = Depends(get_server_now_provider),
+    idempotency_key: Optional[str] = Header(None, alias="Idempotency-Key"),
+) -> NeoActivationResponse:
+    cycle_repo = MedicalCycleRepository(db)
+
+    # 1. Resolve target cycle for authenticated patient
+    resolved_cycle_id: Optional[str] = None
+    if payload is not None and payload.cycle_id:
+        req_cycle_id = payload.cycle_id.strip()
+        target_cycle = cycle_repo.get(req_cycle_id)
+        if (
+            target_cycle is None
+            or target_cycle.patient_id is None
+            or target_cycle.patient_id != session.patient_id
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=GENERIC_CYCLE_ACCESS_DENIED_DETAIL,
+            )
+        resolved_cycle_id = req_cycle_id
+    else:
+        pending_cycle = cycle_repo.get_pending_reassessment_for_patient(session.patient_id)
+        if pending_cycle is not None:
+            resolved_cycle_id = pending_cycle.cycle_id
+        else:
+            active_cycle = cycle_repo.get_active_for_patient(session.patient_id)
+            if active_cycle is not None:
+                resolved_cycle_id = active_cycle.cycle_id
+            else:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail=f"No pending reassessment cycle found for authenticated patient '{session.patient_id}'.",
+                )
+
+    activation_service = NeoConsiliumActivationService(
+        db=db,
+        gateway=gateway,
+        now_provider=now_provider,
+    )
+
+    try:
+        result = activation_service.activate_prepared_neo(
+            cycle_id=resolved_cycle_id,
+            patient_id=session.patient_id,
+            idempotency_key=idempotency_key,
+        )
+
+        if result.is_idempotent_replay:
+            response.headers["X-Aegis-Idempotent-Replay"] = "true"
+
+        # Notify automation worker if present
+        try:
+            worker = getattr(request.app.state, "automation_worker", None)
+            if worker is not None and hasattr(worker, "notify"):
+                worker.notify()
+        except Exception:
+            pass
+
+        return result
+    except NeoActivationCycleNotFoundError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=str(exc),
+        ) from exc
+    except NeoActivationAccessDeniedError:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=GENERIC_CYCLE_ACCESS_DENIED_DETAIL,
+        )
+    except NeoActivationPreconditionError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=str(exc),
+        ) from exc
+    except (ConsiliumConcurrencyConflictError, ReportVersionConflictError) as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=str(exc),
         ) from exc
     except ConsiliumError as exc:
         raise HTTPException(

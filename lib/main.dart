@@ -1399,6 +1399,24 @@ class AtlasScreenState extends State<AtlasScreen> with WidgetsBindingObserver {
   void _checkAndShowAthenaWelcome() {
     final vault = Provider.of<VaultService>(context, listen: false);
 
+    // 🛡️ STAGE 8B: NEO REASSESSMENT WELCOME SHEET
+    if (vault.needsNeoWelcome) {
+      vault.markNeoWelcomeShown();
+      AthenaWelcomeSheet.show(
+        context,
+        isNeoReassessment: true,
+        onConnect: () {
+          if (mounted) {
+            Navigator.push(
+              context,
+              MaterialPageRoute(builder: (context) => const CuratorChatScreen()),
+            );
+          }
+        },
+      );
+      return;
+    }
+
     final Map<String, dynamic> globalFolder = vault.getSystemContext('global');
     final bool alreadyShown = globalFolder['athena_welcomed'] == true;
 
@@ -2737,6 +2755,179 @@ class CuratorVaultSheet extends StatefulWidget {
 
 class _CuratorVaultSheetState extends State<CuratorVaultSheet> {
   /// 🗑️ DIALOGS AND VAULT RESET LOGIC
+  Future<void> _showUpdateHealthInfoDialog(BuildContext context) async {
+    // 1. User confirmation dialog
+    final bool? proceed = await showDialog<bool>(
+      context: context,
+      barrierDismissible: false,
+      builder: (BuildContext dialogContext) {
+        return AlertDialog(
+          backgroundColor: const Color(0xFF0D1117),
+          shape: RoundedRectangleBorder(
+            side: const BorderSide(color: Color(0xFF00FFFF), width: 1),
+            borderRadius: BorderRadius.circular(12),
+          ),
+          title: const Text(
+            'Update Health Information',
+            style: TextStyle(color: Color(0xFF00FFFF), fontWeight: FontWeight.bold),
+          ),
+          content: const Text(
+            'You will complete a new health assessment. Your previous medical history and documents will be preserved.',
+            style: TextStyle(color: Colors.white),
+          ),
+          actions: [
+            TextButton(
+              key: const Key('update_health_info_cancel_btn'),
+              onPressed: () => Navigator.of(dialogContext).pop(false),
+              child: const Text('Cancel', style: TextStyle(color: Colors.white70)),
+            ),
+            TextButton(
+              key: const Key('update_health_info_continue_btn'),
+              onPressed: () => Navigator.of(dialogContext).pop(true),
+              style: TextButton.styleFrom(foregroundColor: const Color(0xFF00FFFF)),
+              child: const Text('Continue', style: TextStyle(fontWeight: FontWeight.bold)),
+            ),
+          ],
+        );
+      },
+    );
+
+    if (proceed != true || !context.mounted) return;
+
+    // 2. Pre-Reset Synchronization Barrier
+    final vault = Provider.of<VaultService>(context, listen: false);
+    VitalsSyncQueue? syncQueue;
+    try {
+      syncQueue = Provider.of<VitalsSyncQueue>(context, listen: false);
+    } catch (_) {}
+    AuthSessionManager? authManager;
+    try {
+      authManager = Provider.of<AuthSessionManager>(context, listen: false);
+    } catch (_) {}
+    AegisApiClient apiClient;
+    try {
+      apiClient = Provider.of<AegisApiClient>(context, listen: false);
+    } catch (_) {
+      apiClient = AegisApiClient();
+    }
+
+    final patientId = authManager?.confirmedAttributionPatientId ?? vault.activePatientId;
+
+    // A. Flush pending telemetry items to ensure no unsynced measurements are lost
+    if (syncQueue != null && (syncQueue.pendingItems.isNotEmpty || syncQueue.quarantinedItems.isNotEmpty)) {
+      try {
+        final syncResult = await syncQueue.flush();
+        if (syncResult.status != SyncStatus.success && syncResult.status != SyncStatus.idle) {
+          if (!context.mounted) return;
+          await _showSyncErrorDialog(
+            context,
+            'Unable to synchronize pending health measurements: ${syncResult.message ?? "Server unreachable"}. Local data preserved. Please retry later.',
+          );
+          return;
+        }
+      } catch (e) {
+        if (!context.mounted) return;
+        await _showSyncErrorDialog(
+          context,
+          'Synchronization failed: $e. Your local measurements are preserved. Please retry later.',
+        );
+        return;
+      }
+    }
+
+    // B. Flush pending local vault disk writes
+    try {
+      await vault.flushPendingWrites(patientId: patientId);
+    } catch (e) {
+      if (!context.mounted) return;
+      await _showSyncErrorDialog(
+        context,
+        'Local storage persistence failed: $e. Reassessment aborted.',
+      );
+      return;
+    }
+
+    // 3. Request server to create or recover Neo reassessment cycle
+    StartNeoReassessmentResponse neoResponse;
+    try {
+      neoResponse = await apiClient.startNeoReassessment();
+    } on AegisNetworkException catch (e) {
+      if (!context.mounted) return;
+      await _showSyncErrorDialog(
+        context,
+        'Network error while starting reassessment: ${e.message}. Your data has been preserved.',
+      );
+      return;
+    } on AegisApiException catch (e) {
+      if (!context.mounted) return;
+      await _showSyncErrorDialog(
+        context,
+        'Server rejected reassessment: ${e.message}. Your data has been preserved.',
+      );
+      return;
+    } catch (e) {
+      if (!context.mounted) return;
+      await _showSyncErrorDialog(
+        context,
+        'Error starting reassessment: $e. Your data has been preserved.',
+      );
+      return;
+    }
+
+    if (!context.mounted) return;
+
+    // 4. Update local Vault and SyncQueue state
+    await vault.prepareForNeoReassessment(
+      newCycleId: neoResponse.cycleId,
+      previousCycleId: neoResponse.previousCycleId,
+      expectedPatientId: patientId,
+    );
+
+    if (syncQueue != null) {
+      try {
+        await syncQueue.resolveActiveCycle(force: true);
+      } catch (_) {}
+    }
+
+    if (!context.mounted) return;
+
+    // 5. Close sheet and navigate directly to fresh Onboarding (AnamnesisScreen)
+    Navigator.of(context).pushAndRemoveUntil(
+      MaterialPageRoute(builder: (context) => AnamnesisScreen()),
+      (Route<dynamic> route) => false,
+    );
+  }
+
+  Future<void> _showSyncErrorDialog(BuildContext context, String message) async {
+    await showDialog<void>(
+      context: context,
+      builder: (BuildContext dialogContext) {
+        return AlertDialog(
+          backgroundColor: const Color(0xFF0D1117),
+          shape: RoundedRectangleBorder(
+            side: const BorderSide(color: Colors.redAccent, width: 1),
+            borderRadius: BorderRadius.circular(12),
+          ),
+          title: const Text(
+            'Synchronization Barrier',
+            style: TextStyle(color: Colors.redAccent, fontWeight: FontWeight.bold),
+          ),
+          content: Text(
+            message,
+            style: const TextStyle(color: Colors.white),
+          ),
+          actions: [
+            TextButton(
+              key: const Key('sync_error_dialog_ok_btn'),
+              onPressed: () => Navigator.of(dialogContext).pop(),
+              child: const Text('OK', style: TextStyle(color: Colors.white70)),
+            ),
+          ],
+        );
+      },
+    );
+  }
+
   Future<void> _showResetVaultDialog(BuildContext context) async {
     // 1. Confirmation window (Yes / No)
     final bool? confirm = await showDialog<bool>(
@@ -2947,39 +3138,43 @@ class _CuratorVaultSheetState extends State<CuratorVaultSheet> {
 
                     const SizedBox(height: 16),
 
-                    // 🛡️ FUTURE STAGE 8B: UPDATE HEALTH INFORMATION (NEO)
-                    // Compatible structure for Stage 8B; strictly non-active without server-side Neo cascade.
-                    // Never linked to destructive resetVault().
-                    Container(
+                    // 🛡️ STAGE 8B: UPDATE HEALTH INFORMATION (NEO)
+                    // Full Neo reassessment flow with Pre-Reset Synchronization Barrier.
+                    // Strictly isolated from destructive resetVault().
+                    InkWell(
                       key: const Key('update_health_info_placeholder'),
-                      width: double.infinity,
-                      padding: const EdgeInsets.all(10),
-                      decoration: BoxDecoration(
-                        color: const Color(0xFF161B22),
-                        borderRadius: BorderRadius.circular(8),
-                        border: Border.all(color: Colors.white12),
-                      ),
-                      child: const Row(
-                        children: [
-                          Icon(Icons.sync_outlined, color: Colors.white38, size: 16),
-                          SizedBox(width: 8),
-                          Expanded(
-                            child: Column(
-                              crossAxisAlignment: CrossAxisAlignment.start,
-                              children: [
-                                Text(
-                                  'Update Health Information',
-                                  style: TextStyle(color: Colors.white54, fontSize: 11, fontWeight: FontWeight.bold),
-                                ),
-                                SizedBox(height: 2),
-                                Text(
-                                  'Future incremental update (Stage 8B). Available after in-person doctor visit.',
-                                  style: TextStyle(color: Colors.white38, fontSize: 10),
-                                ),
-                              ],
+                      onTap: () => _showUpdateHealthInfoDialog(context),
+                      borderRadius: BorderRadius.circular(8),
+                      child: Container(
+                        width: double.infinity,
+                        padding: const EdgeInsets.all(10),
+                        decoration: BoxDecoration(
+                          color: const Color(0xFF161B22),
+                          borderRadius: BorderRadius.circular(8),
+                          border: Border.all(color: const Color(0xFF00FFFF).withOpacity(0.3)),
+                        ),
+                        child: const Row(
+                          children: [
+                            Icon(Icons.sync_outlined, color: Color(0xFF00FFFF), size: 16),
+                            SizedBox(width: 8),
+                            Expanded(
+                              child: Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [
+                                  Text(
+                                    'Update Health Information',
+                                    style: TextStyle(color: Colors.white, fontSize: 11, fontWeight: FontWeight.bold),
+                                  ),
+                                  SizedBox(height: 2),
+                                  Text(
+                                    'Future incremental update (Stage 8B). Available after in-person doctor visit.',
+                                    style: TextStyle(color: Colors.white70, fontSize: 10),
+                                  ),
+                                ],
+                              ),
                             ),
-                          ),
-                        ],
+                          ],
+                        ),
                       ),
                     ),
                   ],

@@ -182,6 +182,30 @@ class VaultService extends ChangeNotifier {
   String? _consiliumCycleId;
   final Map<String, Map<String, dynamic>> _consiliumHistory = {};
 
+  // Stage 8B: Neo Reassessment State
+  bool _isNeoReassessment = false;
+  bool _needsNeoWelcome = false;
+  String? _neoPreviousCycleId;
+  final Map<String, List<Map<String, String>>> _archivedChatHistoryByCycle = {};
+
+  bool get isNeoReassessment => _isNeoReassessment;
+  bool get needsNeoWelcome => _needsNeoWelcome;
+  String? get neoPreviousCycleId => _neoPreviousCycleId;
+  Map<String, List<Map<String, String>>> get archivedChatHistoryByCycle =>
+      Map.unmodifiable(_archivedChatHistoryByCycle);
+
+  void setNeedsNeoWelcome(bool value) {
+    _needsNeoWelcome = value;
+    _persist();
+    notifyListeners();
+  }
+
+  void markNeoWelcomeShown() {
+    _needsNeoWelcome = false;
+    _persist();
+    notifyListeners();
+  }
+
   // Client-facing Weekly Consilium reports
   String? _activeWeeklySprintId;
   int? _activeWeeklySprintNumber;
@@ -488,6 +512,10 @@ class VaultService extends ChangeNotifier {
     _activeWeeklyOverallReport = null;
     _activeWeeklySystemReports.clear();
     _weeklyConsiliumHistory.clear();
+    _isNeoReassessment = false;
+    _needsNeoWelcome = false;
+    _neoPreviousCycleId = null;
+    _archivedChatHistoryByCycle.clear();
   }
 
   Future<void> _initVault() async {
@@ -775,6 +803,21 @@ class VaultService extends ChangeNotifier {
       _activeWeeklySystemReports.clear();
       _weeklyConsiliumHistory.clear();
     }
+
+    _isNeoReassessment = loadedData['is_neo_reassessment'] == true;
+    _needsNeoWelcome = loadedData['needs_neo_welcome'] == true;
+    _neoPreviousCycleId = loadedData['neo_previous_cycle_id'] as String?;
+    if (loadedData['archived_chat_history_by_cycle'] is Map) {
+      _archivedChatHistoryByCycle.clear();
+      (loadedData['archived_chat_history_by_cycle'] as Map).forEach((k, v) {
+        if (v is List) {
+          _archivedChatHistoryByCycle[k.toString()] = v
+              .whereType<Map>()
+              .map((m) => Map<String, String>.from(m))
+              .toList();
+        }
+      });
+    }
   }
 
   Map<String, dynamic> _createSnapshot() {
@@ -784,6 +827,10 @@ class VaultService extends ChangeNotifier {
       'curator_chat_history': _curatorChatHistory,
       'vitals_thresholds': _systemFolders['global']?['vitals_thresholds'],
       'athena_clinical_logs': _athenaClinicalLogs,
+      'is_neo_reassessment': _isNeoReassessment,
+      'needs_neo_welcome': _needsNeoWelcome,
+      'neo_previous_cycle_id': _neoPreviousCycleId,
+      'archived_chat_history_by_cycle': _archivedChatHistoryByCycle,
       'anamnesis_sync': {
         'status': _anamnesisSyncStatus.name,
         'cycle_id': _anamnesisCycleId,
@@ -2277,6 +2324,110 @@ class VaultService extends ChangeNotifier {
     }
   }
 
+  /// Safely transitions Vault to Neo reassessment for a new cycle:
+  /// - Archives previous completed consilium into `_consiliumHistory`
+  /// - Archives previous cycle's chat into `_archivedChatHistoryByCycle`
+  /// - Clears active chat for the new cycle
+  /// - Clears active clinical logs for the new cycle
+  /// - Sets active consiliumCycleId = newCycleId, resets isConsiliumCompleted = false
+  /// - Clears active shelves, active reports, anamnesis data draft
+  /// - Preserves all Doctor documents, historical measurements, patient pairing and identity
+  /// - Never deletes Vault or touches resetVault()
+  Future<bool> prepareForNeoReassessment({
+    required String newCycleId,
+    required String previousCycleId,
+    String? expectedPatientId,
+  }) async {
+    if (_isDisposed) return false;
+
+    final activeId = _activePatientId;
+    if (expectedPatientId != null && expectedPatientId != activeId) {
+      debugPrint('[VaultService] Patient attribution mismatch for Neo transition. Discarding.');
+      return false;
+    }
+
+    final int capturedEpoch = _sessionEpoch;
+
+    // 1. Archive previous consilium if present
+    final prevCycle = previousCycleId.isNotEmpty ? previousCycleId : (_consiliumCycleId ?? '');
+    if (_isConsiliumCompleted && prevCycle.isNotEmpty && _clientOverallReport != null) {
+      _consiliumHistory[prevCycle] = {
+        'cycle_id': prevCycle,
+        'is_completed': true,
+        'overall_report': _clientOverallReport!.toJson(),
+        'system_reports': _clientSystemReports.map((k, v) => MapEntry(k, v.toJson())),
+        'archived_at': DateTime.now().toUtc().toIso8601String(),
+      };
+    }
+
+    // 2. Archive previous cycle's curator chat
+    if (prevCycle.isNotEmpty && _curatorChatHistory.isNotEmpty) {
+      _archivedChatHistoryByCycle[prevCycle] = List.from(_curatorChatHistory);
+    }
+    _curatorChatHistory.clear();
+    _athenaClinicalLogs.clear();
+
+    // 3. Reset active consilium state
+    _isConsiliumCompleted = false;
+    _consiliumCycleId = newCycleId;
+    _clientOverallReport = null;
+    _clientSystemReports.clear();
+
+    // 4. Reset active shelves
+    for (final sysKey in _systemFolders.keys) {
+      if (sysKey != 'notes_export' && sysKey != 'global' && sysKey != 'core_cascade') {
+        _systemFolders[sysKey]?.remove('system_user_report');
+        _systemFolders[sysKey]?['system_general_shelf'] = null;
+      }
+    }
+    _systemFolders['core_cascade']?['pro_general_shelf'] = null;
+    _systemFolders['core_cascade']?['flash_general_shelf'] = null;
+    _systemFolders['global']?.remove('athena_welcomed');
+
+    // 5. Reset anamnesis state for fresh assessment
+    _anamnesisSyncStatus = AnamnesisSyncStatus.idle;
+    _anamnesisCycleId = null;
+    _anamnesisIntakeVersion = null;
+    _anamnesisSyncedAt = null;
+    _anamnesisSyncError = null;
+    _isAnamnesisSyncing = false;
+
+    // 6. Reset weekly sprint state for new cycle
+    _activeWeeklySprintId = null;
+    _activeWeeklySprintNumber = null;
+    _activeWeeklyReportDate = null;
+    _activeWeeklyOverallReport = null;
+    _activeWeeklySystemReports.clear();
+
+    // 7. Mark Neo state
+    _isNeoReassessment = true;
+    _neoPreviousCycleId = prevCycle;
+    _needsNeoWelcome = false;
+
+    if (_isDisposed || _sessionEpoch != capturedEpoch || _activePatientId != activeId) {
+      return false;
+    }
+
+    try {
+      await _persist();
+      if (_isDisposed || _sessionEpoch != capturedEpoch || _activePatientId != activeId) {
+        return false;
+      }
+      if (activeId != null) {
+        await flushPendingWrites(patientId: activeId);
+        if (_isDisposed || _sessionEpoch != capturedEpoch || _activePatientId != activeId) {
+          return false;
+        }
+      }
+      notifyListeners();
+      return true;
+    } catch (e) {
+      debugPrint('[VaultService] Failed to securely persist Neo reassessment state: $e');
+      notifyListeners();
+      return false;
+    }
+  }
+
   // Direct saving method for vital parameters
   void updateSmartWatchMetrics({
     int? systolic,
@@ -2953,14 +3104,22 @@ class VaultService extends ChangeNotifier {
   /// Synchronizes sanitized curator chat history from server for active patient.
   /// Strictly checks [expectedPatientId] against active patient attribution to prevent cross-patient contamination.
   /// Preserves local history if incoming history is empty or if patient attribution does not match.
-  bool syncCuratorChatHistory(List<Map<String, String>> history, {String? expectedPatientId}) {
+  bool syncCuratorChatHistory(
+    List<Map<String, String>> history, {
+    String? cycleId,
+    String? expectedPatientId,
+  }) {
     if (expectedPatientId != null && _activePatientId != expectedPatientId) {
       debugPrint('[VaultService] Patient attribution mismatch when syncing curator chat history. Discarding.');
       return false;
     }
+    // If incoming history is empty, only preserve local history if it belongs to the same cycle
     if (history.isEmpty && _curatorChatHistory.isNotEmpty) {
-      debugPrint('[VaultService] Incoming history is empty while local vault has history. Preserving local history.');
-      return false;
+      final isSameCycle = cycleId == null || _consiliumCycleId == null || cycleId == _consiliumCycleId;
+      if (isSameCycle) {
+        debugPrint('[VaultService] Incoming history is empty while local vault has history. Preserving local history.');
+        return false;
+      }
     }
     _curatorChatHistory.clear();
     _curatorChatHistory.addAll(history);

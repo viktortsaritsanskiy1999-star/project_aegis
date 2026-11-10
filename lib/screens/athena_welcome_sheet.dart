@@ -2,24 +2,56 @@ import 'package:flutter/material.dart';
 
 class AthenaWelcomeSheet extends StatelessWidget {
   final VoidCallback onConnect;
+  final bool isNeoReassessment;
+  final String? customTitle;
+  final String? customSubtitle;
+  final String? customButtonText;
 
   const AthenaWelcomeSheet({
     super.key,
     required this.onConnect,
+    this.isNeoReassessment = false,
+    this.customTitle,
+    this.customSubtitle,
+    this.customButtonText,
   });
 
-  static Future<void> show(BuildContext context, {required VoidCallback onConnect}) {
+  static Future<void> show(
+    BuildContext context, {
+    required VoidCallback onConnect,
+    bool isNeoReassessment = false,
+    String? customTitle,
+    String? customSubtitle,
+    String? customButtonText,
+  }) {
     return showModalBottomSheet(
       context: context,
       isScrollControlled: true,
       backgroundColor: Colors.transparent,
       barrierColor: const Color(0xB3000000), // Equivalent to black70
-      builder: (context) => AthenaWelcomeSheet(onConnect: onConnect),
+      builder: (context) => AthenaWelcomeSheet(
+        onConnect: onConnect,
+        isNeoReassessment: isNeoReassessment,
+        customTitle: customTitle,
+        customSubtitle: customSubtitle,
+        customButtonText: customButtonText,
+      ),
     );
   }
 
   @override
   Widget build(BuildContext context) {
+    final title = customTitle ??
+        (isNeoReassessment
+            ? 'Thank you for updating your health information!'
+            : 'Data processed!');
+    final subtitle = customSubtitle ??
+        (isNeoReassessment
+            ? 'Athena is waiting for you.'
+            : 'The medical board has finished analyzing your metrics. Now we know a little more about your health.\n\nJust go about your business, and we will always be near. Shall I introduce you to Athena?');
+    final buttonText = customButtonText ??
+        (isNeoReassessment ? 'Go to Chat' : 'Meet Athena');
+
     return Container(
       decoration: const BoxDecoration(
         color: Color(0xFF0D1117),
@@ -57,9 +89,9 @@ class AthenaWelcomeSheet extends StatelessWidget {
                 ),
               ),
               const SizedBox(height: 20),
-              const Text(
-                'Data processed!',
-                style: TextStyle(
+              Text(
+                title,
+                style: const TextStyle(
                   color: Colors.white,
                   fontSize: 22,
                   fontWeight: FontWeight.bold,
@@ -67,9 +99,9 @@ class AthenaWelcomeSheet extends StatelessWidget {
                 textAlign: TextAlign.center,
               ),
               const SizedBox(height: 12),
-              const Text(
-                'The medical board has finished analyzing your metrics. Now we know a little more about your health.\n\nJust go about your business, and we will always be near. Shall I introduce you to Athena?',
-                style: TextStyle(
+              Text(
+                subtitle,
+                style: const TextStyle(
                   color: Colors.white70,
                   fontSize: 15,
                   height: 1.4,
@@ -81,6 +113,7 @@ class AthenaWelcomeSheet extends StatelessWidget {
                 width: double.infinity,
                 height: 52,
                 child: ElevatedButton(
+                  key: const Key('athena_welcome_connect_btn'),
                   onPressed: () {
                     Navigator.of(context).pop();
                     onConnect();
@@ -93,18 +126,18 @@ class AthenaWelcomeSheet extends StatelessWidget {
                     ),
                     elevation: 0,
                   ),
-                  child: const Row(
+                  child: Row(
                     mainAxisAlignment: MainAxisAlignment.center,
                     children: [
                       Text(
-                        'Meet Athena',
-                        style: TextStyle(
+                        buttonText,
+                        style: const TextStyle(
                           fontSize: 16,
                           fontWeight: FontWeight.bold,
                         ),
                       ),
-                      SizedBox(width: 8),
-                      Icon(Icons.arrow_forward_rounded, size: 20),
+                      const SizedBox(width: 8),
+                      const Icon(Icons.arrow_forward_rounded, size: 20),
                     ],
                   ),
                 ),

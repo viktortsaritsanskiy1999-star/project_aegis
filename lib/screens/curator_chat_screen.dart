@@ -199,7 +199,11 @@ class _CuratorChatScreenState extends State<CuratorChatScreen> {
             .map((m) => {'sender': m.sender, 'text': m.text})
             .toList();
 
-        vault?.syncCuratorChatHistory(serverMessages, expectedPatientId: patientId);
+        vault?.syncCuratorChatHistory(
+          serverMessages,
+          cycleId: historyResponse.cycleId,
+          expectedPatientId: patientId,
+        );
         vault?.setUnreadAthenaMessage(false);
 
         setState(() {
@@ -209,8 +213,10 @@ class _CuratorChatScreenState extends State<CuratorChatScreen> {
         });
         _scrollToBottom();
       } else {
-        // If server history is empty, check if local vault already has messages before generating greeting
-        final localHistory = vault?.getCuratorChatHistory() ?? [];
+        // If server history is empty, check if local vault already has messages for THIS cycle
+        final currentConsiliumCycle = vault?.consiliumCycleId;
+        final isCycleMatch = currentConsiliumCycle == null || currentConsiliumCycle == historyResponse.cycleId;
+        final localHistory = (isCycleMatch ? vault?.getCuratorChatHistory() : null) ?? [];
         if (localHistory.isNotEmpty) {
           setState(() {
             _messages = List.from(localHistory);
@@ -218,6 +224,20 @@ class _CuratorChatScreenState extends State<CuratorChatScreen> {
             _errorMessage = null;
           });
           _scrollToBottom();
+          return;
+        }
+
+        // Avoid creating duplicate client greeting if post_primary_init is generating server greeting
+        if (vault?.isNeoReassessment == true) {
+          setState(() {
+            _isInitializing = true;
+            _errorMessage = null;
+          });
+          Future.delayed(const Duration(milliseconds: 1500), () {
+            if (mounted && _chatEpoch == epoch) {
+              _loadChatHistoryAndInitialize();
+            }
+          });
           return;
         }
 

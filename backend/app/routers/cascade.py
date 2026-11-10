@@ -19,9 +19,17 @@ from app.schemas.consilium import (
     LabRevisionConsiliumClientResponse,
     LabVisionIntakeClientResponse,
     EcgVisionIntakeClientResponse,
+    NeoAdminActivationRequest,
+    NeoActivationResponse,
 )
 from app.security.auth import ServiceAdminSession, require_service_admin_session
 from app.services.gemini_gateway import GeminiGateway, GeminiGatewayError
+from app.services.neo_activation_service import (
+    NeoConsiliumActivationService,
+    NeoActivationError,
+    NeoActivationPreconditionError,
+    NeoActivationCycleNotFoundError,
+)
 from app.services.primary_consilium_service import (
     PrimaryConsiliumService,
     ConsiliumError,
@@ -161,6 +169,43 @@ async def run_primary_consilium_endpoint(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=str(exc),
         )
+
+
+@router.post(
+    "/activate-neo",
+    response_model=NeoActivationResponse,
+    summary="Admin endpoint to activate prepared Neo Consilium for a cycle",
+    description=(
+        "Admin-scoped endpoint that atomically transitions an existing prepared Neo cycle "
+        "from 'pending_reassessment' to 'active'. Publishes Athena active strategy, sets schedule anchor T0, "
+        "activates new Pro personal vitals thresholds, and enqueues post-primary Athena greeting without repeating "
+        "the 10-model consilium cascade. Safe, idempotent."
+    ),
+)
+async def activate_neo_consilium_endpoint(
+    payload: NeoAdminActivationRequest,
+    db: Session = Depends(get_db),
+    gateway: GeminiGateway = Depends(get_gemini_gateway),
+    _token: ServiceAdminSession = Depends(require_service_admin_session),
+) -> NeoActivationResponse:
+    service = NeoConsiliumActivationService(db=db, gateway=gateway)
+    try:
+        return service.activate_prepared_neo(cycle_id=payload.cycle_id)
+    except NeoActivationCycleNotFoundError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=str(exc),
+        ) from exc
+    except NeoActivationPreconditionError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=str(exc),
+        ) from exc
+    except ConsiliumError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=str(exc),
+        ) from exc
 
 
 @router.post(

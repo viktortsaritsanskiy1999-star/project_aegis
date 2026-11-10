@@ -57,6 +57,14 @@ from app.services.ecg_context_service import (
     EcgConsiliumContext,
     assemble_consilium_ecg_context,
 )
+from app.services.neo_activation_service import (
+    NeoConsiliumActivationService,
+    NeoActivationError,
+    NeoActivationPreconditionError,
+    NeoActivationCycleNotFoundError,
+    NeoActivationAccessDeniedError,
+    NEO_ACTIVATION_AUDIT_REPORT_TYPE,
+)
 
 __all__ = [
     "create_sqlite_backup",
@@ -85,6 +93,12 @@ __all__ = [
     "ConsiliumContextMissingError",
     "ConsiliumQualityRejectionError",
     "ConsiliumCooldownError",
+    "NeoConsiliumActivationService",
+    "NeoActivationError",
+    "NeoActivationPreconditionError",
+    "NeoActivationCycleNotFoundError",
+    "NeoActivationAccessDeniedError",
+    "NEO_ACTIVATION_AUDIT_REPORT_TYPE",
     "LabVisionValidationError",
     "EcgVisionValidationError",
     "detect_image_mime_type_from_bytes",
