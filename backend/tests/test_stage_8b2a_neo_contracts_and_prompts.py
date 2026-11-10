@@ -640,7 +640,7 @@ def test_10_model_identifiers_and_call_count_invariants():
     # Check canonical values
     assert "flash-lite" in gateway.flash_lite_model.lower()
     assert "flash" in gateway.flash_model.lower()
-    assert "pro" in gateway.pro_model.lower()
+    assert "argon" in gateway.pro_model.lower() or "pro" in gateway.pro_model.lower()
 
     # 2. Planned call sequence for Neo Consilium
     planned_sequence = [

@@ -68,7 +68,7 @@ def _build_contract_mock_gateway(recorded_calls: List[Dict[str, Any]]) -> Gemini
             "prompt": prompt_text,
         })
 
-        if "pro" in url_path.lower():
+        if "pro" in url_path.lower() or "argon" in url_path.lower():
             return httpx.Response(200, json=_gemini_envelope(_sample_weekly_pro_output()))
         return httpx.Response(200, json=_gemini_envelope(_sample_weekly_flash_output()))
 

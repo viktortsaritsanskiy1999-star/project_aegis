@@ -77,7 +77,7 @@ def _build_test_gateway(
         })
 
         # Weekly Consilium Pro Chief
-        if "you are the chief physician" in prompt_text.lower() or "pro" in url_path.lower():
+        if "you are the chief physician" in prompt_text.lower() or "pro" in url_path.lower() or "argon" in url_path.lower():
             return httpx.Response(200, json=_gemini_envelope(_sample_weekly_pro_output()))
 
         # Weekly Consilium Flash Deputy

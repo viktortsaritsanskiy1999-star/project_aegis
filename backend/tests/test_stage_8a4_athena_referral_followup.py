@@ -323,8 +323,8 @@ class Stage8A4MockHarness:
                     ),
                 )
 
-            # 6. Weekly Consilium Pro (identified by pro model URL)
-            if "pro-preview" in url_path or "-pro" in url_path:
+            # 6. Weekly Consilium Pro (identified by pro/argon model URL)
+            if "pro-preview" in url_path or "-pro" in url_path or "argon" in url_path:
                 pro_out = _sample_weekly_pro_output()
                 if self.referral_recommended:
                     pro_out["referral_decision"] = {

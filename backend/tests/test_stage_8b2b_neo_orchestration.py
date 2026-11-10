@@ -403,7 +403,7 @@ async def test_02_real_gemini_model_roles_and_ids(sqlite_db_session: Session):
     # Invariants on Gateway model configurations
     assert "flash-lite" in gateway.flash_lite_model.lower()
     assert "flash" in gateway.flash_model.lower()
-    assert "pro" in gateway.pro_model.lower()
+    assert "argon" in gateway.pro_model.lower() or "pro" in gateway.pro_model.lower()
 
     flash_lite_calls = [c for c in recorded_calls if c["model_role"] == GeminiModelRole.FLASH_LITE]
     flash_calls = [c for c in recorded_calls if c["model_role"] == GeminiModelRole.FLASH]

@@ -34,16 +34,26 @@ def _gemini_success_payload(text_content: str) -> dict:
 
 
 def test_resolve_model_roles_and_explicit_names():
+    # Test default model configuration
+    default_gateway = GeminiGateway(api_key="test_key_abc")
+    assert default_gateway.resolve_model_name(GeminiModelRole.FLASH_LITE) == "gemini-3.5-flash-lite"
+    assert default_gateway.resolve_model_name(GeminiModelRole.FLASH) == "gemini-3.8-flash"
+    assert default_gateway.resolve_model_name(GeminiModelRole.PRO) == "gemini-4-argon"
+    assert default_gateway.resolve_model_name(GeminiModelRole.VISION) == "gemini-3.8-flash"
+
+    # Test explicit override
     gateway = GeminiGateway(
         api_key="test_key_abc",
-        flash_lite_model="gemini-3.1-flash-lite",
-        flash_model="gemini-3.6-flash",
-        pro_model="gemini-3.1-pro-preview",
+        flash_lite_model="gemini-custom-lite",
+        flash_model="gemini-custom-flash",
+        pro_model="gemini-custom-pro",
+        vision_model="gemini-custom-vision",
     )
-    assert gateway.resolve_model_name(GeminiModelRole.FLASH_LITE) == "gemini-3.1-flash-lite"
-    assert gateway.resolve_model_name(GeminiModelRole.FLASH) == "gemini-3.6-flash"
-    assert gateway.resolve_model_name(GeminiModelRole.PRO) == "gemini-3.1-pro-preview"
-    assert gateway.resolve_model_name("flash_lite") == "gemini-3.1-flash-lite"
+    assert gateway.resolve_model_name(GeminiModelRole.FLASH_LITE) == "gemini-custom-lite"
+    assert gateway.resolve_model_name(GeminiModelRole.FLASH) == "gemini-custom-flash"
+    assert gateway.resolve_model_name(GeminiModelRole.PRO) == "gemini-custom-pro"
+    assert gateway.resolve_model_name(GeminiModelRole.VISION) == "gemini-custom-vision"
+    assert gateway.resolve_model_name("flash_lite") == "gemini-custom-lite"
     assert gateway.resolve_model_name("gemini-custom-exp") == "gemini-custom-exp"
 
     with pytest.raises(GeminiValidationError):

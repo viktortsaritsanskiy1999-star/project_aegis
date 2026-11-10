@@ -53,7 +53,7 @@ class ModelReport(Base):
         index=True,
     )
 
-    model: Mapped[str] = mapped_column(String(64))  # gemini-3.1-pro, gemini-3.6-flash, etc.
+    model: Mapped[str] = mapped_column(String(64))  # gemini-4-argon, gemini-3.8-flash, gemini-3.5-flash-lite, etc.
     report_type: Mapped[str] = mapped_column(String(64), index=True)  # system_shelf, master_cascade, workout_intelligence
     privacy_level: Mapped[str] = mapped_column(String(32), index=True)  # server_only vs client_facing
     version: Mapped[int] = mapped_column(Integer, default=1)

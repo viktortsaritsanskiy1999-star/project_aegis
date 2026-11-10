@@ -45,7 +45,7 @@ class AegisAgentRole(str, Enum):
     """
     Distinct logical AI agent roles in Project Aegis.
     Separates the logical role of an agent from the physical Gemini model name
-    (since multiple independent modules share 'gemini-3.6-flash').
+    (since multiple independent modules share 'gemini-3.8-flash').
     """
     # Preparatory modules (Gemini Flash)
     ANAMNESIS_M1 = "anamnesis_m1"

@@ -1,13 +1,14 @@
 import 'dart:convert';
 import 'package:flutter/foundation.dart';
 import 'package:google_generative_ai/google_generative_ai.dart';
+import 'aegis_model_config.dart';
 import 'vault_service.dart';
 import 'vitals_alert_context.dart';
 
 /// Curator conversational agent management service (Athena)
 class CuratorAgent {
   static const String _defaultApiKey = "YOUR_API_KEY_HERE";
-  static const String _defaultModelName = "gemini-3.6-flash";
+  static const String _defaultModelName = AegisModelConfig.flashModel;
 
   final String _apiKey;
   final String _modelName;

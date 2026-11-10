@@ -433,8 +433,8 @@ def _build_failure_injection_mock_gateway(
             ep_id = ep_match.group(1) if ep_match else None
             return httpx.Response(200, json=_gemini_envelope(_sample_wellness_output(ep_id)))
 
-        # 9. Primary Chief Physician (Gemini Pro)
-        if "pro" in url_path or ("chief physician" in prompt.lower() and "deputy" not in prompt.lower()):
+        # 9. Primary Chief Physician (Gemini Pro / Argon)
+        if "pro" in url_path or "argon" in url_path or ("chief physician" in prompt.lower() and "deputy" not in prompt.lower()):
             return httpx.Response(200, json=_gemini_envelope(_sample_pro_output()))
 
         # 10. Primary Deputy Chief Physician (Gemini Flash)

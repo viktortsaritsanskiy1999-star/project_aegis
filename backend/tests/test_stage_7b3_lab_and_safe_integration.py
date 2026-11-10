@@ -502,8 +502,8 @@ class Stage7B3MockGateway:
                 ep_id = ep_match.group(1) if ep_match else None
                 return httpx.Response(200, json=_gemini_envelope(_sample_wellness_output(ep_id)))
 
-            # 10. Primary Chief Physician (Gemini Pro)
-            if "pro" in url_path or ("chief physician" in prompt.lower() and "deputy" not in prompt.lower()):
+            # 10. Primary Chief Physician (Gemini Pro / Argon)
+            if "pro" in url_path or "argon" in url_path or ("chief physician" in prompt.lower() and "deputy" not in prompt.lower()):
                 return httpx.Response(200, json=_gemini_envelope(_sample_pro_output()))
 
             # 11. Primary Deputy Chief Physician (Gemini Flash)
@@ -973,7 +973,7 @@ async def test_02_manual_edit_debounce_and_cooldown_lifecycle(tmp_path: Path, mo
             assert len(rev_calls) == 10
             assert sum(1 for c in rev_calls if "flash-lite" in c["url_path"]) == 8
             assert sum(1 for c in rev_calls if "flash-lite" not in c["url_path"] and "flash" in c["url_path"]) == 1
-            assert sum(1 for c in rev_calls if "pro" in c["url_path"]) == 1
+            assert sum(1 for c in rev_calls if "pro" in c["url_path"] or "argon" in c["url_path"]) == 1
 
             # 6. Verify 72-hour cooldown is established
             status_resp_5 = await client.get("/api/v1/client/cascade/labs/scheduling-status", headers=auth_headers)

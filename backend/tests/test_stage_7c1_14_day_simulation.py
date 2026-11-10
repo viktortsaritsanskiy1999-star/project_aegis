@@ -838,7 +838,7 @@ async def test_stage_7c1_14_day_simulation_pilot(tmp_path: Path, monkeypatch: py
             assert len(primary_calls) == 10
             assert sum(1 for c in primary_calls if "flash-lite" in c["url_path"]) == 8
             assert sum(1 for c in primary_calls if "flash" in c["url_path"] and "flash-lite" not in c["url_path"]) == 1
-            assert sum(1 for c in primary_calls if "pro" in c["url_path"]) == 1
+            assert sum(1 for c in primary_calls if "pro" in c["url_path"] or "argon" in c["url_path"]) == 1
 
             # 3. Worker executes post_primary_init -> establishes Schedule Anchor T0
             await _drain_worker(worker)

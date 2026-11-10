@@ -379,8 +379,8 @@ def _build_stage_7b1_mock_gateway(recorded_calls: List[Dict[str, Any]]) -> Gemin
             ep_id = ep_match.group(1) if ep_match else None
             return httpx.Response(200, json=_gemini_envelope(_sample_wellness_output(ep_id)))
 
-        # 7. Primary Chief Physician (Gemini Pro)
-        if "pro" in url_path or ("chief physician" in prompt.lower() and "deputy" not in prompt.lower()):
+        # 7. Primary Chief Physician (Gemini Pro / Argon)
+        if "pro" in url_path or "argon" in url_path or ("chief physician" in prompt.lower() and "deputy" not in prompt.lower()):
             assert "flash-lite" not in url_path, f"Flash-Lite forbidden for Chief Physician: {url_path}"
             return httpx.Response(200, json=_gemini_envelope(_sample_pro_output()))
 
@@ -652,7 +652,7 @@ async def test_stage_7b1_full_first_week_lifecycle(tmp_path: Path, monkeypatch: 
                 1 for c in primary_consilium_calls
                 if "flash" in c["url_path"] and "flash-lite" not in c["url_path"]
             )
-            pro_count = sum(1 for c in primary_consilium_calls if "pro" in c["url_path"])
+            pro_count = sum(1 for c in primary_consilium_calls if "pro" in c["url_path"] or "argon" in c["url_path"])
             assert flash_lite_count == 8, f"Expected 8 Flash-Lite calls, got {flash_lite_count}"
             assert flash_count == 1, f"Expected 1 Flash Deputy call, got {flash_count}"
             assert pro_count == 1, f"Expected 1 Pro Chief call, got {pro_count}"

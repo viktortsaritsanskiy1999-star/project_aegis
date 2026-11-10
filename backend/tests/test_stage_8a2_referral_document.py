@@ -383,7 +383,7 @@ def _build_prompt_aware_mock_gateway(
             or "[CLINICAL_REPORT]" in prompt_text
         ):
             scenario = "athena_chat"
-        elif "pro-preview" in url_path or "-pro" in url_path:
+        elif "pro-preview" in url_path or "-pro" in url_path or "argon" in url_path:
             scenario = "weekly_pro"
         else:
             scenario = "weekly_flash"
@@ -595,7 +595,7 @@ async def test_02_recommended_true_executes_strictly_flash_then_pro_zero_flash_l
     assert "flash-lite" not in recorded_calls[0]["url_path"].lower()
 
     assert recorded_calls[1]["scenario"] == "doc_pro"
-    assert "pro" in recorded_calls[1]["url_path"].lower()
+    assert "argon" in recorded_calls[1]["url_path"].lower() or "pro" in recorded_calls[1]["url_path"].lower()
     assert "flash-lite" not in recorded_calls[1]["url_path"].lower()
 
     # Verify both SERVER_ONLY raw and CLIENT_FACING validated reports + atomic document_ready state

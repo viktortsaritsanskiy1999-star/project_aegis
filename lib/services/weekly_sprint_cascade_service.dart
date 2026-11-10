@@ -1,9 +1,10 @@
+import 'aegis_model_config.dart';
 import 'vault_service.dart';
 
 /// Background weekly board service (Deputy Flash -> Chief Physician Pro)
 class WeeklySprintCascadeService {
-  static const String _flashModel = "gemini-3.6-flash";
-  static const String _proModel = "gemini-3.1-pro-preview";
+  static const String _flashModel = AegisModelConfig.flashModel;
+  static const String _proModel = AegisModelConfig.proModel;
 
   String _ensureString(dynamic input, {String fallback = ''}) {
     if (input == null) return fallback;

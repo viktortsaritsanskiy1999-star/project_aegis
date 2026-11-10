@@ -83,15 +83,15 @@ class Settings(BaseSettings):
         alias="GEMINI_API_KEY",
     )
     gemini_flash_lite_model: str = Field(
-        default="gemini-3.1-flash-lite",
+        default="gemini-3.5-flash-lite",
         alias="AEGIS_GEMINI_FLASH_LITE_MODEL",
     )
     gemini_flash_model: str = Field(
-        default="gemini-3.6-flash",
+        default="gemini-3.8-flash",
         alias="AEGIS_GEMINI_FLASH_MODEL",
     )
     gemini_pro_model: str = Field(
-        default="gemini-3.1-pro-preview",
+        default="gemini-4-argon",
         alias="AEGIS_GEMINI_PRO_MODEL",
     )
     gemini_vision_model: str = Field(

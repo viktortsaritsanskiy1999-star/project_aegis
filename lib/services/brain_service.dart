@@ -3,6 +3,7 @@ import 'dart:io';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:google_generative_ai/google_generative_ai.dart';
+import 'aegis_model_config.dart';
 import 'master_cascade_service.dart';
 import 'system_models_prompts.dart';
 import 'vault_service.dart';
@@ -15,18 +16,18 @@ class BrainService extends ChangeNotifier {
   // ==========================================
   // GEMINI API CONNECTION SETTINGS
   // ==========================================
-  // M1 (Anamnesis) and Vision ECG -> 3.6-flash
-  static const String _modelName = "gemini-3.6-flash";
+  // M1 (Anamnesis) and Vision ECG -> 3.8-flash
+  static const String _modelName = AegisModelConfig.flashModel;
 
-  // 8 system agents -> 3.1-flash-lite
-  static const String _cascadeModelName = "gemini-3.1-flash-lite";
+  // 8 system agents -> 3.5-flash-lite
+  static const String _cascadeModelName = AegisModelConfig.flashLiteModel;
 
   late final GenerativeModel _visionModel;
   final MasterCascadeService _masterCascadeService = MasterCascadeService();
 
   BrainService() {
     _visionModel = GenerativeModel(
-      model: 'gemini-3.6-flash',
+      model: AegisModelConfig.visionModel,
       apiKey: _apiKey,
     );
   }

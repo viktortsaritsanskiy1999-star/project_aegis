@@ -238,10 +238,10 @@ def _build_stage_4_mock_gateway(
             "prompt": prompt,
         })
 
-        # 1. Weekly Chief Physician (Gemini Pro)
+        # 1. Weekly Chief Physician (Gemini Pro / Argon)
         if "You are the Chief Physician" in prompt:
             assert "flash-lite" not in url_path, f"Flash-Lite called during Weekly: {url_path}"
-            assert "pro" in url_path
+            assert "argon" in url_path or "pro" in url_path
             if fail_on_step_a and step_a_failures["count"] == 0:
                 step_a_failures["count"] += 1
                 return httpx.Response(503, json={"error": {"message": "Transient Pro Chief Physician overload"}})
@@ -942,7 +942,7 @@ async def test_14_weekly_cascade_strictly_flash_to_pro_no_eight_lite_models(tmp_
     weekly_calls = [c for c in calls if ("Deputy Chief Physician" in c["prompt"] or "Head of Department" in c["prompt"]) or "Chief Physician" in c["prompt"]]
     assert len(weekly_calls) == 2
     assert "flash" in weekly_calls[0]["url_path"] and "flash-lite" not in weekly_calls[0]["url_path"]
-    assert "pro" in weekly_calls[1]["url_path"]
+    assert "argon" in weekly_calls[1]["url_path"] or "pro" in weekly_calls[1]["url_path"]
     # Check that Flash-Lite was never called across all recorded calls
     for c in calls:
         assert "flash-lite" not in c["url_path"]

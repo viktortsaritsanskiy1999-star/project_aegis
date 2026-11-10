@@ -1,11 +1,12 @@
 import 'dart:convert';
 import 'package:google_generative_ai/google_generative_ai.dart';
 import 'package:image_picker/image_picker.dart';
+import 'aegis_model_config.dart';
 import 'vault_service.dart';
 
 class LabParserService {
   final GenerativeModel _visionModel = GenerativeModel(
-    model: 'gemini-3.6-flash',
+    model: AegisModelConfig.visionModel,
     apiKey: 'YOUR_API_KEY_HERE',
   );
 

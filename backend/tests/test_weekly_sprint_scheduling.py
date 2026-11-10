@@ -74,7 +74,7 @@ def _build_mock_gateway(recorded_calls: List[Dict[str, Any]]) -> GeminiGateway:
             "prompt": prompt_text,
         })
 
-        if "pro" in url_path.lower():
+        if "pro" in url_path.lower() or "argon" in url_path.lower():
             return httpx.Response(200, json=_gemini_envelope(_sample_weekly_pro_output()))
         # Handle athena chat mock: return warm response with valid hidden [CLINICAL_REPORT]
         if "service pulse:" in prompt_text.lower() or "first introduction" in prompt_text.lower() or "just checking in" in prompt_text.lower():

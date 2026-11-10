@@ -861,7 +861,7 @@ async def test_stage_7c2a_120_day_stability_simulation(tmp_path: Path, monkeypat
             assert len(primary_calls) == 10
             assert sum(1 for c in primary_calls if "flash-lite" in c["url_path"]) == 8
             assert sum(1 for c in primary_calls if "flash" in c["url_path"] and "flash-lite" not in c["url_path"]) == 1
-            assert sum(1 for c in primary_calls if "pro" in c["url_path"]) == 1
+            assert sum(1 for c in primary_calls if "pro" in c["url_path"] or "argon" in c["url_path"]) == 1
 
             # Worker drains post_primary_init -> establishes Schedule Anchor T0
             assert worker is not None

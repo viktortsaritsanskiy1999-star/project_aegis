@@ -73,7 +73,7 @@ def _build_attribution_test_gateway(
         })
 
         # 1. Weekly Consilium Pro Chief turn
-        if "you are the chief physician" in prompt_text.lower() or "pro" in url_path.lower():
+        if "you are the chief physician" in prompt_text.lower() or "pro" in url_path.lower() or "argon" in url_path.lower():
             return httpx.Response(200, json=_gemini_envelope(_sample_weekly_pro_output()))
 
         # 2. Weekly Consilium Flash Deputy turn
