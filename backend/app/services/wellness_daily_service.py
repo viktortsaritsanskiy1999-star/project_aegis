@@ -32,6 +32,7 @@ from app.schemas.wellness import (
 )
 from app.services.consilium_prompts import build_wellness_daily_analysis_prompt
 from app.services.gemini_gateway import GeminiGateway, GeminiGatewayError, GeminiModelRole
+from app.services.audit_trail_service import audit_scope
 from app.services.weekly_consilium_service import (
     WeeklyConsiliumService,
     ConsiliumCycleInactiveError,
@@ -843,11 +844,17 @@ class WellnessDailyService:
             measurements=measurements,
             mode2_episodes=mode2_episodes,
         )
-        interpretation = await self._execute_gemini_wellness_analysis(
-            summary=factual_summary,
-            calendar_week=calendar_week,
-            calendar_day=calendar_day,
-        )
+        with audit_scope(
+            patient_id=patient_id,
+            cycle_id=clean_cycle,
+            stage="wellness_daily",
+            input_context_summary={"calendar_week": calendar_week, "calendar_day": calendar_day},
+        ):
+            interpretation = await self._execute_gemini_wellness_analysis(
+                summary=factual_summary,
+                calendar_week=calendar_week,
+                calendar_day=calendar_day,
+            )
 
         ready_report = WellnessDailyReport(
             report_id=report_id,

@@ -9,6 +9,7 @@ from app.models.device import Device
 from app.models.pairing_code import PairingCode
 from app.models.device_refresh_token import DeviceRefreshToken
 from app.models.auth_rate_limit import AuthRateLimit
+from app.models.audit_review import ClinicalAIAuditReview
 
 __all__ = [
     "Base",
@@ -22,4 +23,5 @@ __all__ = [
     "PairingCode",
     "DeviceRefreshToken",
     "AuthRateLimit",
+    "ClinicalAIAuditReview",
 ]

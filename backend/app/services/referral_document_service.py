@@ -57,6 +57,7 @@ from app.services.ecg_context_service import (
     sanitize_pii_text,
 )
 from app.services.gemini_gateway import GeminiGateway, GeminiModelRole
+from app.services.audit_trail_service import audit_scope
 from app.services.lab_context_service import assemble_consilium_laboratory_context
 from app.services.mode2_vitals_service import ATHENA_MODE2_EPISODE_REPORT_TYPE
 from app.services.primary_consilium_service import (
@@ -853,25 +854,31 @@ class ReferralDocumentService:
             referral_state=ref_state,
         )
 
-        # STEP 1: Gemini Flash — Clinical History Extractor (NEVER Flash-Lite)
-        flash_prompt = build_referral_flash_extractor_prompt(snapshot)
-        flash_extraction: ReferralClinicalHistoryExtraction = await self.gateway.generate_structured(
-            prompt=flash_prompt,
-            response_schema=ReferralClinicalHistoryExtraction,
-            model=GeminiModelRole.FLASH,
-        )
+        with audit_scope(
+            patient_id=effective_patient_id,
+            cycle_id=clean_cycle_id,
+            sprint_id=target_sprint_id,
+            stage="referral_document",
+        ):
+            # STEP 1: Gemini Flash — Clinical History Extractor (NEVER Flash-Lite)
+            flash_prompt = build_referral_flash_extractor_prompt(snapshot)
+            flash_extraction: ReferralClinicalHistoryExtraction = await self.gateway.generate_structured(
+                prompt=flash_prompt,
+                response_schema=ReferralClinicalHistoryExtraction,
+                model=GeminiModelRole.FLASH,
+            )
 
-        # STEP 2: Gemini Pro — Doctor Observation Document Author (NEVER Flash-Lite)
-        pro_prompt = build_referral_pro_document_prompt(
-            flash_extraction=flash_extraction.model_dump(),
-            referral_decision=snapshot["approved_referral_decision"],
-            cycle_metadata=snapshot["cycle_context"],
-        )
-        pro_document: ReferralDoctorDocumentOutput = await self.gateway.generate_structured(
-            prompt=pro_prompt,
-            response_schema=ReferralDoctorDocumentOutput,
-            model=GeminiModelRole.PRO,
-        )
+            # STEP 2: Gemini Pro — Doctor Observation Document Author (NEVER Flash-Lite)
+            pro_prompt = build_referral_pro_document_prompt(
+                flash_extraction=flash_extraction.model_dump(),
+                referral_decision=snapshot["approved_referral_decision"],
+                cycle_metadata=snapshot["cycle_context"],
+            )
+            pro_document: ReferralDoctorDocumentOutput = await self.gateway.generate_structured(
+                prompt=pro_prompt,
+                response_schema=ReferralDoctorDocumentOutput,
+                model=GeminiModelRole.PRO,
+            )
 
         now_dt = self._now_utc()
         now_iso = now_dt.isoformat()

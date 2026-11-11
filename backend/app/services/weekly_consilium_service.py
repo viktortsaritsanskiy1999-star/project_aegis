@@ -40,6 +40,11 @@ from app.services.consilium_prompts import (
     build_athena_referral_context_block,
 )
 from app.services.gemini_gateway import GeminiGateway, GeminiModelRole
+from app.services.audit_trail_service import (
+    AuditContext,
+    set_current_audit_context,
+    reset_current_audit_context,
+)
 from app.services.primary_consilium_service import (
     ConsiliumError,
     ConsiliumCycleNotFoundError,
@@ -2992,6 +2997,15 @@ class WeeklyConsiliumService:
                 cycle_id, idempotency_key=idempotency_key
             )
 
+            audit_token = set_current_audit_context(
+                AuditContext(
+                    patient_id=cycle.patient_id,
+                    cycle_id=cycle_id,
+                    sprint_id=sprint_id,
+                    stage="weekly_consilium",
+                )
+            )
+
             try:
                 # Resolve target sprint metadata before DB writes
                 existing_sprints = self.sprint_repo.list_by_cycle(cycle_id)
@@ -3387,4 +3401,5 @@ class WeeklyConsiliumService:
                     system_reports=client_system_reports,
                 )
             finally:
+                reset_current_audit_context(audit_token)
                 self._release_cross_process_lease_safe(cycle_id, lease_owner_id)

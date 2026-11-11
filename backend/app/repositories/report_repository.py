@@ -186,6 +186,24 @@ class ModelReportRepository:
                 self.db.refresh(report)
             else:
                 self.db.flush()
+
+            # Automatically link persisted report to active clinical audit context if present
+            try:
+                from app.services.audit_trail_service import get_current_audit_context, get_audit_trail_service
+                ctx = get_current_audit_context()
+                if ctx and ctx.last_call_id:
+                    audit_svc = getattr(ctx, "audit_service", None) or get_audit_trail_service()
+                    if getattr(audit_svc, "enabled", False):
+                        audit_svc.link_report(
+                            call_id=ctx.last_call_id,
+                            report_id=report_id,
+                            patient_id=ctx.patient_id,
+                            cycle_id=cycle_id,
+                            privacy_level=validated_privacy,
+                        )
+            except Exception:
+                pass
+
             return report
         except ReportVersionConflictError:
             if commit:

@@ -42,6 +42,12 @@ from app.services.consilium_prompts import (
     build_neo_pro_master_prompt,
 )
 from app.services.gemini_gateway import GeminiGateway, GeminiModelRole
+from app.services.audit_trail_service import (
+    AuditContext,
+    audit_scope,
+    set_current_audit_context,
+    reset_current_audit_context,
+)
 
 
 RAW_USER_ANAMNESIS_REPORT_TYPE = "raw_user_anamnesis"
@@ -800,19 +806,25 @@ class PrimaryConsiliumService:
         as the Anamnesis M1 agent, and stores the verified result as a server_only report.
         NOTE: Never called inside run_primary_consilium().
         """
-        if not self.cycle_repo.get(cycle_id):
+        cycle = self.cycle_repo.get(cycle_id)
+        if not cycle:
             raise ConsiliumCycleNotFoundError(f"Medical cycle '{cycle_id}' not found.")
 
-        prompt = build_anamnesis_prompt(raw_anamnesis_context)
-        parsed: AnamnesisModelOutput = await self.gateway.generate_structured(
-            prompt=prompt,
-            response_schema=AnamnesisModelOutput,
-            model=GeminiModelRole.FLASH,
-        )
-        return self.save_preparatory_anamnesis_result(
+        with audit_scope(
+            patient_id=cycle.patient_id,
             cycle_id=cycle_id,
-            anamnesis_output=parsed,
-        )
+            stage="preparatory_anamnesis_m1",
+        ):
+            prompt = build_anamnesis_prompt(raw_anamnesis_context)
+            parsed: AnamnesisModelOutput = await self.gateway.generate_structured(
+                prompt=prompt,
+                response_schema=AnamnesisModelOutput,
+                model=GeminiModelRole.FLASH,
+            )
+            return self.save_preparatory_anamnesis_result(
+                cycle_id=cycle_id,
+                anamnesis_output=parsed,
+            )
 
     def save_preparatory_anamnesis_result(
         self,
@@ -1190,6 +1202,15 @@ class PrimaryConsiliumService:
                 idempotency_key=idempotency_key,
             )
 
+            audit_token = set_current_audit_context(
+                AuditContext(
+                    patient_id=cycle.patient_id,
+                    cycle_id=cycle_id,
+                    stage="primary_consilium" if consilium_mode == ConsiliumMode.INITIAL else "neo_consilium",
+                    input_context_summary={"consilium_mode": consilium_mode.value, "date": resolved_date},
+                )
+            )
+
             try:
                 # 1. Load already-saved preparatory results from DB (never re-run M1 or Vision here)
                 from app.services.lab_context_service import assemble_consilium_laboratory_context
@@ -1547,6 +1568,8 @@ class PrimaryConsiliumService:
                 self.db.rollback()
                 self._release_cross_process_lease_safe(cycle_id, lease_owner_id)
                 raise
+            finally:
+                reset_current_audit_context(audit_token)
 
         return PrimaryConsiliumClientResponse(
             cycle_id=cycle_id,

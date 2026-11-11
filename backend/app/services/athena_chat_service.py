@@ -33,6 +33,12 @@ from app.schemas.consilium import (
     AthenaClinicalLogEntry,
 )
 from app.schemas.privacy import PrivacyLevel
+from app.services.audit_trail_service import (
+    AuditContext,
+    audit_scope,
+    set_current_audit_context,
+    reset_current_audit_context,
+)
 from app.services.consilium_prompts import (
     build_athena_referral_context_block,
     build_athena_referral_followup_reminder_prompt,
@@ -477,11 +483,16 @@ class AthenaChatService:
             contents = self._build_gemini_contents(chat_history, prompt_text)
 
             # 7. Execute AI Generation with Emergency Fail-Safe Fallback
-            raw_response, used_emergency_fallback = await self._execute_generation_with_fallback(
-                contents=contents,
-                system_instruction=system_prompt,
-                pre_emergency=pre_emergency,
-            )
+            with audit_scope(
+                patient_id=clean_patient_id,
+                cycle_id=resolved_cycle_id,
+                stage="athena_chat",
+            ):
+                raw_response, used_emergency_fallback = await self._execute_generation_with_fallback(
+                    contents=contents,
+                    system_instruction=system_prompt,
+                    pre_emergency=pre_emergency,
+                )
 
             # 8-10. Atomic Turn Persistence with Cross-Process Optimistic Retry
             message_id = f"msg_{uuid.uuid4().hex[:16]}"

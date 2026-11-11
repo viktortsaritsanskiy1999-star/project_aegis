@@ -10,7 +10,7 @@ class Settings(BaseSettings):
     Does NOT contain working secret values by default.
     """
     model_config = SettingsConfigDict(
-        env_file=".env",
+        env_file=(".env", "backend/.env"),
         env_file_encoding="utf-8",
         extra="ignore",
     )
@@ -148,6 +148,19 @@ class Settings(BaseSettings):
     enable_lab_revision: bool = Field(
         default=False,
         alias="AEGIS_ENABLE_LAB_REVISION",
+    )
+    # Stage 9 Clinical AI Audit Trail & Local Admin Inspection Dashboard
+    enable_clinical_audit: bool = Field(
+        default=False,
+        alias="AEGIS_ENABLE_CLINICAL_AUDIT",
+    )
+    audit_storage_dir: str = Field(
+        default="backend/data/audit_trail",
+        alias="AEGIS_AUDIT_STORAGE_DIR",
+    )
+    audit_strict_test_mode: bool = Field(
+        default=False,
+        alias="AEGIS_AUDIT_STRICT_TEST_MODE",
     )
 
 

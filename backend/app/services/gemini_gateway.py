@@ -1,11 +1,21 @@
 import asyncio
 import json
 import logging
+import time
+import uuid
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Type, TypeVar
 import httpx
 from pydantic import BaseModel, ValidationError
 from app.config import settings
+from app.services.audit_trail_service import (
+    AuditContext,
+    AuditRecord,
+    AuditTrailService,
+    get_audit_trail_service,
+    get_current_audit_context,
+)
 
 logger = logging.getLogger("aegis.gemini_gateway")
 
@@ -83,6 +93,7 @@ class GeminiGateway:
         base_url: Optional[str] = None,
         transport: Optional[httpx.AsyncBaseTransport] = None,
         sleep_func: Callable[[float], Awaitable[None]] = asyncio.sleep,
+        audit_service: Optional[AuditTrailService] = None,
     ) -> None:
         self._api_key = api_key if api_key is not None else settings.gemini_api_key
         self.flash_lite_model = flash_lite_model or settings.gemini_flash_lite_model
@@ -104,10 +115,88 @@ class GeminiGateway:
         self._transport = transport
         self._sleep_func = sleep_func
 
+        if audit_service is not None:
+            self.audit_service = audit_service
+        elif settings.enable_clinical_audit:
+            self.audit_service = get_audit_trail_service()
+        else:
+            self.audit_service = None
+        self.last_call_id: Optional[str] = None
+
         if self.max_retries < 1:
             raise GeminiConfigurationError("max_retries must be at least 1.")
         if self.timeout_seconds <= 0:
             raise GeminiConfigurationError("timeout_seconds must be positive.")
+
+    def is_audit_enabled(self) -> bool:
+        """Checks if clinical audit logging is active."""
+        return self.audit_service is not None and getattr(self.audit_service, "enabled", True)
+
+    def _record_audit_event(
+        self,
+        call_id: str,
+        ctx: Optional[AuditContext],
+        model: GeminiModelRole | str,
+        system_instruction: Optional[str],
+        prompt: Optional[str],
+        raw_response_text: str,
+        cleaned_json_text: Optional[str],
+        parsed_json: Optional[Dict[str, Any]],
+        status: str,
+        schema_name: Optional[str],
+        validation_error: Optional[str],
+        latency_ms: float,
+        attempt: int = 1,
+        total_attempts: int = 1,
+        diagnostic_log: Optional[str] = None,
+    ) -> None:
+        """Internal helper to dispatch audit record creation to AuditTrailService."""
+        if not self.is_audit_enabled() or not self.audit_service:
+            return
+
+        if ctx:
+            ctx.last_call_id = call_id
+            if hasattr(ctx, "call_ids") and ctx.call_ids is not None:
+                ctx.call_ids.append(call_id)
+            if self.audit_service:
+                ctx.audit_service = self.audit_service
+
+        patient_id = (ctx.patient_id if (ctx and ctx.patient_id) else "unassigned_patient")
+        cycle_id = (ctx.cycle_id if (ctx and ctx.cycle_id) else "unassigned_cycle")
+        sprint_id = ctx.sprint_id if ctx else None
+        stage = ctx.stage if ctx else "general"
+        input_summary = ctx.input_context_summary if ctx else None
+        report_id = ctx.report_id if ctx else None
+
+        role_str = model.value if isinstance(model, GeminiModelRole) else str(model)
+        resolved_name = self.resolve_model_name(model)
+
+        record = AuditRecord(
+            call_id=call_id,
+            patient_id=patient_id,
+            cycle_id=cycle_id,
+            sprint_id=sprint_id,
+            stage=stage,
+            model_role=role_str,
+            model_name=resolved_name,
+            system_instruction=system_instruction,
+            prompt=prompt,
+            input_context_summary=input_summary,
+            raw_response_text=raw_response_text,
+            cleaned_json_text=cleaned_json_text,
+            parsed_json=parsed_json,
+            status=status,
+            schema_name=schema_name,
+            validation_error=validation_error,
+            latency_ms=round(latency_ms, 2),
+            created_at_utc=datetime.now(timezone.utc).isoformat(),
+            report_id=report_id,
+            privacy_level=None,
+            attempt_number=attempt,
+            total_attempts=total_attempts,
+            error_diagnostic_log=diagnostic_log,
+        )
+        self.audit_service.record_call(record)
 
     def resolve_model_name(self, model_or_role: GeminiModelRole | str) -> str:
         """Resolves a GeminiModelRole or explicit model identifier into a target model string."""
@@ -263,6 +352,9 @@ class GeminiGateway:
         max_output_tokens: int = 8192,
         inline_images: Optional[List[Dict[str, str]]] = None,
         contents: Optional[List[Dict[str, Any]]] = None,
+        audit_context: Optional[AuditContext] = None,
+        call_id: Optional[str] = None,
+        _skip_audit_record: bool = False,
     ) -> str:
         """
         Executes a call to Gemini generateContent endpoint with bounded retries on transient 429/503/timeout.
@@ -316,6 +408,11 @@ class GeminiGateway:
             "x-goog-api-key": api_key,
         }
 
+        if call_id is None:
+            call_id = f"call_{uuid.uuid4().hex}"
+        self.last_call_id = call_id
+        start_time = time.perf_counter()
+
         backoff = self.initial_backoff_seconds
         last_transient_error: Optional[Exception] = None
 
@@ -339,6 +436,28 @@ class GeminiGateway:
                             await self._sleep_func(backoff)
                             backoff *= 2
                         continue
+
+                    if not _skip_audit_record and self.is_audit_enabled():
+                        latency_ms = (time.perf_counter() - start_time) * 1000.0
+                        ctx = audit_context or get_current_audit_context()
+                        err_status = "TIMEOUT" if isinstance(net_err, httpx.TimeoutException) else "TRANSPORT_ERROR"
+                        self._record_audit_event(
+                            call_id=call_id,
+                            ctx=ctx,
+                            model=model,
+                            system_instruction=system_instruction,
+                            prompt=prompt or str(contents),
+                            raw_response_text="",
+                            cleaned_json_text=None,
+                            parsed_json=None,
+                            status=err_status,
+                            schema_name=None,
+                            validation_error=str(last_transient_error),
+                            latency_ms=latency_ms,
+                            attempt=attempt,
+                            total_attempts=self.max_retries,
+                            diagnostic_log=f"Exhausted retries: {last_transient_error}",
+                        )
                     raise last_transient_error from net_err
 
                 if response.status_code != 200:
@@ -358,20 +477,99 @@ class GeminiGateway:
                                 backoff *= 2
                             continue
                     # Non-retryable error OR retries exhausted
+                    if not _skip_audit_record and self.is_audit_enabled():
+                        latency_ms = (time.perf_counter() - start_time) * 1000.0
+                        ctx = audit_context or get_current_audit_context()
+                        self._record_audit_event(
+                            call_id=call_id,
+                            ctx=ctx,
+                            model=model,
+                            system_instruction=system_instruction,
+                            prompt=prompt or str(contents),
+                            raw_response_text=response.text,
+                            cleaned_json_text=None,
+                            parsed_json=None,
+                            status="HTTP_ERROR",
+                            schema_name=None,
+                            validation_error=str(classified_err),
+                            latency_ms=latency_ms,
+                            attempt=attempt,
+                            total_attempts=self.max_retries,
+                            diagnostic_log=f"HTTP {response.status_code}: {classified_err}",
+                        )
                     raise classified_err
 
                 try:
                     payload = response.json()
                 except ValueError as json_err:
+                    if not _skip_audit_record and self.is_audit_enabled():
+                        latency_ms = (time.perf_counter() - start_time) * 1000.0
+                        ctx = audit_context or get_current_audit_context()
+                        self._record_audit_event(
+                            call_id=call_id,
+                            ctx=ctx,
+                            model=model,
+                            system_instruction=system_instruction,
+                            prompt=prompt or str(contents),
+                            raw_response_text=response.text,
+                            cleaned_json_text=None,
+                            parsed_json=None,
+                            status="JSON_DECODE_ERROR",
+                            schema_name=None,
+                            validation_error="Gemini API HTTP 200 response was not valid JSON.",
+                            latency_ms=latency_ms,
+                            attempt=attempt,
+                            total_attempts=self.max_retries,
+                        )
                     raise GeminiValidationError(
                         "Gemini API HTTP 200 response was not valid JSON."
                     ) from json_err
 
-                return self._extract_text_from_response_payload(payload)
+                raw_text = self._extract_text_from_response_payload(payload)
+                if not _skip_audit_record and self.is_audit_enabled():
+                    latency_ms = (time.perf_counter() - start_time) * 1000.0
+                    ctx = audit_context or get_current_audit_context()
+                    self._record_audit_event(
+                        call_id=call_id,
+                        ctx=ctx,
+                        model=model,
+                        system_instruction=system_instruction,
+                        prompt=prompt or str(contents),
+                        raw_response_text=raw_text,
+                        cleaned_json_text=None,
+                        parsed_json=None,
+                        status="SUCCESS",
+                        schema_name=None,
+                        validation_error=None,
+                        latency_ms=latency_ms,
+                        attempt=attempt,
+                        total_attempts=self.max_retries,
+                    )
+                return raw_text
 
-        raise last_transient_error or GeminiTransientError(
+        final_err = last_transient_error or GeminiTransientError(
             f"Failed to receive response from Gemini after {self.max_retries} attempts."
         )
+        if not _skip_audit_record and self.is_audit_enabled():
+            latency_ms = (time.perf_counter() - start_time) * 1000.0
+            ctx = audit_context or get_current_audit_context()
+            self._record_audit_event(
+                call_id=call_id,
+                ctx=ctx,
+                model=model,
+                system_instruction=system_instruction,
+                prompt=prompt or str(contents),
+                raw_response_text="",
+                cleaned_json_text=None,
+                parsed_json=None,
+                status="TRANSIENT_EXHAUSTED",
+                schema_name=None,
+                validation_error=str(final_err),
+                latency_ms=latency_ms,
+                attempt=self.max_retries,
+                total_attempts=self.max_retries,
+            )
+        raise final_err
 
     async def generate_json(
         self,
@@ -380,17 +578,97 @@ class GeminiGateway:
         system_instruction: Optional[str] = None,
         max_output_tokens: int = 8192,
         inline_images: Optional[List[Dict[str, str]]] = None,
+        audit_context: Optional[AuditContext] = None,
+        _skip_audit_record: bool = False,
     ) -> Dict[str, Any]:
         """Generates content and parses the response into a validated Python dictionary."""
-        raw_text = await self.generate_raw_text(
-            prompt=prompt,
+        if not self.is_audit_enabled() or _skip_audit_record:
+            raw_text = await self.generate_raw_text(
+                prompt=prompt,
+                model=model,
+                system_instruction=system_instruction,
+                response_mime_type="application/json",
+                max_output_tokens=max_output_tokens,
+                inline_images=inline_images,
+                audit_context=audit_context,
+                _skip_audit_record=True,
+            )
+            return self.parse_json_object(raw_text)
+
+        call_id = f"call_{uuid.uuid4().hex}"
+        self.last_call_id = call_id
+        start_time = time.perf_counter()
+        ctx = audit_context or get_current_audit_context()
+
+        try:
+            raw_text = await self.generate_raw_text(
+                prompt=prompt,
+                model=model,
+                system_instruction=system_instruction,
+                response_mime_type="application/json",
+                max_output_tokens=max_output_tokens,
+                inline_images=inline_images,
+                audit_context=audit_context,
+                call_id=call_id,
+                _skip_audit_record=True,
+            )
+        except Exception as net_err:
+            latency_ms = (time.perf_counter() - start_time) * 1000.0
+            err_status = "TIMEOUT" if "timeout" in str(net_err).lower() else "TRANSPORT_ERROR"
+            self._record_audit_event(
+                call_id=call_id,
+                ctx=ctx,
+                model=model,
+                system_instruction=system_instruction,
+                prompt=prompt,
+                raw_response_text="",
+                cleaned_json_text=None,
+                parsed_json=None,
+                status=err_status,
+                schema_name=None,
+                validation_error=str(net_err),
+                latency_ms=latency_ms,
+                total_attempts=self.max_retries,
+            )
+            raise
+
+        cleaned = self._strip_outer_markdown_fence(raw_text)
+        try:
+            parsed = self.parse_json_object(raw_text)
+        except GeminiValidationError as json_err:
+            latency_ms = (time.perf_counter() - start_time) * 1000.0
+            self._record_audit_event(
+                call_id=call_id,
+                ctx=ctx,
+                model=model,
+                system_instruction=system_instruction,
+                prompt=prompt,
+                raw_response_text=raw_text,
+                cleaned_json_text=cleaned,
+                parsed_json=None,
+                status="JSON_DECODE_ERROR",
+                schema_name=None,
+                validation_error=str(json_err),
+                latency_ms=latency_ms,
+            )
+            raise json_err
+
+        latency_ms = (time.perf_counter() - start_time) * 1000.0
+        self._record_audit_event(
+            call_id=call_id,
+            ctx=ctx,
             model=model,
             system_instruction=system_instruction,
-            response_mime_type="application/json",
-            max_output_tokens=max_output_tokens,
-            inline_images=inline_images,
+            prompt=prompt,
+            raw_response_text=raw_text,
+            cleaned_json_text=cleaned,
+            parsed_json=parsed,
+            status="SUCCESS",
+            schema_name=None,
+            validation_error=None,
+            latency_ms=latency_ms,
         )
-        return self.parse_json_object(raw_text)
+        return parsed
 
     async def generate_structured(
         self,
@@ -400,24 +678,126 @@ class GeminiGateway:
         system_instruction: Optional[str] = None,
         max_output_tokens: int = 8192,
         inline_images: Optional[List[Dict[str, str]]] = None,
+        audit_context: Optional[AuditContext] = None,
     ) -> T:
         """
         Generates content, parses JSON strictly, and validates against a Pydantic BaseModel schema.
         Raises GeminiValidationError if the response does not conform to response_schema.
+        Preserves raw text and schema validation errors for clinical auditability.
         """
-        parsed_dict = await self.generate_json(
-            prompt=prompt,
+        if not self.is_audit_enabled():
+            parsed_dict = await self.generate_json(
+                prompt=prompt,
+                model=model,
+                system_instruction=system_instruction,
+                max_output_tokens=max_output_tokens,
+                inline_images=inline_images,
+                _skip_audit_record=True,
+            )
+            try:
+                return response_schema.model_validate(parsed_dict)
+            except ValidationError as val_err:
+                raise GeminiValidationError(
+                    f"Model response failed structured schema validation for {response_schema.__name__}: {val_err}"
+                ) from val_err
+
+        call_id = f"call_{uuid.uuid4().hex}"
+        self.last_call_id = call_id
+        start_time = time.perf_counter()
+        ctx = audit_context or get_current_audit_context()
+
+        try:
+            raw_text = await self.generate_raw_text(
+                prompt=prompt,
+                model=model,
+                system_instruction=system_instruction,
+                response_mime_type="application/json",
+                max_output_tokens=max_output_tokens,
+                inline_images=inline_images,
+                audit_context=audit_context,
+                call_id=call_id,
+                _skip_audit_record=True,
+            )
+        except Exception as net_err:
+            latency_ms = (time.perf_counter() - start_time) * 1000.0
+            err_status = "TIMEOUT" if "timeout" in str(net_err).lower() else "TRANSPORT_ERROR"
+            self._record_audit_event(
+                call_id=call_id,
+                ctx=ctx,
+                model=model,
+                system_instruction=system_instruction,
+                prompt=prompt,
+                raw_response_text="",
+                cleaned_json_text=None,
+                parsed_json=None,
+                status=err_status,
+                schema_name=response_schema.__name__,
+                validation_error=str(net_err),
+                latency_ms=latency_ms,
+                total_attempts=self.max_retries,
+            )
+            raise
+
+        cleaned = self._strip_outer_markdown_fence(raw_text)
+        try:
+            parsed_dict = self.parse_json_object(raw_text)
+        except GeminiValidationError as json_err:
+            latency_ms = (time.perf_counter() - start_time) * 1000.0
+            self._record_audit_event(
+                call_id=call_id,
+                ctx=ctx,
+                model=model,
+                system_instruction=system_instruction,
+                prompt=prompt,
+                raw_response_text=raw_text,
+                cleaned_json_text=cleaned,
+                parsed_json=None,
+                status="JSON_DECODE_ERROR",
+                schema_name=response_schema.__name__,
+                validation_error=str(json_err),
+                latency_ms=latency_ms,
+            )
+            raise json_err
+
+        try:
+            validated = response_schema.model_validate(parsed_dict)
+        except ValidationError as val_err:
+            latency_ms = (time.perf_counter() - start_time) * 1000.0
+            val_msg = (
+                f"Model response failed structured schema validation for {response_schema.__name__}: {val_err}"
+            )
+            self._record_audit_event(
+                call_id=call_id,
+                ctx=ctx,
+                model=model,
+                system_instruction=system_instruction,
+                prompt=prompt,
+                raw_response_text=raw_text,
+                cleaned_json_text=cleaned,
+                parsed_json=parsed_dict,
+                status="SCHEMA_ERROR",
+                schema_name=response_schema.__name__,
+                validation_error=val_msg,
+                latency_ms=latency_ms,
+            )
+            raise GeminiValidationError(val_msg) from val_err
+
+        latency_ms = (time.perf_counter() - start_time) * 1000.0
+        self._record_audit_event(
+            call_id=call_id,
+            ctx=ctx,
             model=model,
             system_instruction=system_instruction,
-            max_output_tokens=max_output_tokens,
-            inline_images=inline_images,
+            prompt=prompt,
+            raw_response_text=raw_text,
+            cleaned_json_text=cleaned,
+            parsed_json=parsed_dict,
+            status="SUCCESS",
+            schema_name=response_schema.__name__,
+            validation_error=None,
+            latency_ms=latency_ms,
         )
-        try:
-            return response_schema.model_validate(parsed_dict)
-        except ValidationError as val_err:
-            raise GeminiValidationError(
-                f"Model response failed structured schema validation for {response_schema.__name__}: {val_err}"
-            ) from val_err
+        return validated
 
     async def run_neo_system_specialist(
         self,

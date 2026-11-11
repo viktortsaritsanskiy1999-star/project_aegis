@@ -59,6 +59,11 @@ from app.services.consilium_prompts import (
     build_background_lab_revision_chief_prompt,
 )
 from app.services.gemini_gateway import GeminiGateway, GeminiModelRole
+from app.services.audit_trail_service import (
+    AuditContext,
+    set_current_audit_context,
+    reset_current_audit_context,
+)
 from app.services.primary_consilium_service import (
     ConsiliumError,
     ConsiliumCycleNotFoundError,
@@ -2006,6 +2011,14 @@ class LabRevisionConsiliumService:
             # 1. Authoritative server-time 168-hour cooldown & cross-process lease acquisition
             lease_owner_id = self._acquire_cross_process_lease(cycle_id)
 
+            audit_token = set_current_audit_context(
+                AuditContext(
+                    patient_id=cycle.patient_id,
+                    cycle_id=cycle_id,
+                    stage="lab_revision_consilium",
+                )
+            )
+
             try:
                 resolved_date = (
                     report_date.strip()
@@ -2431,6 +2444,8 @@ class LabRevisionConsiliumService:
             except BaseException:
                 self._release_cross_process_lease_safe(cycle_id, lease_owner_id)
                 raise
+            finally:
+                reset_current_audit_context(audit_token)
 
             updated_cooldown = self.get_cooldown_status(cycle_id)
             return LabRevisionConsiliumClientResponse(

@@ -193,6 +193,16 @@ def verify_client_token(
     if raw_token.count(".") == 2:
         return authenticate_device_jwt(raw_token, db)
 
+    # Validate ephemeral admin session tokens
+    if raw_token.startswith("adm_sess_"):
+        try:
+            from app.routers.admin_audit import is_valid_ephemeral_session
+            if is_valid_ephemeral_session(raw_token):
+                return ServiceAdminSession()
+        except ImportError:
+            pass
+        _raise_unauthorized("Invalid or expired administrative session.")
+
     configured_secret = settings.api_secret.strip()
     if not configured_secret:
         _raise_unauthorized("Authentication failed: server API secret is unconfigured.")
