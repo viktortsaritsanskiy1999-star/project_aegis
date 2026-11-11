@@ -1,4 +1,4 @@
-package com.example.aegis_health
+package com.hai.aegis
 
 import io.flutter.embedding.android.FlutterActivity
 
