@@ -122,6 +122,7 @@ class GeminiGateway:
         else:
             self.audit_service = None
         self.last_call_id: Optional[str] = None
+        self.usage_records: List[Dict[str, Any]] = []
 
         if self.max_retries < 1:
             raise GeminiConfigurationError("max_retries must be at least 1.")
@@ -526,9 +527,32 @@ class GeminiGateway:
                     ) from json_err
 
                 raw_text = self._extract_text_from_response_payload(payload)
+                latency_ms = (time.perf_counter() - start_time) * 1000.0
+                ctx = audit_context or get_current_audit_context()
+
+                usage_metadata = payload.get("usageMetadata") if isinstance(payload, dict) else None
+                diagnostic_info = None
+                if usage_metadata:
+                    p_tok = usage_metadata.get("promptTokenCount", 0)
+                    c_tok = usage_metadata.get("candidatesTokenCount", 0)
+                    tot_tok = usage_metadata.get("totalTokenCount", 0)
+                    cached_tok = usage_metadata.get("cachedContentTokenCount", 0)
+                    diagnostic_info = f"[USAGE] prompt={p_tok}, candidates={c_tok}, total={tot_tok}, cached={cached_tok}"
+                    if not hasattr(self, "usage_records") or self.usage_records is None:
+                        self.usage_records = []
+                    self.usage_records.append({
+                        "call_id": call_id,
+                        "model_role": model.value if isinstance(model, GeminiModelRole) else str(model),
+                        "model_name": resolved_model,
+                        "prompt_tokens": p_tok,
+                        "candidates_tokens": c_tok,
+                        "cached_tokens": cached_tok,
+                        "total_tokens": tot_tok,
+                        "latency_ms": round(latency_ms, 2),
+                        "stage": ctx.stage if ctx else "unknown",
+                    })
+
                 if not _skip_audit_record and self.is_audit_enabled():
-                    latency_ms = (time.perf_counter() - start_time) * 1000.0
-                    ctx = audit_context or get_current_audit_context()
                     self._record_audit_event(
                         call_id=call_id,
                         ctx=ctx,
@@ -544,6 +568,7 @@ class GeminiGateway:
                         latency_ms=latency_ms,
                         attempt=attempt,
                         total_attempts=self.max_retries,
+                        diagnostic_log=diagnostic_info,
                     )
                 return raw_text
 
