@@ -162,6 +162,29 @@ class Settings(BaseSettings):
         default=False,
         alias="AEGIS_AUDIT_STRICT_TEST_MODE",
     )
+    # Stage 10 Google Sign-In & Closed Beta Configuration
+    google_client_ids: str = Field(
+        default="",
+        alias="AEGIS_GOOGLE_CLIENT_IDS",
+    )
+    beta_registration_open: bool = Field(
+        default=False,
+        alias="AEGIS_BETA_REGISTRATION_OPEN",
+    )
+    google_token_clock_skew_seconds: int = Field(
+        default=10,
+        ge=0,
+        le=300,
+        alias="AEGIS_GOOGLE_TOKEN_CLOCK_SKEW_SECONDS",
+    )
+
+    @property
+    def parsed_google_client_ids(self) -> list[str]:
+        if not self.google_client_ids:
+            return []
+        if isinstance(self.google_client_ids, list):
+            return self.google_client_ids
+        return [cid.strip() for cid in self.google_client_ids.split(",") if cid.strip()]
 
 
 settings = Settings()

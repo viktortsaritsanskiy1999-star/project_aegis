@@ -1,6 +1,6 @@
 from datetime import datetime, timezone
 import uuid
-from typing import List, TYPE_CHECKING
+from typing import List, Optional, TYPE_CHECKING
 from sqlalchemy import String, DateTime
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from app.models.base import Base
@@ -9,6 +9,7 @@ if TYPE_CHECKING:
     from app.models.medical_cycle import MedicalCycle
     from app.models.device import Device
     from app.models.pairing_code import PairingCode
+    from app.models.patient_google_identity import PatientGoogleIdentity
 
 
 class Patient(Base):
@@ -56,5 +57,11 @@ class Patient(Base):
     pairing_codes: Mapped[List["PairingCode"]] = relationship(
         "PairingCode",
         back_populates="patient",
+        cascade="all, delete-orphan",
+    )
+    google_identity: Mapped[Optional["PatientGoogleIdentity"]] = relationship(
+        "PatientGoogleIdentity",
+        back_populates="patient",
+        uselist=False,
         cascade="all, delete-orphan",
     )

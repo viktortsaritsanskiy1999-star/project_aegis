@@ -6,6 +6,7 @@ import 'package:provider/provider.dart';
 import '../services/api/vitals_api_models.dart';
 import '../services/auth/auth_models.dart';
 import '../services/auth/auth_session_manager.dart';
+import '../services/auth/google_auth_service.dart';
 import '../services/health_data_provider.dart';
 
 /// Modal bottom sheet allowing patients to bind their mobile device to an Aegis profile
@@ -49,6 +50,7 @@ class _AegisDevicePairingModalState extends State<AegisDevicePairingModal> {
       TextEditingController(text: 'Aegis Mobile Client');
 
   bool _isSubmitting = false;
+  bool _isGoogleSubmitting = false;
   bool _isSuccess = false;
   String? _successPatientId;
   String? _errorMessage;
@@ -197,6 +199,85 @@ class _AegisDevicePairingModalState extends State<AegisDevicePairingModal> {
         _isSubmitting = false;
         _errorMessage =
             'Connection to Aegis server failed. Please check your network and try again.';
+      });
+    }
+  }
+
+  Future<void> _signInWithGoogle(AuthSessionManager authManager) async {
+    setState(() {
+      _isGoogleSubmitting = true;
+      _errorMessage = null;
+    });
+
+    try {
+      final idToken = await GoogleAuthService.instance.signInAndGetIdToken();
+      if (idToken == null) {
+        if (mounted) {
+          setState(() {
+            _isGoogleSubmitting = false;
+          });
+        }
+        return;
+      }
+
+      final deviceName = _deviceNameController.text.trim().isNotEmpty
+          ? _deviceNameController.text.trim()
+          : 'Aegis Mobile Client';
+
+      final request = GoogleAuthRequest(
+        idToken: idToken,
+        deviceName: deviceName,
+        platform: 'mobile',
+      );
+
+      final session = await authManager.authenticateWithGoogle(request);
+
+      if (!mounted) return;
+      setState(() {
+        _isGoogleSubmitting = false;
+        _isSuccess = true;
+        _successPatientId = session.patientId;
+        _errorMessage = null;
+      });
+
+      _autoCloseTimer = Timer(const Duration(milliseconds: 1800), () {
+        if (mounted) {
+          Navigator.of(context).maybePop();
+        }
+      });
+    } on AegisRateLimitException catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _isGoogleSubmitting = false;
+      });
+      _startCooldown(e.retryAfter ?? const Duration(seconds: 60));
+    } on AegisNetworkException catch (_) {
+      if (!mounted) return;
+      setState(() {
+        _isGoogleSubmitting = false;
+        _errorMessage =
+            'Connection to Aegis server failed. Please check your network and try again.';
+      });
+    } on AegisApiException catch (e) {
+      if (!mounted) return;
+      String msg;
+      if (e.statusCode == 403) {
+        msg = 'Access denied. Project Aegis is currently in closed beta. '
+            'Please request access from an administrator.';
+      } else if (e.statusCode == 401) {
+        msg = 'Google authentication rejected by server. Please try signing in again.';
+      } else {
+        msg = 'Connection to Aegis server failed (${e.statusCode}). Please try again.';
+      }
+      setState(() {
+        _isGoogleSubmitting = false;
+        _errorMessage = msg;
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _isGoogleSubmitting = false;
+        _errorMessage = 'Google sign-in encountered an error: $e';
       });
     }
   }
@@ -568,7 +649,8 @@ class _AegisDevicePairingModalState extends State<AegisDevicePairingModal> {
   ) {
     final bool isCodeValid = _codeController.text.trim().length == 6;
     final bool isRateLimited = _cooldownRemainingSeconds > 0;
-    final bool canSubmit = isCodeValid && !_isSubmitting && !isRateLimited;
+    final bool canSubmit = isCodeValid && !_isSubmitting && !_isGoogleSubmitting && !isRateLimited;
+    final bool canGoogleSubmit = !_isSubmitting && !_isGoogleSubmitting && !isRateLimited;
 
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
@@ -590,10 +672,77 @@ class _AegisDevicePairingModalState extends State<AegisDevicePairingModal> {
         ),
         const SizedBox(height: 8),
         const Text(
-          'Enter the 6-digit pairing code generated from the Aegis portal or provided by your clinician.',
+          'Enter the 6-digit pairing code generated from the Aegis portal or continue with Google.',
           style: TextStyle(color: Colors.white70, fontSize: 12, height: 1.4),
         ),
         const SizedBox(height: 18),
+
+        // Google Sign-In Button
+        SizedBox(
+          width: double.infinity,
+          child: ElevatedButton(
+            key: const Key('continue_with_google_button'),
+            style: ElevatedButton.styleFrom(
+              backgroundColor: const Color(0xFF1F242C),
+              foregroundColor: Colors.white,
+              padding: const EdgeInsets.symmetric(vertical: 12),
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(10),
+                side: const BorderSide(color: Colors.white24, width: 1),
+              ),
+            ),
+            onPressed: canGoogleSubmit ? () => _signInWithGoogle(authManager) : null,
+            child: _isGoogleSubmitting
+                ? const Row(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    children: [
+                      SizedBox(
+                        width: 16,
+                        height: 16,
+                        child: CircularProgressIndicator(strokeWidth: 2, color: Colors.cyanAccent),
+                      ),
+                      SizedBox(width: 10),
+                      Text(
+                        'SIGNING IN WITH GOOGLE...',
+                        style: TextStyle(color: Colors.cyanAccent, fontWeight: FontWeight.bold, fontSize: 12),
+                      ),
+                    ],
+                  )
+                : const Row(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    children: [
+                      Icon(Icons.account_circle, color: Colors.white, size: 20),
+                      SizedBox(width: 10),
+                      Text(
+                        'Continue with Google',
+                        style: TextStyle(
+                          color: Colors.white,
+                          fontSize: 13,
+                          fontWeight: FontWeight.w600,
+                          letterSpacing: 0.3,
+                        ),
+                      ),
+                    ],
+                  ),
+          ),
+        ),
+        const SizedBox(height: 16),
+
+        // Divider
+        const Row(
+          children: [
+            Expanded(child: Divider(color: Colors.white12)),
+            Padding(
+              padding: EdgeInsets.symmetric(horizontal: 10),
+              child: Text(
+                'OR USE 6-DIGIT CODE',
+                style: TextStyle(color: Colors.white38, fontSize: 10, fontWeight: FontWeight.bold),
+              ),
+            ),
+            Expanded(child: Divider(color: Colors.white12)),
+          ],
+        ),
+        const SizedBox(height: 16),
 
         // 6-digit Code Input Field
         const Text(

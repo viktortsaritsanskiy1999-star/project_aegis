@@ -115,7 +115,7 @@ class AegisApiClient {
     );
     sanitized = sanitized.replaceAllMapped(
       RegExp(
-        r'(["\x27]?(?:access_token|refresh_token|pairing_code|accessToken|refreshToken|pairingCode)["\x27]?\s*[:=]\s*["\x27]?)([^"\x27,\s}\])]+)(["\x27]?)',
+        r'(["\x27]?(?:access_token|refresh_token|pairing_code|accessToken|refreshToken|pairingCode|id_token|idToken)["\x27]?\s*[:=]\s*["\x27]?)([^"\x27,\s}\])]+)(["\x27]?)',
         caseSensitive: false,
       ),
       (m) => '${m.group(1)}[REDACTED]${m.group(3)}',
@@ -263,6 +263,33 @@ class AegisApiClient {
     } on TimeoutException catch (_) {
       _log('Timeout on $uri');
       throw AegisTimeoutException('Device pairing timed out after ${timeout.inSeconds}s');
+    } on SocketException catch (e) {
+      _log('Socket error on $uri: ${e.message}');
+      throw AegisNetworkException('Network connection failed: ${e.message}');
+    } on http.ClientException catch (e) {
+      _log('Client error on $uri: ${e.message}');
+      throw AegisNetworkException('HTTP client error: ${e.message}');
+    }
+  }
+
+  /// Authenticate device with Google ID Token (`POST /api/v1/auth/google`).
+  /// Does not use `tokenProvider` and never logs `idToken` or returned tokens.
+  Future<DevicePairResponse> authenticateWithGoogle(GoogleAuthRequest request) async {
+    final uri = Uri.parse('$baseUrl/api/v1/auth/google');
+    final payloadJson = json.encode(request.toJson());
+    try {
+      final headers = _buildJsonHeaders();
+      _log('POST $uri (deviceName: ${request.deviceName}, platform: ${request.platform})');
+      final response = await _client.post(uri, headers: headers, body: payloadJson).timeout(timeout);
+
+      if (response.statusCode == 200) {
+        final data = json.decode(response.body) as Map<String, dynamic>;
+        return DevicePairResponse.fromJson(data);
+      }
+      _handleErrorResponse(response);
+    } on TimeoutException catch (_) {
+      _log('Timeout on $uri');
+      throw AegisTimeoutException('Google authentication timed out after ${timeout.inSeconds}s');
     } on SocketException catch (e) {
       _log('Socket error on $uri: ${e.message}');
       throw AegisNetworkException('Network connection failed: ${e.message}');

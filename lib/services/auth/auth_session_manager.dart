@@ -607,6 +607,121 @@ class AuthSessionManager extends ChangeNotifier {
     }
   }
 
+  /// Atomically authenticates the device using Google ID token via [request] (`POST /api/v1/auth/google`)
+  /// and persists the resulting Aegis [AuthSession] in [IAuthTokenStorage].
+  Future<AuthSession> authenticateWithGoogle(GoogleAuthRequest request) async {
+    _ensureNotDisposed();
+
+    final now = _nowProvider().toUtc();
+    if (_status == AuthSessionStatus.rateLimited &&
+        _rateLimitedUntil != null &&
+        now.isBefore(_rateLimitedUntil!)) {
+      final remaining = _rateLimitedUntil!.difference(now);
+      final rateErr = AegisRateLimitException(
+        'Authentication is rate-limited. Please retry later.',
+        statusCode: 429,
+        retryAfter: remaining,
+      );
+      _lastError = rateErr;
+      throw rateErr;
+    }
+
+    try {
+      final response = await _apiClient.authenticateWithGoogle(request);
+
+      if (!isValidMobileAccessTokenJwt(response.accessToken)) {
+        const err = AegisAuthException(
+          'Server returned an invalid mobile access token (JWT required).',
+          statusCode: 401,
+        );
+        _lastError = err;
+        throw err;
+      }
+
+      final newSession = AuthSession.fromPairResponse(response);
+      _registerActiveDevice(newSession.deviceId);
+
+      await _storage.saveSession(newSession);
+
+      // Verify that new session is reliably committed before clearing old guard
+      AuthSession? verifiedPairSession;
+      try {
+        verifiedPairSession = await _storage.loadSession();
+      } on SecureStorageUnavailableException catch (e) {
+        _log('Failed to verify persisted session after Google auth: ${e.message}');
+        _isRefreshIndeterminate = true;
+        _status = AuthSessionStatus.expired;
+        _session = null;
+        _lastStorageError = e;
+        notifyListeners();
+        rethrow;
+      } catch (_) {
+        _log('Failed to verify persisted session after Google auth: unexpected error.');
+        _isRefreshIndeterminate = true;
+        _status = AuthSessionStatus.expired;
+        _session = null;
+        const verifyErr = SecureStorageUnavailableException(
+          'Failed to verify persisted Google auth session in secure storage.',
+        );
+        _lastStorageError = verifyErr;
+        notifyListeners();
+        throw verifyErr;
+      }
+
+      if (verifiedPairSession == null ||
+          verifiedPairSession.refreshToken != newSession.refreshToken) {
+        _isRefreshIndeterminate = true;
+        _status = AuthSessionStatus.expired;
+        _session = null;
+        const verifyErr = SecureStorageUnavailableException(
+          'Persisted session validation failed after Google auth.',
+        );
+        _lastStorageError = verifyErr;
+        notifyListeners();
+        throw verifyErr;
+      }
+
+      try {
+        await _storage.clearRefreshInFlightRecord();
+      } on SecureStorageUnavailableException catch (e) {
+        _log('Notice: Failed to clear old in-flight record after Google auth: ${e.message}');
+        _lastStorageError = e;
+      } catch (_) {}
+
+      if (_session != null && _session!.deviceId != newSession.deviceId) {
+        _unregisterActiveDevice(_session!.deviceId);
+      }
+
+      _session = newSession;
+      _lastKnownPatientId = newSession.patientId;
+      _isInitialized = true;
+      _status = AuthSessionStatus.authenticated;
+      _isRefreshIndeterminate = false;
+      _hasAttemptedScopeUpgrade = false;
+      _rateLimitedUntil = null;
+      _lastRetryAfter = null;
+      _lastError = null;
+      _lastStorageError = null;
+      _log('Device authenticated via Google successfully (deviceId: ${newSession.deviceId}, patientId: ${newSession.patientId})');
+      notifyListeners();
+      return newSession;
+    } on AegisRateLimitException catch (e) {
+      _lastError = e;
+      _applyRateLimit(e.retryAfter);
+      notifyListeners();
+      rethrow;
+    } on AegisApiException catch (e) {
+      _lastError = e;
+      notifyListeners();
+      rethrow;
+    } catch (e) {
+      final wrapped = AegisAuthException('Unexpected error during Google authentication: $e');
+      _lastError = wrapped;
+      notifyListeners();
+      throw wrapped;
+    }
+  }
+
   /// Checks whether the active session possesses all required permissions
   /// (defaulting to [AegisScopes.standardDeviceScopes]).
   ///

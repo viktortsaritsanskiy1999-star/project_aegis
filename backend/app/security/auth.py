@@ -20,6 +20,7 @@ from app.security.tokens import (
     TokenValidationError,
     verify_access_token,
 )
+from app.services.google_auth_service import is_patient_beta_revoked
 
 # HTTPBearer security scheme
 security_scheme = HTTPBearer(auto_error=False)
@@ -133,6 +134,13 @@ def authenticate_device_jwt(raw_token: str, db: Session) -> DeviceSession:
 
     if patient.status != "active":
         _raise_unauthorized("Patient profile is not active.")
+
+    if is_patient_beta_revoked(db, claims.patient_id):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Access denied. Project Aegis closed beta access has been revoked.",
+            headers={"Cache-Control": "no-store", "Pragma": "no-cache"},
+        )
 
     # Mandatory server-side refresh-token family lineage check (fail-closed):
     # 1. A refresh-token family matching (device_id, family_id) MUST exist in DB.

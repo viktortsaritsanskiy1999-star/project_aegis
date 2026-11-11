@@ -1,16 +1,20 @@
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 import logging
 import time
 from typing import Callable, List, Optional, Tuple
-from sqlalchemy import select
+import uuid
+from sqlalchemy import select, or_
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 from app.config import settings
+from app.models.beta_whitelist import BetaAccessWhitelist
 from app.models.device import Device
 from app.models.device_refresh_token import DeviceRefreshToken
 from app.models.pairing_code import PairingCode
 from app.models.patient import Patient
+from app.models.patient_google_identity import PatientGoogleIdentity
+from app.repositories.device_repository import DeviceRepository
 from app.repositories.pairing_repository import PairingRepository
 from app.repositories.token_repository import DeviceTokenRepository
 from app.security.rate_limiter import (
@@ -24,21 +28,36 @@ from app.security.tokens import (
     create_access_token,
     resolve_jwt_secret,
 )
+from app.services.google_auth_service import (
+    GoogleAuthConfigError,
+    GoogleAuthService,
+    GoogleTokenVerificationError,
+    VerifiedGoogleClaims,
+    get_google_auth_service,
+    is_patient_beta_revoked,
+)
 
 logger = logging.getLogger(__name__)
 
 _DEFAULT_RATE_LIMITER = object()
 
 
+class ClosedBetaAccessDeniedError(Exception):
+    """Raised when a user is not permitted into the closed beta."""
+
+
+class GoogleAccountSuspendedError(Exception):
+    """Raised when the associated Aegis patient profile is inactive or archived."""
+
+
 @dataclass(frozen=True)
 class PairingSessionBundle:
     """
     Complete atomic result of pairing a device:
-    contains the paired Device entity, consumed PairingCode entity,
+    contains the paired Device entity, consumed PairingCode entity (or None for Google Auth),
     issued short-lived JWT access token, and issued long-lived refresh token.
     """
     device: Device
-    pairing_code: PairingCode
     access_token: str
     access_token_claims_jti: str
     access_token_expires_in: int
@@ -48,6 +67,7 @@ class PairingSessionBundle:
     patient_id: str
     device_id: str
     scope: str
+    pairing_code: Optional[PairingCode] = None
     post_commit_warnings: Tuple[str, ...] = ()
 
 
@@ -339,6 +359,12 @@ class AuthService:
                     self.db.rollback()
                     return False, "Patient is not active", None
 
+                if is_patient_beta_revoked(self.db, str(patient.patient_id)):
+                    self.db.rollback()
+                    raise ClosedBetaAccessDeniedError(
+                        "Access denied. Project Aegis closed beta access has been revoked."
+                    )
+
                 committed_patient_id = str(device.patient_id)
                 committed_device_id = str(device.device_id)
 
@@ -396,3 +422,218 @@ class AuthService:
             )
 
         return False, "Could not rotate refresh token due to concurrent lock contention", None
+
+    def authenticate_google_device_and_issue_tokens(
+        self,
+        *,
+        id_token: str,
+        device_name: str,
+        platform: str = "android",
+        device_id: Optional[str] = None,
+        client_ip: Optional[str] = None,
+        scope: str = DEFAULT_DEVICE_SCOPE,
+        access_ttl_minutes: Optional[int] = None,
+        refresh_ttl_days: Optional[int] = None,
+        access_token_factory: Optional[Callable[..., IssuedAccessToken]] = None,
+        google_auth_service: Optional[GoogleAuthService] = None,
+    ) -> Tuple[bool, str, Optional[PairingSessionBundle]]:
+        """
+        Authenticates a client device using an externally verified Google ID Token,
+        anchoring the identity strictly to Google's verified `sub`.
+        """
+        # 1. Fail-closed secret & limiter verification
+        resolved_jwt_secret = resolve_jwt_secret(self._jwt_secret)
+        if not isinstance(self._rate_limiter, PersistentRateLimiter):
+            raise RateLimiterUnavailableError(
+                "PersistentRateLimiter is required for authentication (fail-closed)."
+            )
+
+        # 2. Rate-limit check & slot reservation
+        ticket: RateLimitAttemptTicket = self._rate_limiter.acquire_attempt(
+            client_ip=client_ip or "unknown",
+            device_id=device_id,
+        )
+
+        # 3. Verify Google ID token cryptographically
+        verifier = google_auth_service or get_google_auth_service()
+        claims: VerifiedGoogleClaims = verifier.verify_token(id_token)
+
+        device_repo = DeviceRepository(self.db)
+        token_repo = DeviceTokenRepository(self.db)
+        effective_refresh_ttl = (
+            settings.refresh_token_ttl_days if refresh_ttl_days is None else refresh_ttl_days
+        )
+        token_creator = access_token_factory or create_access_token
+
+        # --- PRE-COMMIT & COMMIT PHASE ---
+        try:
+            # 4. Check if Google Identity already exists
+            identity = self.db.scalar(
+                select(PatientGoogleIdentity)
+                .where(PatientGoogleIdentity.google_sub == claims.sub)
+            )
+
+            # Check for explicit closed-beta revocation
+            revocation_check = self.db.scalar(
+                select(BetaAccessWhitelist).where(
+                    BetaAccessWhitelist.identifier_type.in_(["google_sub", "email"]),
+                    BetaAccessWhitelist.identifier_value.in_(
+                        [claims.sub] + ([claims.email.lower()] if claims.email else [])
+                    ),
+                    or_(
+                        BetaAccessWhitelist.is_active.is_(False),
+                        BetaAccessWhitelist.revoked_at.isnot(None),
+                    ),
+                )
+            )
+            if revocation_check is not None:
+                self.db.rollback()
+                raise ClosedBetaAccessDeniedError(
+                    "Closed beta access has been revoked for this Google account."
+                )
+
+            if identity is not None:
+                # Existing Google-authenticated patient
+                patient = self.db.scalar(
+                    select(Patient).where(Patient.patient_id == identity.patient_id)
+                )
+                if patient is None or patient.status != "active":
+                    self.db.rollback()
+                    raise GoogleAccountSuspendedError(
+                        f"Patient profile '{identity.patient_id}' is inactive or suspended."
+                    )
+
+                patient_id = identity.patient_id
+                identity.last_authenticated_at = datetime.now(timezone.utc)
+                if claims.email and identity.email != claims.email:
+                    identity.email = claims.email
+                identity.email_verified = claims.email_verified
+                self.db.flush()
+            else:
+                # New user registration: check closed beta allowlist
+                if not settings.beta_registration_open:
+                    allowed = False
+                    # Sub-based whitelist
+                    sub_entry = self.db.scalar(
+                        select(BetaAccessWhitelist).where(
+                            BetaAccessWhitelist.identifier_type == "google_sub",
+                            BetaAccessWhitelist.identifier_value == claims.sub,
+                            BetaAccessWhitelist.is_active.is_(True),
+                            BetaAccessWhitelist.revoked_at.is_(None),
+                        )
+                    )
+                    if sub_entry is not None:
+                        allowed = True
+                    elif claims.email:
+                        email_entry = self.db.scalar(
+                            select(BetaAccessWhitelist).where(
+                                BetaAccessWhitelist.identifier_type == "email",
+                                BetaAccessWhitelist.identifier_value == claims.email.lower(),
+                                BetaAccessWhitelist.is_active.is_(True),
+                                BetaAccessWhitelist.revoked_at.is_(None),
+                            )
+                        )
+                        if email_entry is not None:
+                            allowed = True
+
+                    if not allowed:
+                        self.db.rollback()
+                        raise ClosedBetaAccessDeniedError(
+                            "Registration is restricted during closed beta. Your Google account is not on the approval list."
+                        )
+
+                # Provision new Aegis patient
+                patient_id = f"pat_g_{uuid.uuid4().hex[:14]}"
+                new_patient = Patient(patient_id=patient_id, status="active")
+                self.db.add(new_patient)
+                self.db.flush()
+
+                new_identity = PatientGoogleIdentity(
+                    id=f"gid_{uuid.uuid4().hex[:14]}",
+                    google_sub=claims.sub,
+                    google_issuer=claims.iss,
+                    patient_id=patient_id,
+                    email=claims.email,
+                    email_verified=claims.email_verified,
+                    created_at=datetime.now(timezone.utc),
+                    last_authenticated_at=datetime.now(timezone.utc),
+                )
+                self.db.add(new_identity)
+                self.db.flush()
+
+            # 5. Register device & issue tokens atomically
+            device = device_repo.register_device(
+                patient_id=patient_id,
+                device_name=device_name,
+                platform=platform,
+                device_id=device_id,
+                commit=False,
+            )
+            committed_device_id = str(device.device_id)
+
+            # 6. Revoke prior refresh tokens for this device
+            token_repo.revoke_all_for_device(committed_device_id, commit=False)
+
+            # 7. Issue new refresh token
+            raw_refresh, refresh_entity = token_repo.issue_refresh_token(
+                device_id=committed_device_id,
+                ttl_days=effective_refresh_ttl,
+                commit=False,
+            )
+            committed_family_id = str(refresh_entity.family_id)
+
+            # 8. Issue signed HS256 JWT access token
+            issued_jwt = token_creator(
+                patient_id=patient_id,
+                device_id=committed_device_id,
+                family_id=committed_family_id,
+                scope=scope,
+                ttl_minutes=access_ttl_minutes,
+                secret=resolved_jwt_secret,
+            )
+            if (
+                issued_jwt is None
+                or not isinstance(getattr(issued_jwt, "access_token", None), str)
+                or not issued_jwt.access_token.strip()
+            ):
+                raise RuntimeError("Access token factory returned an invalid token bundle.")
+
+            # 9. Commit transaction atomically
+            self.db.commit()
+        except Exception:
+            self.db.rollback()
+            raise
+
+        # --- POST-COMMIT PHASE (Transaction is already committed; NEVER rollback!) ---
+        post_commit_warnings: List[str] = []
+
+        try:
+            self.db.refresh(device)
+            self.db.refresh(refresh_entity)
+        except Exception as refresh_exc:
+            warn_msg = f"Post-commit ORM refresh warning: {refresh_exc}"
+            logger.warning(warn_msg)
+            post_commit_warnings.append(warn_msg)
+
+        try:
+            self._rate_limiter.record_success(ticket)
+        except Exception as limiter_exc:
+            warn_msg = f"Post-commit rate limiter record_success warning: {limiter_exc}"
+            logger.warning(warn_msg)
+            post_commit_warnings.append(warn_msg)
+
+        bundle = PairingSessionBundle(
+            device=device,
+            access_token=issued_jwt.access_token,
+            access_token_claims_jti=issued_jwt.claims.jti,
+            access_token_expires_in=issued_jwt.expires_in,
+            access_token_expires_at=issued_jwt.claims.expires_at,
+            refresh_token=raw_refresh,
+            refresh_token_entity=refresh_entity,
+            patient_id=patient_id,
+            device_id=committed_device_id,
+            scope=issued_jwt.claims.scope,
+            pairing_code=None,
+            post_commit_warnings=tuple(post_commit_warnings),
+        )
+        return True, "Google authentication successful", bundle

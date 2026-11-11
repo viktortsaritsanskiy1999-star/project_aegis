@@ -35,6 +35,36 @@ String? _validateDeviceId(String? id) {
   return clean;
 }
 
+/// Request payload corresponding to backend `POST /api/v1/auth/google`.
+@immutable
+class GoogleAuthRequest {
+  final String idToken;
+  final String deviceName;
+  final String? deviceId;
+  final String platform;
+
+  GoogleAuthRequest({
+    required String idToken,
+    String deviceName = 'Aegis Mobile Client',
+    String? deviceId,
+    String platform = 'android',
+  })  : idToken = _validateRequiredNonBlank(idToken, 'id_token'),
+        deviceName = _validateRequiredNonBlank(deviceName, 'device_name'),
+        deviceId = _validateDeviceId(deviceId),
+        platform = _validateRequiredNonBlank(platform, 'platform');
+
+  Map<String, dynamic> toJson() => {
+    'id_token': idToken,
+    'device_name': deviceName,
+    'platform': platform,
+    if (deviceId != null) 'device_id': deviceId,
+  };
+
+  @override
+  String toString() =>
+      'GoogleAuthRequest(deviceName: $deviceName, platform: $platform, deviceId: $deviceId, idToken: [REDACTED])';
+}
+
 /// Request payload corresponding to backend `POST /api/v1/auth/pair`.
 @immutable
 class DevicePairRequest {

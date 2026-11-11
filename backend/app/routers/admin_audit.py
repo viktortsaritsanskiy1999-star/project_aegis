@@ -16,11 +16,16 @@ from sqlalchemy.orm import Session
 from app.config import settings
 from app.database import get_db
 from app.models.audit_review import ClinicalAIAuditReview
+from app.models.beta_whitelist import BetaAccessWhitelist
 from app.models.health_measurement import HealthMeasurement
 from app.models.medical_cycle import MedicalCycle
 from app.models.model_report import ModelReport
 from app.models.patient import Patient
 from app.models.workout_session import WorkoutSession
+from app.schemas.auth import (
+    BetaWhitelistCreateRequest,
+    BetaWhitelistResponse,
+)
 from app.schemas.audit import (
     AdminLoginRequest,
     AdminLoginResponse,
@@ -184,6 +189,102 @@ def admin_audit_login(
         token_type="bearer",
         expires_in=7200,
     )
+
+
+# ==============================================================================
+# CLOSED BETA WHITELIST MANAGEMENT (LOCAL ADMIN ONLY)
+# ==============================================================================
+
+@router.get(
+    "/api/v1/admin/beta/whitelist",
+    response_model=List[BetaWhitelistResponse],
+    summary="List closed beta whitelist entries (Server Admin Only)",
+)
+def list_beta_whitelist(
+    request: Request,
+    db: Session = Depends(get_db),
+    admin_session: ServiceAdminSession = Depends(require_service_admin_session),
+) -> List[BetaWhitelistResponse]:
+    """Returns all closed beta whitelist entries ordered by creation date."""
+    entries = db.scalars(
+        select(BetaAccessWhitelist).order_by(BetaAccessWhitelist.created_at.desc())
+    ).all()
+    return [BetaWhitelistResponse.model_validate(e) for e in entries]
+
+
+@router.post(
+    "/api/v1/admin/beta/whitelist",
+    response_model=BetaWhitelistResponse,
+    status_code=status.HTTP_201_CREATED,
+    summary="Add an account (sub or email) to the closed beta whitelist (Server Admin Only)",
+)
+def create_beta_whitelist_entry(
+    payload: BetaWhitelistCreateRequest,
+    request: Request,
+    db: Session = Depends(get_db),
+    admin_session: ServiceAdminSession = Depends(require_service_admin_session),
+) -> BetaWhitelistResponse:
+    """Grants beta access to a specific Google sub or verified email address."""
+    clean_val = (
+        payload.identifier_value.strip().lower()
+        if payload.identifier_type == "email"
+        else payload.identifier_value.strip()
+    )
+    existing = db.scalar(
+        select(BetaAccessWhitelist).where(
+            BetaAccessWhitelist.identifier_type == payload.identifier_type,
+            BetaAccessWhitelist.identifier_value == clean_val,
+        )
+    )
+    if existing:
+        existing.is_active = True
+        existing.revoked_at = None
+        if payload.notes:
+            existing.notes = payload.notes
+        db.commit()
+        db.refresh(existing)
+        return BetaWhitelistResponse.model_validate(existing)
+
+    entry = BetaAccessWhitelist(
+        id=f"bw_{uuid.uuid4().hex[:14]}",
+        identifier_type=payload.identifier_type,
+        identifier_value=clean_val,
+        is_active=True,
+        granted_by="admin",
+        notes=payload.notes,
+        created_at=datetime.now(timezone.utc),
+    )
+    db.add(entry)
+    db.commit()
+    db.refresh(entry)
+    return BetaWhitelistResponse.model_validate(entry)
+
+
+@router.delete(
+    "/api/v1/admin/beta/whitelist/{entry_id}",
+    response_model=BetaWhitelistResponse,
+    summary="Revoke closed beta access for an entry (Server Admin Only)",
+)
+def revoke_beta_whitelist_entry(
+    entry_id: str,
+    request: Request,
+    db: Session = Depends(get_db),
+    admin_session: ServiceAdminSession = Depends(require_service_admin_session),
+) -> BetaWhitelistResponse:
+    """Revokes closed beta access for a specified whitelist entry."""
+    entry = db.scalar(
+        select(BetaAccessWhitelist).where(BetaAccessWhitelist.id == entry_id)
+    )
+    if not entry:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Beta whitelist entry '{entry_id}' not found.",
+        )
+    entry.is_active = False
+    entry.revoked_at = datetime.now(timezone.utc)
+    db.commit()
+    db.refresh(entry)
+    return BetaWhitelistResponse.model_validate(entry)
 
 
 # ==============================================================================

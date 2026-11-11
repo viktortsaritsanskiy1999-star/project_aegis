@@ -10,6 +10,8 @@ from app.models.pairing_code import PairingCode
 from app.models.device_refresh_token import DeviceRefreshToken
 from app.models.auth_rate_limit import AuthRateLimit
 from app.models.audit_review import ClinicalAIAuditReview
+from app.models.patient_google_identity import PatientGoogleIdentity
+from app.models.beta_whitelist import BetaAccessWhitelist
 
 __all__ = [
     "Base",
@@ -24,4 +26,6 @@ __all__ = [
     "DeviceRefreshToken",
     "AuthRateLimit",
     "ClinicalAIAuditReview",
+    "PatientGoogleIdentity",
+    "BetaAccessWhitelist",
 ]

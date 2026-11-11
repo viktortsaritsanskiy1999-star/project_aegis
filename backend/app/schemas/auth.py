@@ -126,3 +126,118 @@ class DeviceRevokeResponse(BaseModel):
     status: str = Field(default="revoked")
     device_id: str
     revoked: bool = Field(default=True)
+
+
+class GoogleAuthRequest(BaseModel):
+    """
+    Request payload for `POST /api/v1/auth/google`.
+    - `id_token` is marked `repr=False` to strictly prevent credentials leaking into logs.
+    - Strictly forbids extra fields.
+    """
+    model_config = ConfigDict(extra="forbid")
+
+    id_token: str = Field(
+        ...,
+        min_length=10,
+        repr=False,
+        description="Cryptographically signed Google ID Token obtained from Google Sign-In SDK",
+    )
+    device_id: Optional[str] = Field(
+        default=None,
+        min_length=1,
+        max_length=64,
+        description="Optional client-generated device identifier",
+    )
+    device_name: str = Field(
+        ...,
+        min_length=1,
+        max_length=128,
+        description="Human-readable device label (e.g. 'Pixel 8 Pro')",
+    )
+    platform: str = Field(
+        default="android",
+        min_length=1,
+        max_length=32,
+        description="Device platform identifier (android, ios, wearos)",
+    )
+
+    @field_validator("id_token")
+    @classmethod
+    def _validate_id_token(cls, value: str) -> str:
+        clean = value.strip()
+        if not clean:
+            raise ValueError("id_token must not be empty.")
+        if clean.count(".") != 2:
+            raise ValueError("id_token must be a valid 3-part JWT structure.")
+        return clean
+
+    @field_validator("device_name", "platform")
+    @classmethod
+    def _validate_non_blank(cls, value: str) -> str:
+        clean = value.strip()
+        if not clean:
+            raise ValueError("Field must not be blank.")
+        return clean
+
+    @field_validator("device_id")
+    @classmethod
+    def _validate_device_id(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        clean = value.strip()
+        if not clean:
+            raise ValueError("device_id must not be blank when provided.")
+        if any(ord(ch) < 32 or ord(ch) > 126 for ch in clean):
+            raise ValueError("device_id contains invalid characters.")
+        return clean
+
+
+class BetaWhitelistCreateRequest(BaseModel):
+    """Request payload for administrators to grant closed beta access."""
+    model_config = ConfigDict(extra="forbid")
+
+    identifier_type: str = Field(
+        default="email",
+        description="Whitelist identifier type: 'google_sub' or 'email'",
+    )
+    identifier_value: str = Field(
+        ...,
+        min_length=3,
+        max_length=255,
+        description="Target Google Sub or normalized email address",
+    )
+    notes: Optional[str] = Field(
+        default=None,
+        max_length=255,
+        description="Administrative notes (e.g. 'Doctor tester', 'Beta cohort #1')",
+    )
+
+    @field_validator("identifier_type")
+    @classmethod
+    def _validate_type(cls, value: str) -> str:
+        clean = value.strip().lower()
+        if clean not in ("google_sub", "email"):
+            raise ValueError("identifier_type must be either 'google_sub' or 'email'.")
+        return clean
+
+    @field_validator("identifier_value")
+    @classmethod
+    def _validate_value(cls, value: str) -> str:
+        clean = value.strip()
+        if not clean:
+            raise ValueError("identifier_value must not be empty.")
+        return clean
+
+
+class BetaWhitelistResponse(BaseModel):
+    """Response payload for beta whitelist entries."""
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    identifier_type: str
+    identifier_value: str
+    is_active: bool
+    granted_by: str
+    notes: Optional[str] = None
+    created_at: datetime
+    revoked_at: Optional[datetime] = None

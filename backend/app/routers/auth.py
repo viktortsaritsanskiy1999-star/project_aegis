@@ -16,6 +16,7 @@ from app.schemas.auth import (
     DevicePairResponse,
     DeviceRevokeRequest,
     DeviceRevokeResponse,
+    GoogleAuthRequest,
     TokenRefreshRequest,
     TokenRefreshResponse,
 )
@@ -26,7 +27,15 @@ from app.security.rate_limiter import (
     resolve_client_ip,
 )
 from app.security.tokens import TokenConfigurationError
-from app.services.auth_service import AuthService
+from app.services.auth_service import (
+    AuthService,
+    ClosedBetaAccessDeniedError,
+    GoogleAccountSuspendedError,
+)
+from app.services.google_auth_service import (
+    GoogleAuthConfigError,
+    GoogleTokenVerificationError,
+)
 
 NO_STORE_HEADERS = {
     "Cache-Control": "no-store",
@@ -35,7 +44,7 @@ NO_STORE_HEADERS = {
 GENERIC_PAIRING_FAILURE_DETAIL = "Invalid or unacceptable pairing credentials."
 
 SENSITIVE_FIELD_NAMES = frozenset(
-    {"pairing_code", "refresh_token", "access_token", "password", "secret"}
+    {"pairing_code", "refresh_token", "access_token", "password", "secret", "id_token"}
 )
 
 
@@ -186,6 +195,12 @@ def pair_device_endpoint(
             detail="Server authentication configuration is unavailable (fail-closed).",
             headers=NO_STORE_HEADERS,
         ) from exc
+    except ClosedBetaAccessDeniedError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=str(exc),
+            headers=NO_STORE_HEADERS,
+        ) from exc
     except ValueError as exc:
         err_lower = str(exc).lower()
         if "pairing secret" in err_lower:
@@ -204,6 +219,103 @@ def pair_device_endpoint(
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail=GENERIC_PAIRING_FAILURE_DETAIL,
+            headers={"WWW-Authenticate": "Bearer", **NO_STORE_HEADERS},
+        )
+
+    return DevicePairResponse(
+        access_token=bundle.access_token,
+        token_type="Bearer",
+        expires_in=bundle.access_token_expires_in,
+        expires_at=bundle.access_token_expires_at,
+        refresh_token=bundle.refresh_token,
+        refresh_expires_at=bundle.refresh_token_entity.expires_at,
+        patient_id=bundle.patient_id,
+        device_id=bundle.device_id,
+        scope=bundle.scope,
+    )
+
+
+@router.post(
+    "/google",
+    response_model=DevicePairResponse,
+    summary="Authenticate or register a mobile device using an externally verified Google ID Token",
+    description=(
+        "Protected by persistent SQLite rate limiting. Cryptographically verifies the Google ID Token "
+        "via official Google Auth library, anchors identity strictly to Google's verified `sub`, enforces "
+        "closed beta allowlist policies, registers the device, and issues standard Aegis DeviceSession tokens."
+    ),
+)
+def google_auth_endpoint(
+    payload: GoogleAuthRequest,
+    request: Request,
+    response: Response,
+    auth_service: AuthService = Depends(get_auth_service),
+) -> DevicePairResponse:
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["Pragma"] = "no-cache"
+
+    client_host = request.client.host if request.client is not None else None
+    client_ip = resolve_client_ip(client_host, request.headers)
+
+    try:
+        ok, _msg, bundle = auth_service.authenticate_google_device_and_issue_tokens(
+            id_token=payload.id_token,
+            device_name=payload.device_name,
+            platform=payload.platform,
+            device_id=payload.device_id,
+            client_ip=client_ip,
+        )
+    except RateLimitExceededError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Too many authentication attempts. Please retry later.",
+            headers={
+                "Retry-After": str(exc.retry_after),
+                "Cache-Control": "no-store",
+                "Pragma": "no-cache",
+            },
+        ) from exc
+    except RateLimiterUnavailableError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Authentication rate limiter is unavailable (fail-closed).",
+            headers=NO_STORE_HEADERS,
+        ) from exc
+    except GoogleAuthConfigError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Google Sign-In configuration is unavailable on this server.",
+            headers=NO_STORE_HEADERS,
+        ) from exc
+    except GoogleTokenVerificationError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=f"Google authentication failed: {exc}",
+            headers={"WWW-Authenticate": "Bearer", **NO_STORE_HEADERS},
+        ) from exc
+    except ClosedBetaAccessDeniedError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=str(exc),
+            headers=NO_STORE_HEADERS,
+        ) from exc
+    except GoogleAccountSuspendedError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=str(exc),
+            headers=NO_STORE_HEADERS,
+        ) from exc
+    except TokenConfigurationError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Server authentication configuration is unavailable (fail-closed).",
+            headers=NO_STORE_HEADERS,
+        ) from exc
+
+    if not ok or bundle is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Google authentication failed.",
             headers={"WWW-Authenticate": "Bearer", **NO_STORE_HEADERS},
         )
 
@@ -247,6 +359,12 @@ def refresh_tokens_endpoint(
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Server authentication configuration is unavailable (fail-closed).",
+            headers=NO_STORE_HEADERS,
+        ) from exc
+    except ClosedBetaAccessDeniedError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=str(exc),
             headers=NO_STORE_HEADERS,
         ) from exc
     except ValueError as exc:
