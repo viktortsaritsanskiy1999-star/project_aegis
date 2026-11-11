@@ -57,3 +57,6 @@ venv/
 .pytest_cache/
 backend/data/
 backend/backend/
+test/Synthetic_Patient_001/
+backend/audit_logs/
+audit_logs/
