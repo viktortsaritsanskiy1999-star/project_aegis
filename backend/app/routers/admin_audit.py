@@ -1,17 +1,18 @@
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 import json
 import logging
 from pathlib import Path
 import re
 import secrets
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, Generator, List, Optional, Tuple, Union
 import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from fastapi.responses import HTMLResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from sqlalchemy import select, func
-from sqlalchemy.orm import Session
+from sqlalchemy import create_engine, select, func
+from sqlalchemy.orm import sessionmaker, Session
 
 from app.config import settings
 from app.database import get_db
@@ -55,6 +56,106 @@ from app.services.audit_trail_service import (
 )
 
 logger = logging.getLogger("aegis.admin_audit")
+
+
+def get_audit_data_sources() -> Dict[str, Dict[str, Any]]:
+    """
+    Returns registered audit trail data sources.
+    Allows switching between the live simulation vault (synthetic_patient_001)
+    and the historical automated test fixtures vault (default).
+    """
+    backend_dir = Path(__file__).resolve().parents[2]
+    synth_db = backend_dir / "data" / "synthetic_patient_001.db"
+    synth_audit = backend_dir / "audit_logs" / "synthetic_patient_001"
+
+    # Default database from settings
+    default_db_raw = settings.database_url
+    for prefix in ("sqlite:///", "sqlite://"):
+        if default_db_raw.startswith(prefix):
+            default_db_raw = default_db_raw[len(prefix):]
+            break
+    default_db_path = Path(default_db_raw)
+    if not default_db_path.is_absolute():
+        default_db_path = (backend_dir / default_db_path).resolve()
+
+    default_audit_raw = getattr(settings, "audit_storage_dir", "backend/data/audit_trail")
+    default_audit_path = Path(default_audit_raw)
+    if not default_audit_path.is_absolute():
+        default_audit_path = (backend_dir / default_audit_path).resolve()
+
+    sources: Dict[str, Dict[str, Any]] = {}
+    if synth_db.exists() and synth_audit.exists():
+        sources["synthetic_patient_001"] = {
+            "id": "synthetic_patient_001",
+            "name": "Synthetic Patient 001 (Live Simulation)",
+            "description": "21-day autonomous clinical trial with real Gemini APIs",
+            "db_path": synth_db,
+            "audit_dir": synth_audit,
+            "available": True,
+            "is_default": True,
+        }
+    sources["default"] = {
+        "id": "default",
+        "name": "Historical Test Vault (aegis_private_vault.db)",
+        "description": "Historical automated test fixtures and vault data",
+        "db_path": default_db_path,
+        "audit_dir": default_audit_path,
+        "available": default_db_path.exists(),
+        "is_default": "synthetic_patient_001" not in sources,
+    }
+    return sources
+
+
+_custom_session_factories: Dict[str, sessionmaker] = {}
+_custom_audit_services: Dict[str, AuditTrailService] = {}
+
+
+@contextmanager
+def get_effective_audit_context(
+    source: Optional[str],
+    default_db: Session,
+    default_audit_service: AuditTrailService,
+) -> Generator[Tuple[Session, AuditTrailService], None, None]:
+    """
+    Resolves the active database session and audit service.
+    - If source is None, empty, or 'default': yields (default_db, default_audit_service).
+    - If source matches a registered custom source (e.g., 'synthetic_patient_001'):
+      opens an isolated session to its SQLite file and instantiates its AuditTrailService.
+    """
+    clean_src = (source or "default").strip()
+    sources = get_audit_data_sources()
+    if clean_src == "default" or clean_src not in sources:
+        yield default_db, default_audit_service
+        return
+
+    cfg = sources[clean_src]
+    db_path = cfg["db_path"]
+    audit_dir = cfg["audit_dir"]
+
+    if not db_path.exists():
+        logger.warning(f"Data source '{clean_src}' DB not found at {db_path}; falling back to default.")
+        yield default_db, default_audit_service
+        return
+
+    if clean_src not in _custom_session_factories:
+        engine_args = {"check_same_thread": False}
+        custom_engine = create_engine(
+            f"sqlite:///{db_path.as_posix()}",
+            connect_args=engine_args,
+            pool_pre_ping=True,
+        )
+        _custom_session_factories[clean_src] = sessionmaker(
+            autocommit=False, autoflush=False, bind=custom_engine
+        )
+
+    if clean_src not in _custom_audit_services:
+        _custom_audit_services[clean_src] = AuditTrailService(storage_dir=audit_dir)
+
+    custom_session = _custom_session_factories[clean_src]()
+    try:
+        yield custom_session, _custom_audit_services[clean_src]
+    finally:
+        custom_session.close()
 
 # Ephemeral in-memory admin sessions for secure browser access (no permanent master secret in JS)
 _ephemeral_admin_sessions: Dict[str, datetime] = {}
@@ -292,23 +393,47 @@ def revoke_beta_whitelist_entry(
 # ==============================================================================
 
 @router.get(
+    "/api/v1/admin/audit/sources",
+    summary="List available audit trail data sources (Server Admin Only)",
+)
+def list_audit_sources(
+    request: Request,
+    admin_session: ServiceAdminSession = Depends(require_service_admin_session),
+) -> List[Dict[str, Any]]:
+    """Lists registered audit trail data sources for dashboard switching."""
+    sources_dict = get_audit_data_sources()
+    res = []
+    for s_id, s_info in sources_dict.items():
+        res.append({
+            "id": s_id,
+            "name": s_info["name"],
+            "description": s_info["description"],
+            "available": s_info["available"],
+            "is_default": s_info.get("is_default", False),
+        })
+    return res
+
+
+@router.get(
     "/api/v1/admin/audit/patients",
     response_model=List[str],
     summary="List patients with clinical cycles or audit records (Server Admin Only)",
 )
 def list_audit_patients(
     request: Request,
+    source: Optional[str] = Query(None, description="Optional audit data source identifier"),
     db: Session = Depends(get_db),
     admin_session: ServiceAdminSession = Depends(require_service_admin_session),
     audit_service: AuditTrailService = Depends(get_audit_trail_service),
 ) -> List[str]:
     """Lists distinct patients from both the primary SQLite database and filesystem audit storage."""
-    db_patients = set(db.scalars(select(Patient.patient_id)).all())
-    cycle_patients = set(
-        db.scalars(select(MedicalCycle.patient_id).where(MedicalCycle.patient_id.isnot(None))).all()
-    )
-    fs_patients = set(audit_service.list_patients())
-    return sorted([p for p in (db_patients | cycle_patients | fs_patients) if p])
+    with get_effective_audit_context(source, db, audit_service) as (eff_db, eff_audit):
+        db_patients = set(eff_db.scalars(select(Patient.patient_id)).all())
+        cycle_patients = set(
+            eff_db.scalars(select(MedicalCycle.patient_id).where(MedicalCycle.patient_id.isnot(None))).all()
+        )
+        fs_patients = set(eff_audit.list_patients())
+        return sorted([p for p in (db_patients | cycle_patients | fs_patients) if p])
 
 
 @router.get(
@@ -319,43 +444,45 @@ def list_audit_patients(
 def list_patient_audit_cycles(
     patient_id: str,
     request: Request,
+    source: Optional[str] = Query(None, description="Optional audit data source identifier"),
     db: Session = Depends(get_db),
     admin_session: ServiceAdminSession = Depends(require_service_admin_session),
     audit_service: AuditTrailService = Depends(get_audit_trail_service),
 ) -> List[Dict[str, Any]]:
     """Returns all cycles for a patient, preserving historical cycles across Neo reassessments."""
-    clean_patient_id = audit_service.validate_identifier(patient_id, "patient_id")
+    with get_effective_audit_context(source, db, audit_service) as (eff_db, eff_audit):
+        clean_patient_id = eff_audit.validate_identifier(patient_id, "patient_id")
 
-    db_cycles = db.scalars(
-        select(MedicalCycle)
-        .where(MedicalCycle.patient_id == clean_patient_id)
-        .order_by(MedicalCycle.created_at.asc())
-    ).all()
+        db_cycles = eff_db.scalars(
+            select(MedicalCycle)
+            .where(MedicalCycle.patient_id == clean_patient_id)
+            .order_by(MedicalCycle.created_at.asc())
+        ).all()
 
-    cycle_map: Dict[str, Dict[str, Any]] = {}
-    for c in db_cycles:
-        cycle_map[c.cycle_id] = {
-            "cycle_id": c.cycle_id,
-            "patient_id": c.patient_id,
-            "status": c.status,
-            "started_at": c.started_at.isoformat() if c.started_at else None,
-            "closed_at": c.closed_at.isoformat() if c.closed_at else None,
-            "source": "sqlite",
-        }
-
-    fs_cycles = audit_service.list_cycles(clean_patient_id)
-    for cyc in fs_cycles:
-        if cyc not in cycle_map:
-            cycle_map[cyc] = {
-                "cycle_id": cyc,
-                "patient_id": clean_patient_id,
-                "status": "historical",
-                "started_at": None,
-                "closed_at": None,
-                "source": "filesystem",
+        cycle_map: Dict[str, Dict[str, Any]] = {}
+        for c in db_cycles:
+            cycle_map[c.cycle_id] = {
+                "cycle_id": c.cycle_id,
+                "patient_id": c.patient_id,
+                "status": c.status,
+                "started_at": c.started_at.isoformat() if c.started_at else None,
+                "closed_at": c.closed_at.isoformat() if c.closed_at else None,
+                "source": "sqlite",
             }
 
-    return list(cycle_map.values())
+        fs_cycles = eff_audit.list_cycles(clean_patient_id)
+        for cyc in fs_cycles:
+            if cyc not in cycle_map:
+                cycle_map[cyc] = {
+                    "cycle_id": cyc,
+                    "patient_id": clean_patient_id,
+                    "status": "historical",
+                    "started_at": None,
+                    "closed_at": None,
+                    "source": "filesystem",
+                }
+
+        return list(cycle_map.values())
 
 
 @router.get(
@@ -366,18 +493,20 @@ def list_patient_audit_cycles(
 def list_cycle_stages(
     cycle_id: str,
     request: Request,
+    source: Optional[str] = Query(None, description="Optional audit data source identifier"),
     db: Session = Depends(get_db),
     admin_session: ServiceAdminSession = Depends(require_service_admin_session),
     audit_service: AuditTrailService = Depends(get_audit_trail_service),
 ) -> List[Dict[str, Any]]:
-    clean_cycle_id = audit_service.validate_identifier(cycle_id, "cycle_id")
-    calls = audit_service.list_calls(cycle_id=clean_cycle_id)
+    with get_effective_audit_context(source, db, audit_service) as (eff_db, eff_audit):
+        clean_cycle_id = eff_audit.validate_identifier(cycle_id, "cycle_id")
+        calls = eff_audit.list_calls(cycle_id=clean_cycle_id)
 
-    stage_counts: Dict[str, int] = {}
-    for c in calls:
-        stage_counts[c.stage] = stage_counts.get(c.stage, 0) + 1
+        stage_counts: Dict[str, int] = {}
+        for c in calls:
+            stage_counts[c.stage] = stage_counts.get(c.stage, 0) + 1
 
-    return [{"stage": stage, "call_count": count} for stage, count in stage_counts.items()]
+        return [{"stage": stage, "call_count": count} for stage, count in stage_counts.items()]
 
 
 @router.get(
@@ -390,24 +519,26 @@ def list_cycle_calls(
     request: Request,
     stage: Optional[str] = Query(None, description="Optional filter by stage"),
     sprint_id: Optional[str] = Query(None, description="Optional filter by sprint ID"),
+    source: Optional[str] = Query(None, description="Optional audit data source identifier"),
     db: Session = Depends(get_db),
     admin_session: ServiceAdminSession = Depends(require_service_admin_session),
     audit_service: AuditTrailService = Depends(get_audit_trail_service),
 ) -> List[AuditRecordSummary]:
-    clean_cycle_id = audit_service.validate_identifier(cycle_id, "cycle_id")
-    summaries = audit_service.list_calls(cycle_id=clean_cycle_id, stage=stage, sprint_id=sprint_id)
+    with get_effective_audit_context(source, db, audit_service) as (eff_db, eff_audit):
+        clean_cycle_id = eff_audit.validate_identifier(cycle_id, "cycle_id")
+        summaries = eff_audit.list_calls(cycle_id=clean_cycle_id, stage=stage, sprint_id=sprint_id)
 
-    call_ids = [s.call_id for s in summaries]
-    if call_ids:
-        reviews = db.scalars(
-            select(ClinicalAIAuditReview).where(ClinicalAIAuditReview.call_id.in_(call_ids))
-        ).all()
-        review_map = {r.call_id: r.status for r in reviews}
-        for s in summaries:
-            if s.call_id in review_map:
-                s.review_status = review_map[s.call_id]
+        call_ids = [s.call_id for s in summaries]
+        if call_ids:
+            reviews = eff_db.scalars(
+                select(ClinicalAIAuditReview).where(ClinicalAIAuditReview.call_id.in_(call_ids))
+            ).all()
+            review_map = {r.call_id: r.status for r in reviews}
+            for s in summaries:
+                if s.call_id in review_map:
+                    s.review_status = review_map[s.call_id]
 
-    return summaries
+        return summaries
 
 
 @router.get(
@@ -418,47 +549,49 @@ def list_cycle_calls(
 def get_call_inspection_detail(
     call_id: str,
     request: Request,
+    source: Optional[str] = Query(None, description="Optional audit data source identifier"),
     db: Session = Depends(get_db),
     admin_session: ServiceAdminSession = Depends(require_service_admin_session),
     audit_service: AuditTrailService = Depends(get_audit_trail_service),
 ) -> CallInspectionDetailResponse:
-    clean_call_id = audit_service.validate_identifier(call_id, "call_id")
-    call_record = audit_service.get_call(clean_call_id)
-    if call_record is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Audit record not found for call_id '{call_id}'.",
+    with get_effective_audit_context(source, db, audit_service) as (eff_db, eff_audit):
+        clean_call_id = eff_audit.validate_identifier(call_id, "call_id")
+        call_record = eff_audit.get_call(clean_call_id)
+        if call_record is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Audit record not found for call_id '{call_id}'.",
+            )
+
+        persisted_report: Optional[PersistedReportDetail] = None
+        if call_record.report_id:
+            report = eff_db.scalar(
+                select(ModelReport).where(ModelReport.report_id == call_record.report_id)
+            )
+            if report:
+                persisted_report = PersistedReportDetail.model_validate(report)
+        elif call_record.cycle_id:
+            query = select(ModelReport).where(ModelReport.cycle_id == call_record.cycle_id)
+            if call_record.sprint_id:
+                query = query.where(ModelReport.sprint_id == call_record.sprint_id)
+            report = eff_db.scalars(query).first()
+            if report:
+                persisted_report = PersistedReportDetail.model_validate(report)
+
+        review_record = eff_db.scalar(
+            select(ClinicalAIAuditReview).where(ClinicalAIAuditReview.call_id == clean_call_id)
+        )
+        review_response = (
+            ClinicalReviewResponse.model_validate(review_record)
+            if review_record is not None
+            else None
         )
 
-    persisted_report: Optional[PersistedReportDetail] = None
-    if call_record.report_id:
-        report = db.scalar(
-            select(ModelReport).where(ModelReport.report_id == call_record.report_id)
+        return CallInspectionDetailResponse(
+            call=call_record,
+            persisted_report=persisted_report,
+            review=review_response,
         )
-        if report:
-            persisted_report = PersistedReportDetail.model_validate(report)
-    elif call_record.cycle_id:
-        query = select(ModelReport).where(ModelReport.cycle_id == call_record.cycle_id)
-        if call_record.sprint_id:
-            query = query.where(ModelReport.sprint_id == call_record.sprint_id)
-        report = db.scalars(query).first()
-        if report:
-            persisted_report = PersistedReportDetail.model_validate(report)
-
-    review_record = db.scalar(
-        select(ClinicalAIAuditReview).where(ClinicalAIAuditReview.call_id == clean_call_id)
-    )
-    review_response = (
-        ClinicalReviewResponse.model_validate(review_record)
-        if review_record is not None
-        else None
-    )
-
-    return CallInspectionDetailResponse(
-        call=call_record,
-        persisted_report=persisted_report,
-        review=review_response,
-    )
 
 
 @router.post(
@@ -470,74 +603,76 @@ def submit_call_review(
     call_id: str,
     payload: ClinicalReviewUpdateRequest,
     request: Request,
+    source: Optional[str] = Query(None, description="Optional audit data source identifier"),
     db: Session = Depends(get_db),
     admin_session: ServiceAdminSession = Depends(require_service_admin_session),
     audit_service: AuditTrailService = Depends(get_audit_trail_service),
 ) -> ClinicalReviewResponse:
-    clean_call_id = audit_service.validate_identifier(call_id, "call_id")
-    call_record = audit_service.get_call(clean_call_id)
-    if call_record is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Audit record not found for call_id '{call_id}'.",
-        )
-
-    if payload.status == ClinicalReviewStatus.REVIEWED_PASS:
-        if not payload.reviewer_id or not payload.reviewer_id.strip():
+    with get_effective_audit_context(source, db, audit_service) as (eff_db, eff_audit):
+        clean_call_id = eff_audit.validate_identifier(call_id, "call_id")
+        call_record = eff_audit.get_call(clean_call_id)
+        if call_record is None:
             raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                detail="Medical quality PASS requires confirmation from a qualified reviewer (reviewer_id cannot be empty).",
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Audit record not found for call_id '{call_id}'.",
             )
 
-    review = db.scalar(
-        select(ClinicalAIAuditReview).where(ClinicalAIAuditReview.call_id == clean_call_id)
-    )
+        if payload.status == ClinicalReviewStatus.REVIEWED_PASS:
+            if not payload.reviewer_id or not payload.reviewer_id.strip():
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail="Medical quality PASS requires confirmation from a qualified reviewer (reviewer_id cannot be empty).",
+                )
 
-    now_utc = datetime.now(timezone.utc)
-    if review is None:
-        review = ClinicalAIAuditReview(
-            review_id=f"rev_{uuid.uuid4().hex[:16]}",
-            call_id=clean_call_id,
-            patient_id=call_record.patient_id,
-            cycle_id=call_record.cycle_id,
-            sprint_id=call_record.sprint_id,
-            stage=call_record.stage,
-            status=payload.status.value,
-            reviewer_id=payload.reviewer_id.strip() if payload.reviewer_id else None,
-            reviewed_at=now_utc if payload.status != ClinicalReviewStatus.NOT_REVIEWED else None,
-            notes=payload.notes,
-            facts_accurate=payload.facts_accurate,
-            units_correct=payload.units_correct,
-            unjustified_conclusions_found=payload.unjustified_conclusions_found,
-            cross_agent_consistent=payload.cross_agent_consistent,
-            red_flags_identified=payload.red_flags_identified,
-            strategy_aligns_with_inputs=payload.strategy_aligns_with_inputs,
-            created_at=now_utc,
-            updated_at=now_utc,
+        review = eff_db.scalar(
+            select(ClinicalAIAuditReview).where(ClinicalAIAuditReview.call_id == clean_call_id)
         )
-        db.add(review)
-    else:
-        review.status = payload.status.value
-        review.reviewer_id = payload.reviewer_id.strip() if payload.reviewer_id else review.reviewer_id
-        review.reviewed_at = now_utc if payload.status != ClinicalReviewStatus.NOT_REVIEWED else review.reviewed_at
-        review.notes = payload.notes
-        if payload.facts_accurate is not None:
-            review.facts_accurate = payload.facts_accurate
-        if payload.units_correct is not None:
-            review.units_correct = payload.units_correct
-        if payload.unjustified_conclusions_found is not None:
-            review.unjustified_conclusions_found = payload.unjustified_conclusions_found
-        if payload.cross_agent_consistent is not None:
-            review.cross_agent_consistent = payload.cross_agent_consistent
-        if payload.red_flags_identified is not None:
-            review.red_flags_identified = payload.red_flags_identified
-        if payload.strategy_aligns_with_inputs is not None:
-            review.strategy_aligns_with_inputs = payload.strategy_aligns_with_inputs
-        review.updated_at = now_utc
 
-    db.commit()
-    db.refresh(review)
-    return ClinicalReviewResponse.model_validate(review)
+        now_utc = datetime.now(timezone.utc)
+        if review is None:
+            review = ClinicalAIAuditReview(
+                review_id=f"rev_{uuid.uuid4().hex[:16]}",
+                call_id=clean_call_id,
+                patient_id=call_record.patient_id,
+                cycle_id=call_record.cycle_id,
+                sprint_id=call_record.sprint_id,
+                stage=call_record.stage,
+                status=payload.status.value,
+                reviewer_id=payload.reviewer_id.strip() if payload.reviewer_id else None,
+                reviewed_at=now_utc if payload.status != ClinicalReviewStatus.NOT_REVIEWED else None,
+                notes=payload.notes,
+                facts_accurate=payload.facts_accurate,
+                units_correct=payload.units_correct,
+                unjustified_conclusions_found=payload.unjustified_conclusions_found,
+                cross_agent_consistent=payload.cross_agent_consistent,
+                red_flags_identified=payload.red_flags_identified,
+                strategy_aligns_with_inputs=payload.strategy_aligns_with_inputs,
+                created_at=now_utc,
+                updated_at=now_utc,
+            )
+            eff_db.add(review)
+        else:
+            review.status = payload.status.value
+            review.reviewer_id = payload.reviewer_id.strip() if payload.reviewer_id else review.reviewer_id
+            review.reviewed_at = now_utc if payload.status != ClinicalReviewStatus.NOT_REVIEWED else review.reviewed_at
+            review.notes = payload.notes
+            if payload.facts_accurate is not None:
+                review.facts_accurate = payload.facts_accurate
+            if payload.units_correct is not None:
+                review.units_correct = payload.units_correct
+            if payload.unjustified_conclusions_found is not None:
+                review.unjustified_conclusions_found = payload.unjustified_conclusions_found
+            if payload.cross_agent_consistent is not None:
+                review.cross_agent_consistent = payload.cross_agent_consistent
+            if payload.red_flags_identified is not None:
+                review.red_flags_identified = payload.red_flags_identified
+            if payload.strategy_aligns_with_inputs is not None:
+                review.strategy_aligns_with_inputs = payload.strategy_aligns_with_inputs
+            review.updated_at = now_utc
+
+        eff_db.commit()
+        eff_db.refresh(review)
+        return ClinicalReviewResponse.model_validate(review)
 
 
 # ==============================================================================
@@ -555,6 +690,17 @@ _ORGAN_SYSTEMS = [
     ("integumentary", "Integumentary System"),
 ]
 
+_ORGAN_ALIASES: Dict[str, List[str]] = {
+    "cardiovascular": ["cardiovascular", "cvs"],
+    "respiratory": ["respiratory", "resp"],
+    "nervous": ["nervous", "cns"],
+    "musculoskeletal": ["musculoskeletal", "msk"],
+    "gastrointestinal": ["gastrointestinal", "gi_tract", "gi"],
+    "immune": ["immune", "blood", "hemo"],
+    "endocrine": ["endocrine", "endo"],
+    "integumentary": ["integumentary", "kidneys", "renal", "skin"],
+}
+
 
 @router.get(
     "/api/v1/admin/audit/patients/{patient_id}/preview/{cycle_id}",
@@ -566,6 +712,7 @@ def get_patient_preview(
     cycle_id: str,
     request: Request,
     stage: Optional[str] = Query(None, description="Optional stage filter"),
+    source: Optional[str] = Query(None, description="Optional audit data source identifier"),
     db: Session = Depends(get_db),
     admin_session: ServiceAdminSession = Depends(require_service_admin_session),
     audit_service: AuditTrailService = Depends(get_audit_trail_service),
@@ -577,228 +724,248 @@ def get_patient_preview(
     - Doctor referral banner & Safe documents
     - 4-Stage trace: Gemini Verbatim -> SERVER_ONLY -> CLIENT_FACING -> Flutter View
     """
-    clean_pat = audit_service.validate_identifier(patient_id, "patient_id")
-    clean_cyc = audit_service.validate_identifier(cycle_id, "cycle_id")
+    with get_effective_audit_context(source, db, audit_service) as (eff_db, eff_audit):
+        clean_pat = eff_audit.validate_identifier(patient_id, "patient_id")
+        clean_cyc = eff_audit.validate_identifier(cycle_id, "cycle_id")
 
-    # 1. Fetch cycle
-    cycle = db.scalar(
-        select(MedicalCycle).where(
-            MedicalCycle.cycle_id == clean_cyc,
-            MedicalCycle.patient_id == clean_pat,
+        # 1. Fetch cycle
+        cycle = eff_db.scalar(
+            select(MedicalCycle).where(
+                MedicalCycle.cycle_id == clean_cyc,
+                MedicalCycle.patient_id == clean_pat,
+            )
         )
-    )
 
-    # 2. Fetch all reports for this cycle
-    reports = db.scalars(
-        select(ModelReport).where(ModelReport.cycle_id == clean_cyc)
-    ).all()
+        # 2. Fetch all reports for this cycle
+        reports = eff_db.scalars(
+            select(ModelReport).where(ModelReport.cycle_id == clean_cyc)
+        ).all()
 
-    client_reports = [r for r in reports if r.privacy_level == PrivacyLevel.CLIENT_FACING.value]
-    server_reports = [r for r in reports if r.privacy_level == PrivacyLevel.SERVER_ONLY.value]
+        client_reports = [r for r in reports if r.privacy_level == PrivacyLevel.CLIENT_FACING.value]
+        server_reports = [r for r in reports if r.privacy_level == PrivacyLevel.SERVER_ONLY.value]
 
-    # Map reports by type and system
-    client_by_type = {r.report_type: r for r in client_reports}
+        # Map reports by type and system
+        client_by_type = {r.report_type: r for r in client_reports}
 
-    # 3. Overall report
-    overall_rep = None
-    for cand in (
-        "user_overall_report",
-        "primary_consilium_overall",
-        "weekly_consilium_overall",
-        "neo_overall",
-        "lab_revision_overall",
-    ):
-        if cand in client_by_type:
-            overall_rep = client_by_type[cand]
-            break
-    if not overall_rep and client_reports:
-        # Fallback to the latest version client report
-        overall_rep = max(client_reports, key=lambda r: (r.version, r.created_at))
-
-    overall_dict = None
-    if overall_rep:
-        overall_dict = {
-            "report_id": overall_rep.report_id,
-            "cycle_id": overall_rep.cycle_id,
-            "report_type": overall_rep.report_type,
-            "version": overall_rep.version,
-            "model": overall_rep.model,
-            "content": overall_rep.content,
-            "created_at": overall_rep.created_at.isoformat(),
-        }
-
-    # 4. Map 8 Organ States
-    organ_states: List[OrganStateSummary] = []
-    system_reports_dict: Dict[str, Dict[str, Any]] = {}
-
-    for sys_key, sys_title in _ORGAN_SYSTEMS:
-        # Look for system report
-        sys_rep = None
-        for r in client_reports:
-            rtype = r.report_type.lower()
-            rcontent = r.content or {}
-            if (
-                rtype == f"{sys_key}_user"
-                or rtype == f"user_system_{sys_key}"
-                or f"_{sys_key}" in rtype
-                or rcontent.get("system_key") == sys_key
-            ):
-                sys_rep = r
+        # 3. Overall report
+        overall_rep = None
+        for cand in (
+            "user_overall_report",
+            "weekly_user_overall_report",
+            "primary_consilium_overall",
+            "weekly_consilium_overall",
+            "neo_overall",
+            "lab_revision_overall",
+        ):
+            if cand in client_by_type:
+                overall_rep = client_by_type[cand]
                 break
+        if not overall_rep and client_reports:
+            # Fallback to the latest version client report
+            overall_rep = max(client_reports, key=lambda r: (r.version, r.created_at))
 
-        if sys_rep:
-            cnt = sys_rep.content or {}
-            title = cnt.get("title") or sys_title
-            summary = cnt.get("summary") or ""
-            highlights = cnt.get("highlights") or []
-            metrics = cnt.get("metrics") or {}
-            def_score = metrics.get("deficiency_score")
-            if def_score is None:
-                def_score = 1 if "attention" in summary.lower() else (2 if "critical" in summary.lower() or "spike" in summary.lower() else 0)
+        overall_dict = None
+        if overall_rep:
+            overall_dict = {
+                "report_id": overall_rep.report_id,
+                "cycle_id": overall_rep.cycle_id,
+                "report_type": overall_rep.report_type,
+                "version": overall_rep.version,
+                "model": overall_rep.model,
+                "content": overall_rep.content,
+                "created_at": overall_rep.created_at.isoformat(),
+            }
 
-            if def_score >= 2 or "critical" in summary.lower() or "spike" in summary.lower():
-                status_val = "critical"
-                color_val = "#EF4444"  # Red
-            elif def_score == 1 or "attention" in summary.lower() or "alert" in summary.lower():
-                status_val = "attention"
-                color_val = "#F59E0B"  # Amber
-            else:
-                status_val = "nominal"
-                color_val = "#10B981"  # Green
+        # 4. Map 8 Organ States
+        organ_states: List[OrganStateSummary] = []
+        system_reports_dict: Dict[str, Dict[str, Any]] = {}
 
-            organ_state = OrganStateSummary(
-                system_key=sys_key,
-                title=title,
-                status=status_val,
-                color=color_val,
-                deficiency_score=int(def_score),
-                summary=summary,
-                highlights=highlights,
-                metrics=metrics,
-                report_id=sys_rep.report_id,
-                version=sys_rep.version,
-            )
-            organ_states.append(organ_state)
-            system_reports_dict[sys_key] = cnt
-        else:
-            organ_states.append(
-                OrganStateSummary(
+        for sys_key, sys_title in _ORGAN_SYSTEMS:
+            match_keys = _ORGAN_ALIASES.get(sys_key, [sys_key])
+            sys_rep = None
+            for r in client_reports:
+                rtype = r.report_type.lower()
+                rcontent = r.content or {}
+                sk = str(rcontent.get("system_key", "")).lower()
+                if (
+                    any(k in rtype for k in match_keys)
+                    or any(k == sk for k in match_keys)
+                ):
+                    sys_rep = r
+                    break
+
+            if sys_rep:
+                cnt = sys_rep.content or {}
+                title = cnt.get("title") or sys_title
+                summary = cnt.get("summary") or ""
+                highlights = cnt.get("highlights") or [
+                    e.get("summary")
+                    for e in cnt.get("entries", [])
+                    if isinstance(e, dict) and e.get("summary")
+                ][:3]
+                metrics = cnt.get("metrics") or {}
+                def_score = metrics.get("deficiency_score")
+                if def_score is None:
+                    def_score = 1 if any(w in summary.lower() for w in ("attention", "elevated", "alert")) else (2 if any(w in summary.lower() for w in ("critical", "spike", "severe")) else 0)
+
+                if def_score >= 2 or "critical" in summary.lower() or "spike" in summary.lower():
+                    status_val = "critical"
+                    color_val = "#EF4444"  # Red
+                elif def_score == 1 or "attention" in summary.lower() or "elevated" in summary.lower() or "alert" in summary.lower():
+                    status_val = "attention"
+                    color_val = "#F59E0B"  # Amber
+                else:
+                    status_val = "nominal"
+                    color_val = "#10B981"  # Green
+
+                organ_state = OrganStateSummary(
                     system_key=sys_key,
-                    title=sys_title,
-                    status="nominal",
-                    color="#38BDF8",  # Cyan neon
-                    deficiency_score=0,
-                    summary="No active observations reported for this organ system in this stage.",
-                    highlights=[],
-                    metrics={},
-                    report_id=None,
-                    version=1,
+                    title=title,
+                    status=status_val,
+                    color=color_val,
+                    deficiency_score=int(def_score),
+                    summary=summary,
+                    highlights=highlights,
+                    metrics=metrics,
+                    report_id=sys_rep.report_id,
+                    version=sys_rep.version,
                 )
-            )
+                organ_states.append(organ_state)
+                system_reports_dict[sys_key] = cnt
+            else:
+                organ_states.append(
+                    OrganStateSummary(
+                        system_key=sys_key,
+                        title=sys_title,
+                        status="nominal",
+                        color="#38BDF8",  # Cyan neon
+                        deficiency_score=0,
+                        summary="No active observations reported for this organ system in this stage.",
+                        highlights=[],
+                        metrics={},
+                        report_id=None,
+                        version=1,
+                    )
+                )
 
-    # 5. Doctor Referral Banner & Documents
-    referral_status = None
-    referral_docs = []
+        # 5. Doctor Referral Banner & Documents
+        referral_status = None
+        referral_docs = []
 
-    # Check for referral decision or doctor document reports
-    for r in reports:
-        if r.report_type in ("referral_doctor_document", "client_doctor_document"):
-            cnt = r.content or {}
-            metrics = cnt.get("metrics") or {}
-            referral_docs.append({
-                "report_id": r.report_id,
-                "cycle_id": r.cycle_id,
-                "document_type": "referral_doctor_document",
-                "specialist_type": metrics.get("specialist_type") or "Cardiologist",
-                "urgency": metrics.get("urgency") or "routine",
-                "report_date": cnt.get("report_date") or r.created_at.strftime("%Y-%m-%d"),
-                "summary": cnt.get("summary") or "Health Observation Summary for Your Doctor",
-                "version": r.version,
-            })
-            if not referral_status:
-                referral_status = {
-                    "has_active_referral": True,
+        # Check for referral decision, lifecycle state, or doctor document reports
+        for r in reports:
+            if r.report_type in ("referral_doctor_document", "client_doctor_document"):
+                cnt = r.content or {}
+                metrics = cnt.get("metrics") or {}
+                summary_text = cnt.get("summary") or "Health Observation Summary for Your Doctor"
+                banner_reason = cnt.get("title") or "Doctor referral recommended based on clinical observations."
+                referral_docs.append({
+                    "report_id": r.report_id,
+                    "cycle_id": r.cycle_id,
+                    "document_type": "referral_doctor_document",
                     "specialist_type": metrics.get("specialist_type") or "Cardiologist",
                     "urgency": metrics.get("urgency") or "routine",
-                    "reason": cnt.get("summary") or "Doctor referral recommended based on multidisciplinary analysis.",
-                    "status": "document_ready",
-                    "report_id": r.report_id,
-                }
-        elif r.report_type == "referral_decision":
-            cnt = r.content or {}
-            if cnt.get("recommended"):
+                    "report_date": cnt.get("report_date") or r.created_at.strftime("%Y-%m-%d"),
+                    "summary": summary_text[:500] if len(summary_text) > 500 else summary_text,
+                    "version": r.version,
+                })
                 if not referral_status:
                     referral_status = {
                         "has_active_referral": True,
-                        "specialist_type": cnt.get("specialist_type") or "Specialist",
-                        "urgency": cnt.get("urgency") or "routine",
-                        "reason": cnt.get("reason") or "Referral recommended.",
-                        "status": "decision_recorded",
+                        "specialist_type": metrics.get("specialist_type") or "Cardiologist / Pulmonologist",
+                        "urgency": metrics.get("urgency") or "routine",
+                        "reason": banner_reason,
+                        "status": "document_ready",
                         "report_id": r.report_id,
                     }
+            elif r.report_type == "referral_lifecycle_state":
+                cnt = r.content or {}
+                if cnt.get("status") in ("active", "ready", "delivered", "escalated"):
+                    specs = ", ".join(cnt.get("target_specialties", [])) or "Specialist"
+                    reason_full = cnt.get("clinical_reason_for_referral") or "Doctor referral recommended."
+                    referral_status = {
+                        "has_active_referral": True,
+                        "specialist_type": specs,
+                        "urgency": cnt.get("urgency") or "routine",
+                        "reason": reason_full[:180] + ("..." if len(reason_full) > 180 else ""),
+                        "status": cnt.get("status"),
+                        "report_id": r.report_id,
+                    }
+            elif r.report_type == "referral_decision":
+                cnt = r.content or {}
+                if cnt.get("recommended"):
+                    if not referral_status:
+                        referral_status = {
+                            "has_active_referral": True,
+                            "specialist_type": cnt.get("specialist_type") or "Specialist",
+                            "urgency": cnt.get("urgency") or "routine",
+                            "reason": cnt.get("reason") or "Referral recommended.",
+                            "status": "decision_recorded",
+                            "report_id": r.report_id,
+                        }
 
-    # 6. Cascade status representation
-    cascade_status = {
-        "active_cycle_id": clean_cyc,
-        "has_active_cycle": cycle is not None and cycle.status == "active",
-        "cycle_status": cycle.status if cycle else "unknown",
-        "has_preparatory_anamnesis": any(r.report_type.startswith("preparatory_anamnesis") for r in server_reports),
-        "is_primary_consilium_completed": any(r.report_type in ("user_overall_report", "primary_consilium_overall") for r in client_reports),
-        "has_active_referral": referral_status is not None,
-        "referral_status": referral_status,
-        "is_neo_reassessment": bool(cycle and getattr(cycle, "is_neo_reassessment", False)),
-    }
-
-    # 7. 4-Stage Trace Data Comparison
-    trace_data = {}
-    calls = audit_service.list_calls(patient_id=clean_pat, cycle_id=clean_cyc)
-    sample_call = None
-    if calls:
-        # Prioritize master/chief or latest
-        sample_call = next((c for c in reversed(calls) if "pro" in c.model_role or "master" in c.stage), calls[-1])
-        full_call = audit_service.get_call(sample_call.call_id)
-        if full_call:
-            trace_data["gemini_raw_verbatim"] = full_call.raw_response_text
-            trace_data["gemini_model_name"] = full_call.model_name
-            trace_data["gemini_latency_ms"] = full_call.latency_ms
-            trace_data["call_id"] = full_call.call_id
-
-    # Server only representation
-    if server_reports:
-        latest_server = server_reports[-1]
-        trace_data["server_only_report"] = {
-            "report_id": latest_server.report_id,
-            "report_type": latest_server.report_type,
-            "content": latest_server.content,
+        # 6. Cascade status representation
+        cascade_status = {
+            "active_cycle_id": clean_cyc,
+            "has_active_cycle": cycle is not None and cycle.status == "active",
+            "cycle_status": cycle.status if cycle else "unknown",
+            "has_preparatory_anamnesis": any(r.report_type.startswith("preparatory_anamnesis") for r in server_reports),
+            "is_primary_consilium_completed": any(r.report_type in ("user_overall_report", "weekly_user_overall_report", "primary_consilium_overall") for r in client_reports),
+            "has_active_referral": referral_status is not None,
+            "referral_status": referral_status,
+            "is_neo_reassessment": bool(cycle and getattr(cycle, "is_neo_reassessment", False)),
         }
 
-    # Client facing representation
-    if overall_rep:
-        trace_data["client_facing_report"] = {
-            "report_id": overall_rep.report_id,
-            "report_type": overall_rep.report_type,
-            "content": overall_rep.content,
-        }
-        trace_data["flutter_view_data"] = {
-            "rendered_title": overall_rep.content.get("title"),
-            "rendered_summary": overall_rep.content.get("summary"),
-            "rendered_highlights": overall_rep.content.get("highlights", []),
-            "rendered_metrics": overall_rep.content.get("metrics", {}),
-            "rendered_date": overall_rep.content.get("report_date"),
-        }
+        # 7. 4-Stage Trace Data Comparison
+        trace_data = {}
+        calls = eff_audit.list_calls(patient_id=clean_pat, cycle_id=clean_cyc)
+        sample_call = None
+        if calls:
+            # Prioritize master/chief or latest
+            sample_call = next((c for c in reversed(calls) if "pro" in c.model_role or "master" in c.stage), calls[-1])
+            full_call = eff_audit.get_call(sample_call.call_id)
+            if full_call:
+                trace_data["gemini_raw_verbatim"] = full_call.raw_response_text
+                trace_data["gemini_model_name"] = full_call.model_name
+                trace_data["gemini_latency_ms"] = full_call.latency_ms
+                trace_data["call_id"] = full_call.call_id
 
-    return PatientPreviewResponse(
-        patient_id=clean_pat,
-        cycle_id=clean_cyc,
-        active_stage=stage or "consilium_view",
-        cascade_status=cascade_status,
-        overall_report=overall_dict,
-        system_reports=system_reports_dict,
-        referral_status=referral_status,
-        referral_documents=referral_docs,
-        organ_states=organ_states,
-        trace_comparison=trace_data,
-    )
+        # Server only representation
+        if server_reports:
+            latest_server = server_reports[-1]
+            trace_data["server_only_report"] = {
+                "report_id": latest_server.report_id,
+                "report_type": latest_server.report_type,
+                "content": latest_server.content,
+            }
+
+        # Client facing representation
+        if overall_rep:
+            trace_data["client_facing_report"] = {
+                "report_id": overall_rep.report_id,
+                "report_type": overall_rep.report_type,
+                "content": overall_rep.content,
+            }
+            trace_data["flutter_view_data"] = {
+                "rendered_title": overall_rep.content.get("title"),
+                "rendered_summary": overall_rep.content.get("summary"),
+                "rendered_highlights": overall_rep.content.get("highlights", []),
+                "rendered_metrics": overall_rep.content.get("metrics", {}),
+                "rendered_date": overall_rep.content.get("report_date"),
+            }
+
+        return PatientPreviewResponse(
+            patient_id=clean_pat,
+            cycle_id=clean_cyc,
+            active_stage=stage or "consilium_view",
+            cascade_status=cascade_status,
+            overall_report=overall_dict,
+            system_reports=system_reports_dict,
+            referral_status=referral_status,
+            referral_documents=referral_docs,
+            organ_states=organ_states,
+            trace_comparison=trace_data,
+        )
 
 
 # ==============================================================================
@@ -813,6 +980,7 @@ def get_patient_preview(
 def get_patient_timeline(
     patient_id: str,
     request: Request,
+    source: Optional[str] = Query(None, description="Optional audit data source identifier"),
     db: Session = Depends(get_db),
     admin_session: ServiceAdminSession = Depends(require_service_admin_session),
     audit_service: AuditTrailService = Depends(get_audit_trail_service),
@@ -827,162 +995,191 @@ def get_patient_timeline(
     - Original Gemini LLM calls, latencies, retries, and errors
     - Medical quality reviews
     """
-    clean_pat = audit_service.validate_identifier(patient_id, "patient_id")
+    with get_effective_audit_context(source, db, audit_service) as (eff_db, eff_audit):
+        clean_pat = eff_audit.validate_identifier(patient_id, "patient_id")
 
-    # 1. Resolve all cycles for patient
-    db_cycles = db.scalars(
-        select(MedicalCycle).where(MedicalCycle.patient_id == clean_pat)
-    ).all()
-    cycle_ids = [c.cycle_id for c in db_cycles]
-    fs_cycles = audit_service.list_cycles(clean_pat)
-    all_cycles = sorted(list(set(cycle_ids + fs_cycles)))
-
-    events: List[UnifiedTimelineEvent] = []
-    anomaly_counts = {"delayed": 0, "duplicate": 0, "error": 0}
-
-    # 2. Ingest Health Measurements (Telemetry)
-    if cycle_ids:
-        measurements = db.scalars(
-            select(HealthMeasurement)
-            .where(HealthMeasurement.cycle_id.in_(cycle_ids))
-            .order_by(HealthMeasurement.measured_at.asc())
+        # 1. Resolve all cycles for patient
+        db_cycles = eff_db.scalars(
+            select(MedicalCycle).where(MedicalCycle.patient_id == clean_pat)
         ).all()
-        for m in measurements:
-            is_warning = bool(m.pulse and (m.pulse > 105 or m.pulse < 50))
+        cycle_ids = [c.cycle_id for c in db_cycles]
+        fs_cycles = eff_audit.list_cycles(clean_pat)
+        all_cycles = sorted(list(set(cycle_ids + fs_cycles)))
+
+        events: List[UnifiedTimelineEvent] = []
+        anomaly_counts = {"delayed": 0, "duplicate": 0, "error": 0}
+
+        # 2. Ingest Health Measurements (Telemetry)
+        if cycle_ids:
+            measurements = eff_db.scalars(
+                select(HealthMeasurement)
+                .where(HealthMeasurement.cycle_id.in_(cycle_ids))
+                .order_by(HealthMeasurement.measured_at.asc())
+            ).all()
+            for m in measurements:
+                is_warning = bool(m.pulse and (m.pulse > 105 or m.pulse < 50))
+                events.append(
+                    UnifiedTimelineEvent(
+                        event_id=f"meas_{m.id}",
+                        category="TELEMETRY",
+                        title=f"Telemetry Point ({m.source})",
+                        description=f"Pulse: {m.pulse or 'N/A'} bpm, BP: {m.systolic or 'N/A'}/{m.diastolic or 'N/A'} mmHg, SpO2: {m.spo2 or 'N/A'}%, Phase: {m.phase}",
+                        virtual_time=m.measured_at.isoformat() if m.measured_at else None,
+                        execution_time_utc=m.ingested_at.isoformat() if m.ingested_at else datetime.now(timezone.utc).isoformat(),
+                        status="WARNING" if is_warning else "SUCCESS",
+                        details={"pulse": m.pulse, "bp": f"{m.systolic}/{m.diastolic}", "phase": m.phase},
+                    )
+                )
+
+        # 3. Ingest Workout Sessions
+        if cycle_ids:
+            workouts = eff_db.scalars(
+                select(WorkoutSession)
+                .where(WorkoutSession.cycle_id.in_(cycle_ids))
+                .order_by(WorkoutSession.created_at.asc())
+            ).all()
+            for w in workouts:
+                events.append(
+                    UnifiedTimelineEvent(
+                        event_id=f"workout_{w.session_id}",
+                        category="WORKOUT",
+                        title=f"Workout Session ({w.status.upper()})",
+                        description=f"Session {w.session_id}: Anomaly detected at {w.anomaly_detected_at.strftime('%H:%M:%S') if w.anomaly_detected_at else 'N/A'}",
+                        virtual_time=w.anomaly_detected_at.isoformat() if w.anomaly_detected_at else None,
+                        execution_time_utc=w.created_at.isoformat() if w.created_at else datetime.now(timezone.utc).isoformat(),
+                        status="SUCCESS",
+                        details={"session_id": w.session_id, "status": w.status},
+                    )
+                )
+
+        # 4. Ingest Model Reports
+        if cycle_ids:
+            reports = eff_db.scalars(
+                select(ModelReport)
+                .where(ModelReport.cycle_id.in_(cycle_ids))
+                .order_by(ModelReport.created_at.asc())
+            ).all()
+            for r in reports:
+                rtype = r.report_type.lower()
+                cat = "REPORT_PERSISTED"
+                if "primary_consilium" in rtype or "primary" in rtype:
+                    cat = "PRIMARY_CONSILIUM"
+                elif "weekly" in rtype:
+                    cat = "WEEKLY_CONSILIUM"
+                elif "lab_revision" in rtype:
+                    cat = "LAB_REVISION"
+                elif "neo" in rtype:
+                    cat = "NEO_REASSESSMENT"
+                elif "referral" in rtype:
+                    cat = "EMERGENCY" if "urgent" in str(r.content).lower() else "REFERRAL"
+                elif "athena" in rtype:
+                    cat = "ATHENA_CHAT"
+                elif "wellness" in rtype:
+                    cat = "WELLNESS"
+                elif "ocr" in rtype or "vision" in rtype or "ecg" in rtype:
+                    cat = "VISION_OCR"
+
+                cnt = r.content or {}
+                events.append(
+                    UnifiedTimelineEvent(
+                        event_id=f"rep_{r.report_id}",
+                        category=cat,
+                        title=f"{cat}: {r.report_type} (v{r.version}, {r.privacy_level})",
+                        description=(cnt.get("summary") or cnt.get("title") or f"Model: {r.model}")[:140],
+                        virtual_time=str(cnt.get("report_date")) if cnt.get("report_date") else None,
+                        execution_time_utc=r.created_at.isoformat() if r.created_at else datetime.now(timezone.utc).isoformat(),
+                        status="SUCCESS",
+                        report_id=r.report_id,
+                        details={"model": r.model, "privacy_level": r.privacy_level, "version": r.version},
+                    )
+                )
+
+        # 5. Ingest Audit Calls from Filesystem
+        calls = eff_audit.list_calls(patient_id=clean_pat)
+        seen_calls: Dict[str, datetime] = {}
+        for c in calls:
+            anomalies = []
+            is_error = c.status not in ("SUCCESS", "UNKNOWN")
+            is_delayed = c.latency_ms > 30000.0
+
+            if is_delayed:
+                anomalies.append("delayed")
+                anomaly_counts["delayed"] += 1
+            if is_error:
+                anomalies.append("inference_error")
+                anomaly_counts["error"] += 1
+
+            # Duplicate check: same stage and sprint within 30 seconds
+            dt_call = None
+            try:
+                dt_call = datetime.fromisoformat(c.created_at_utc.replace("Z", "+00:00"))
+            except Exception:
+                pass
+
+            key = f"{c.stage}_{c.sprint_id or ''}"
+            if key in seen_calls and dt_call:
+                diff = abs((dt_call - seen_calls[key]).total_seconds())
+                if diff < 30.0:
+                    anomalies.append("duplicate")
+                    anomaly_counts["duplicate"] += 1
+            if dt_call:
+                seen_calls[key] = dt_call
+
+            status_val = "ERROR" if is_error else ("WARNING" if is_delayed else "SUCCESS")
+
             events.append(
                 UnifiedTimelineEvent(
-                    event_id=f"meas_{m.id}",
-                    category="TELEMETRY",
-                    title=f"Telemetry Point ({m.source})",
-                    description=f"Pulse: {m.pulse or 'N/A'} bpm, BP: {m.systolic or 'N/A'}/{m.diastolic or 'N/A'} mmHg, SpO2: {m.spo2 or 'N/A'}%, Phase: {m.phase}",
-                    virtual_time=m.measured_at.isoformat() if m.measured_at else None,
-                    execution_time_utc=m.ingested_at.isoformat() if m.ingested_at else datetime.now(timezone.utc).isoformat(),
-                    status="WARNING" if is_warning else "SUCCESS",
-                    details={"pulse": m.pulse, "bp": f"{m.systolic}/{m.diastolic}", "phase": m.phase},
+                    event_id=f"call_{c.call_id}",
+                    category="AI_INFERENCE",
+                    title=f"AI Inference: {c.model_role} ({c.model_name})",
+                    description=f"Stage: {c.stage}, Latency: {c.latency_ms:.1f}ms, Status: {c.status}",
+                    virtual_time=None,
+                    execution_time_utc=c.created_at_utc,
+                    status=status_val,
+                    call_id=c.call_id,
+                    report_id=c.report_id,
+                    anomalies=anomalies,
+                    details={
+                        "latency_ms": c.latency_ms,
+                        "model_name": c.model_name,
+                        "stage": c.stage,
+                        "review_status": c.review_status,
+                    },
                 )
             )
 
-    # 3. Ingest Workout Sessions
-    if cycle_ids:
-        workouts = db.scalars(
-            select(WorkoutSession)
-            .where(WorkoutSession.cycle_id.in_(cycle_ids))
-            .order_by(WorkoutSession.created_at.asc())
+        # 6. Ingest Clinical AI Reviews
+        reviews = eff_db.scalars(
+            select(ClinicalAIAuditReview).where(ClinicalAIAuditReview.patient_id == clean_pat)
         ).all()
-        for w in workouts:
+        for rev in reviews:
             events.append(
                 UnifiedTimelineEvent(
-                    event_id=f"workout_{w.session_id}",
-                    category="WORKOUT",
-                    title=f"Workout Session ({w.status.upper()})",
-                    description=f"Session {w.session_id}: Anomaly detected at {w.anomaly_detected_at.strftime('%H:%M:%S') if w.anomaly_detected_at else 'N/A'}",
-                    virtual_time=w.anomaly_detected_at.isoformat() if w.anomaly_detected_at else None,
-                    execution_time_utc=w.created_at.isoformat() if w.created_at else datetime.now(timezone.utc).isoformat(),
-                    status="SUCCESS",
-                    details={"session_id": w.session_id, "status": w.status},
+                    event_id=f"rev_{rev.review_id}",
+                    category="CLINICAL_REVIEW",
+                    title=f"Clinical Audit Review: {rev.status}",
+                    description=f"Reviewer: {rev.reviewer_id or 'Unassigned'}. Notes: {rev.notes or 'None'}",
+                    virtual_time=None,
+                    execution_time_utc=rev.updated_at.isoformat() if rev.updated_at else datetime.now(timezone.utc).isoformat(),
+                    status="SUCCESS" if rev.status == ClinicalReviewStatus.REVIEWED_PASS.value else "WARNING",
+                    call_id=rev.call_id,
+                    details={"reviewer_id": rev.reviewer_id, "notes": rev.notes},
                 )
             )
 
-    # 4. Ingest Model Reports
-    if cycle_ids:
-        reports = db.scalars(
-            select(ModelReport)
-            .where(ModelReport.cycle_id.in_(cycle_ids))
-            .order_by(ModelReport.created_at.asc())
-        ).all()
-        for r in reports:
-            rtype = r.report_type.lower()
-            cat = "REPORT_PERSISTED"
-            if "primary_consilium" in rtype or "primary" in rtype:
-                cat = "PRIMARY_CONSILIUM"
-            elif "weekly" in rtype:
-                cat = "WEEKLY_CONSILIUM"
-            elif "lab_revision" in rtype:
-                cat = "LAB_REVISION"
-            elif "neo" in rtype:
-                cat = "NEO_REASSESSMENT"
-            elif "referral" in rtype:
-                cat = "EMERGENCY" if "urgent" in str(r.content).lower() else "REFERRAL"
-            elif "athena" in rtype:
-                cat = "ATHENA_CHAT"
-            elif "wellness" in rtype:
-                cat = "WELLNESS"
-            elif "ocr" in rtype or "vision" in rtype or "ecg" in rtype:
-                cat = "VISION_OCR"
+        # 7. Chronological Sort (by virtual_time if present, else execution_time_utc)
+        def _sort_key(ev: UnifiedTimelineEvent):
+            t_str = ev.virtual_time or ev.execution_time_utc
+            return t_str
 
-            cnt = r.content or {}
-            events.append(
-                UnifiedTimelineEvent(
-                    event_id=f"rep_{r.report_id}",
-                    category=cat,
-                    title=f"{cat}: {r.report_type} (v{r.version}, {r.privacy_level})",
-                    description=(cnt.get("summary") or cnt.get("title") or f"Model: {r.model}")[:140],
-                    virtual_time=str(cnt.get("report_date")) if cnt.get("report_date") else None,
-                    execution_time_utc=r.created_at.isoformat() if r.created_at else datetime.now(timezone.utc).isoformat(),
-                    status="SUCCESS",
-                    report_id=r.report_id,
-                    details={"model": r.model, "privacy_level": r.privacy_level, "version": r.version},
-                )
-            )
+        events.sort(key=_sort_key)
 
-    # 5. Ingest Audit Calls from Filesystem
-    calls = audit_service.list_calls(patient_id=clean_pat)
-    seen_calls: Dict[str, datetime] = {}
-    for c in calls:
-        anomalies = []
-        is_error = c.status not in ("SUCCESS", "UNKNOWN")
-        is_delayed = c.latency_ms > 30000.0
-
-        if is_delayed:
-            anomalies.append("delayed")
-            anomaly_counts["delayed"] += 1
-        if is_error:
-            anomalies.append("inference_error")
-            anomaly_counts["error"] += 1
-
-        # Duplicate check: same stage and sprint within 30 seconds
-        dt_call = None
-        try:
-            dt_call = datetime.fromisoformat(c.created_at_utc.replace("Z", "+00:00"))
-        except Exception:
-            pass
-
-        key = f"{c.stage}_{c.sprint_id or ''}"
-        if key in seen_calls and dt_call:
-            diff = abs((dt_call - seen_calls[key]).total_seconds())
-            if diff < 30.0:
-                anomalies.append("duplicate")
-                anomaly_counts["duplicate"] += 1
-        if dt_call:
-            seen_calls[key] = dt_call
-
-        status_val = "ERROR" if is_error else ("WARNING" if is_delayed else "SUCCESS")
-
-        events.append(
-            UnifiedTimelineEvent(
-                event_id=f"call_{c.call_id}",
-                category="AI_INFERENCE",
-                title=f"AI Inference: {c.model_role} ({c.model_name})",
-                description=f"Stage: {c.stage}, Latency: {c.latency_ms:.1f}ms, Status: {c.status}",
-                virtual_time=None,
-                execution_time_utc=c.created_at_utc,
-                status=status_val,
-                call_id=c.call_id,
-                report_id=c.report_id,
-                anomalies=anomalies,
-                details={
-                    "latency_ms": c.latency_ms,
-                    "model_name": c.model_name,
-                    "stage": c.stage,
-                    "review_status": c.review_status,
-                },
-            )
+        return UnifiedTimelineResponse(
+            patient_id=clean_pat,
+            total_events=len(events),
+            events=events,
+            anomaly_counts=anomaly_counts,
         )
-
-    # 6. Ingest Clinical AI Reviews
-    reviews = db.scalars(
-        select(ClinicalAIAuditReview).where(ClinicalAIAuditReview.patient_id == clean_pat)
-    ).all()
     for rev in reviews:
         events.append(
             UnifiedTimelineEvent(
@@ -1535,6 +1732,13 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
   <!-- Global Selectors Bar -->
   <div class="selectors-bar">
     <div class="select-group">
+      <label for="dataSourceSelect">0. Data Source:</label>
+      <select id="dataSourceSelect" onchange="onSourceChanged()">
+        <option value="synthetic_patient_001">Synthetic Patient 001 (Live Simulation)</option>
+        <option value="default">Historical Test Vault (aegis_private_vault.db)</option>
+      </select>
+    </div>
+    <div class="select-group">
       <label for="patientSelect">1. Patient:</label>
       <select id="patientSelect" onchange="onPatientSelected()">
         <option value="">Loading patients...</option>
@@ -1774,6 +1978,7 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
   <script>
     // State management
     let state = {
+      dataSource: 'synthetic_patient_001',
       activeView: 'inferences',
       activeInspectorTab: 'prompt',
       activeTraceTab: 'comparison',
@@ -1803,6 +2008,10 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
       options.headers = options.headers || {};
       if (state.token) {
         options.headers['Authorization'] = 'Bearer ' + state.token;
+      }
+      if (state.dataSource && !url.includes('source=')) {
+        const sep = url.includes('?') ? '&' : '?';
+        url = `${url}${sep}source=${encodeURIComponent(state.dataSource)}`;
       }
       const res = await fetch(url, options);
       if (res.status === 401 || res.status === 403) {
@@ -1861,7 +2070,8 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
         sessionStorage.setItem('aegis_admin_token', state.token);
         updateAuthBadge(true);
         closeLoginModal();
-        loadPatients();
+        await loadSources();
+        await loadPatients();
       } catch (err) {
         alert('Network error during login: ' + err);
       }
@@ -1880,6 +2090,45 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
       else if (viewName === 'inferences') loadCalls();
     }
 
+    async function loadSources() {
+      try {
+        const res = await apiRequest('/api/v1/admin/audit/sources');
+        if (!res.ok) return;
+        const sources = await res.json();
+        const sel = document.getElementById('dataSourceSelect');
+        sel.innerHTML = '';
+        let chosen = '';
+        sources.forEach(s => {
+          if (!s.available) return;
+          const opt = document.createElement('option');
+          opt.value = s.id;
+          opt.textContent = s.name;
+          sel.appendChild(opt);
+          if (s.is_default && !chosen) chosen = s.id;
+        });
+        if (!chosen && sel.options.length > 0) chosen = sel.options[0].value;
+        if (chosen) {
+          state.dataSource = chosen;
+          sel.value = chosen;
+        }
+      } catch (err) {
+        console.error('Error loading data sources:', err);
+      }
+    }
+
+    async function onSourceChanged() {
+      state.dataSource = document.getElementById('dataSourceSelect').value;
+      state.patientId = '';
+      state.cycleId = '';
+      state.stage = '';
+      state.callId = '';
+      state.calls = [];
+      state.currentCallDetail = null;
+      document.getElementById('cycleSelect').innerHTML = '<option value="">Select patient first</option>';
+      document.getElementById('stageSelect').innerHTML = '<option value="">All Stages</option>';
+      await loadPatients();
+    }
+
     async function loadPatients() {
       const res = await apiRequest('/api/v1/admin/audit/patients');
       if (!res.ok) return;
@@ -1890,7 +2139,10 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
       patients.forEach(p => {
         sel.innerHTML += `<option value="${escapeHtml(p)}">${escapeHtml(p)}</option>`;
       });
-      if (patients.length > 0) {
+      if (patients.includes('patient_synth_001')) {
+        sel.value = 'patient_synth_001';
+        onPatientSelected();
+      } else if (patients.length > 0) {
         sel.value = patients[0];
         onPatientSelected();
       }
@@ -2236,7 +2488,15 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
       renderTimeline();
     }
 
-    function renderTimeline() {
+    let timelineDisplayLimit = 300;
+
+    function renderTimeline(loadMore = false) {
+      if (!loadMore) {
+        timelineDisplayLimit = 300;
+      } else {
+        timelineDisplayLimit += 300;
+      }
+
       const catFilter = document.getElementById('timelineCategoryFilter').value;
       const anomFilter = document.getElementById('timelineAnomalyFilter').value;
 
@@ -2254,11 +2514,12 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
         return;
       }
 
-      filtered.forEach(ev => {
+      const toRender = filtered.slice(0, timelineDisplayLimit);
+      toRender.forEach(ev => {
         const div = document.createElement('div');
         let cardClass = 'timeline-card';
-        if (ev.status === 'ERROR' || ev.anomalies.includes('error')) cardClass += ' error';
-        else if (ev.status === 'WARNING' || ev.anomalies.includes('delayed') || ev.anomalies.includes('duplicate')) cardClass += ' delayed';
+        if (ev.status === 'ERROR' || (ev.anomalies && ev.anomalies.includes('error'))) cardClass += ' error';
+        else if (ev.status === 'WARNING' || (ev.anomalies && (ev.anomalies.includes('delayed') || ev.anomalies.includes('duplicate')))) cardClass += ' delayed';
 
         div.className = cardClass;
         div.innerHTML = `
@@ -2275,13 +2536,22 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
         `;
         list.appendChild(div);
       });
+
+      if (filtered.length > timelineDisplayLimit) {
+        const moreContainer = document.createElement('div');
+        moreContainer.style.textAlign = 'center';
+        moreContainer.style.padding = '16px';
+        moreContainer.innerHTML = `<button class="btn btn-secondary" onclick="renderTimeline(true)">Show More Events (Displaying ${toRender.length} of ${filtered.length})</button>`;
+        list.appendChild(moreContainer);
+      }
     }
 
     // Auto-initialize on load
-    window.addEventListener('DOMContentLoaded', () => {
+    window.addEventListener('DOMContentLoaded', async () => {
       if (state.token) {
         updateAuthBadge(true);
-        loadPatients();
+        await loadSources();
+        await loadPatients();
       } else {
         updateAuthBadge(false);
       }

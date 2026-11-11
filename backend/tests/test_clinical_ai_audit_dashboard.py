@@ -1316,4 +1316,46 @@ class TestAdminInspectionDashboardAPI:
         res_api = client.get("/api/v1/admin/audit/patients")
         assert res_api.status_code == 403
 
+    def test_audit_sources_and_synthetic_patient_switching(self):
+        """Verifies multi-source switching between synthetic patient live data and default vault."""
+        client = TestClient(app)
+        app.dependency_overrides[require_service_admin_session] = lambda: ServiceAdminSession()
+
+        try:
+            # 1. Fetch available data sources
+            res_src = client.get("/api/v1/admin/audit/sources")
+            assert res_src.status_code == 200
+            sources = res_src.json()
+            source_ids = [s["id"] for s in sources]
+            assert "default" in source_ids
+
+            # 2. If synthetic_patient_001 is present, verify live inspection without data mixing
+            if "synthetic_patient_001" in source_ids:
+                res_patients = client.get("/api/v1/admin/audit/patients?source=synthetic_patient_001")
+                assert res_patients.status_code == 200
+                synth_patients = res_patients.json()
+                assert "patient_synth_001" in synth_patients
+
+                # Cycles
+                res_cycles = client.get("/api/v1/admin/audit/patients/patient_synth_001/cycles?source=synthetic_patient_001")
+                assert res_cycles.status_code == 200
+                cycles = res_cycles.json()
+                assert any(c["cycle_id"] == "cycle_synth_001" for c in cycles)
+
+                # Calls
+                res_calls = client.get("/api/v1/admin/audit/cycles/cycle_synth_001/calls?source=synthetic_patient_001")
+                assert res_calls.status_code == 200
+                calls = res_calls.json()
+                assert len(calls) > 0
+
+                # Preview
+                res_prev = client.get("/api/v1/admin/audit/patients/patient_synth_001/preview/cycle_synth_001?source=synthetic_patient_001")
+                assert res_prev.status_code == 200
+                prev = res_prev.json()
+                assert len(prev["organ_states"]) == 8
+                assert prev["cascade_status"]["has_active_referral"] is True
+        finally:
+            app.dependency_overrides.clear()
+
+
 
