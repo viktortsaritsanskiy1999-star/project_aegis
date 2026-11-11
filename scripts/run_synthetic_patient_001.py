@@ -38,6 +38,7 @@ from app.database import Base
 from app.models.model_report import ModelReport
 from app.models.patient import Patient
 from app.models.medical_cycle import MedicalCycle
+from app.models.health_measurement import HealthMeasurement
 from app.repositories.cycle_repository import MedicalCycleRepository
 from app.repositories.measurement_repository import HealthMeasurementRepository
 from app.repositories.report_repository import ModelReportRepository
@@ -59,6 +60,7 @@ from app.services.wellness_daily_service import (
     WellnessTriggerType,
 )
 from app.services.athena_daily_journal_service import (
+    ATHENA_CLINICAL_LOG_REPORT_TYPE,
     ATHENA_DAILY_JOURNAL_REPORT_TYPE,
     AthenaDailyJournalService,
 )
@@ -511,125 +513,193 @@ async def run_simulation(
     logger.info("--- [DAY 1] Initial Ingestion & Preparatory Consilium ---")
 
     with SessionFactory() as db:
-        # Create Patient and Medical Cycle
-        p_row = Patient(patient_id=patient_id, status="active", created_at=clock.now())
-        c_row = MedicalCycle(cycle_id=cycle_id, patient_id=patient_id, status="active", started_at=clock.now(), created_at=clock.now())
-        db.add_all([p_row, c_row])
+        # Create Patient and Medical Cycle if not present
+        p_row = db.get(Patient, patient_id)
+        if not p_row:
+            p_row = Patient(patient_id=patient_id, status="active", created_at=clock.now())
+            db.add(p_row)
+        c_row = db.get(MedicalCycle, cycle_id)
+        if not c_row:
+            c_row = MedicalCycle(cycle_id=cycle_id, patient_id=patient_id, status="active", started_at=clock.now(), created_at=clock.now())
+            db.add(c_row)
         db.commit()
 
         # Save Patient Timezone (Europe/Moscow, UTC+3)
         w_service = WellnessDailyService(db=db, gateway=gateway, now_provider=clock.now)
         w_service.save_patient_timezone(cycle_id, "Europe/Moscow")
 
-    # Step 1: Submit M1 Questionnaire Answers
-    logger.info("Submitting M1 Questionnaire Answers...")
-    m1_answers = build_patient_001_anamnesis()
     with SessionFactory() as db:
         primary_svc = PrimaryConsiliumService(db=db, gateway=gateway, now_provider=clock.now)
-        anamnesis_resp = await primary_svc.process_anamnesis_intake(cycle_id=cycle_id, answers=m1_answers)
-        logger.info(f"M1 Anamnesis intake completed (version {anamnesis_resp.intake_version})")
+        is_primary_completed = primary_svc.is_primary_consilium_completed(cycle_id)
 
-    # Step 2: Upload ECG Image (ECG_01.jpg)
-    logger.info("Uploading ECG_01.jpg via EcgVisionService...")
-    ecg_path = patient_dir / "01_Primary_Day_1" / "ECG_01.jpg"
+    if not is_primary_completed:
+        # Step 1: Submit M1 Questionnaire Answers
+        logger.info("Submitting M1 Questionnaire Answers...")
+        m1_answers = build_patient_001_anamnesis()
+        with SessionFactory() as db:
+            primary_svc = PrimaryConsiliumService(db=db, gateway=gateway, now_provider=clock.now)
+            anamnesis_resp = await primary_svc.process_anamnesis_intake(cycle_id=cycle_id, answers=m1_answers)
+            logger.info(f"M1 Anamnesis intake completed (version {anamnesis_resp.intake_version})")
+
+        # Step 2: Upload ECG Image (ECG_01.jpg)
+        logger.info("Uploading ECG_01.jpg via EcgVisionService...")
+        ecg_path = patient_dir / "01_Primary_Day_1" / "ECG_01.jpg"
+        with SessionFactory() as db:
+            ecg_file = UploadFile(file=io.BytesIO(ecg_path.read_bytes()), filename="ECG_01.jpg", headers={"content-type": "image/jpeg"})
+            ecg_svc = EcgVisionService(db=db, gateway=gateway, now_provider=clock.now)
+            ecg_resp = await ecg_svc.process_ecg_image(cycle_id=cycle_id, file=ecg_file)
+            logger.info(f"ECG Vision extraction completed (type: {ecg_resp.recording_type}, quality: {ecg_resp.recording_quality})")
+
+        # Step 3: Upload Initial Lab Images (LAB_01.jpg to LAB_04.jpg)
+        logger.info("Uploading LAB_01.jpg to LAB_04.jpg via LabVisionOcrService...")
+        lab_files = []
+        for i in range(1, 5):
+            lp = patient_dir / "01_Primary_Day_1" / f"LAB_0{i}.jpg"
+            lab_files.append(UploadFile(file=io.BytesIO(lp.read_bytes()), filename=f"LAB_0{i}.jpg", headers={"content-type": "image/jpeg"}))
+
+        with SessionFactory() as db:
+            lab_ocr_svc = LabVisionOcrService(db=db, gateway=gateway, now_provider=clock.now)
+            lab_ocr_resp = await lab_ocr_svc.process_lab_images(cycle_id=cycle_id, files=lab_files)
+            logger.info(f"Lab Vision OCR completed (extracted markers: {lab_ocr_resp.extracted_count})")
+
+        # Step 4: Run Primary Consilium (8 Specialists -> Deputy -> Chief Physician)
+        logger.info("Executing Primary Consilium Cascade (8 Organ Specialists + Deputy + Chief Physician)...")
+        with SessionFactory() as db:
+            primary_svc = PrimaryConsiliumService(db=db, gateway=gateway, now_provider=clock.now)
+            consilium_resp = await primary_svc.run_primary_consilium(cycle_id=cycle_id, mode=ConsiliumMode.INITIAL)
+            summary_str = consilium_resp.overall_report.content.get("summary", "") if (consilium_resp.overall_report and consilium_resp.overall_report.content) else "Completed"
+            logger.info(f"Primary Consilium completed! Master Summary: {str(summary_str)[:120]}...")
+
+    else:
+        logger.info("Primary Consilium is ALREADY completed in DB. Reusing existing reports seamlessly.")
+
+    # Ensure schedule anchor T0 is recorded
     with SessionFactory() as db:
-        ecg_file = UploadFile(file=io.BytesIO(ecg_path.read_bytes()), filename="ECG_01.jpg", headers={"content-type": "image/jpeg"})
-        ecg_svc = EcgVisionService(db=db, gateway=gateway, now_provider=clock.now)
-        ecg_resp = await ecg_svc.process_ecg_image(cycle_id=cycle_id, file=ecg_file)
-        logger.info(f"ECG Vision extraction completed (type: {ecg_resp.recording_type}, quality: {ecg_resp.recording_quality})")
-
-    # Step 3: Upload Initial Lab Images (LAB_01.jpg to LAB_04.jpg)
-    logger.info("Uploading LAB_01.jpg to LAB_04.jpg via LabVisionOcrService...")
-    lab_files = []
-    for i in range(1, 5):
-        lp = patient_dir / "01_Primary_Day_1" / f"LAB_0{i}.jpg"
-        lab_files.append(UploadFile(file=io.BytesIO(lp.read_bytes()), filename=f"LAB_0{i}.jpg", headers={"content-type": "image/jpeg"}))
-
-    with SessionFactory() as db:
-        lab_ocr_svc = LabVisionOcrService(db=db, gateway=gateway, now_provider=clock.now)
-        lab_ocr_resp = await lab_ocr_svc.process_lab_images(cycle_id=cycle_id, files=lab_files)
-        logger.info(f"Lab Vision OCR completed (extracted markers: {lab_ocr_resp.extracted_count})")
-
-    # Step 4: Run Primary Consilium (8 Specialists -> Deputy -> Chief Physician)
-    logger.info("Executing Primary Consilium Cascade (8 Organ Specialists + Deputy + Chief Physician)...")
-    with SessionFactory() as db:
-        primary_svc = PrimaryConsiliumService(db=db, gateway=gateway, now_provider=clock.now)
-        consilium_resp = await primary_svc.run_primary_consilium(cycle_id=cycle_id, mode=ConsiliumMode.INITIAL)
-        logger.info(f"Primary Consilium completed! Master Summary: {consilium_resp.master_summary[:120]}...")
-
-        # Record schedule anchor T0
         consilium_w_svc = WeeklyConsiliumService(db=db, now_provider=clock.now)
         consilium_w_svc.record_schedule_anchor(
             cycle_id=cycle_id,
-            anchor_dt=clock.now(),
+            anchor_dt=datetime(2026, 11, 11, 4, 0, 0, tzinfo=timezone.utc),
             source="post_primary_greeting",
         )
 
     # Step 5: Send Initial Athena Companion Greeting
-    logger.info("Initializing Athena Companion Greeting...")
     with SessionFactory() as db:
-        athena_svc = AthenaChatService(db=db, gateway=gateway, now_provider=clock.now)
-        greeting_resp = await athena_svc.handle_turn(
-            patient_id=patient_id,
-            cycle_id=cycle_id,
-            request=AthenaChatRequest(
-                message=None,
-                event_type="first_planned_question",
-            ),
-        )
-        logger.info(f"Athena Initial Greeting: {greeting_resp.reply[:100]}...")
+        chat_reports = db.scalars(
+            select(ModelReport).where(ModelReport.cycle_id == cycle_id, ModelReport.report_type.in_(["athena_chat_turn", "athena_chat_history"]))
+        ).all()
 
-    # Step 6: Patient Answers Athena's First Question (with delay)
-    clock.advance(hours=2) # 06:00 UTC = 09:00 local
-    logger.info("Patient responding to Athena's first greeting...")
-    patient_day1_reply = await generate_patient_reply(
-        gateway=gateway,
-        athena_question=greeting_resp.reply,
-        context_note="Первый день в программе, чувствую себя бодро.",
-        is_dry_run=dry_run,
-    )
-    with SessionFactory() as db:
-        athena_svc = AthenaChatService(db=db, gateway=gateway, now_provider=clock.now)
-        await athena_svc.handle_turn(
-            patient_id=patient_id,
-            cycle_id=cycle_id,
-            request=AthenaChatRequest(
-                message=patient_day1_reply,
-                event_type="routine_answer",
-            ),
-        )
-        logger.info(f"Patient replied: {patient_day1_reply}")
+    if not chat_reports:
+        logger.info("Initializing Athena Companion Greeting...")
+        with SessionFactory() as db:
+            athena_svc = AthenaChatService(db=db, gateway=gateway, now_provider=clock.now)
+            greeting_resp = await athena_svc.handle_turn(
+                patient_id=patient_id,
+                cycle_id=cycle_id,
+                request=AthenaChatRequest(
+                    message=None,
+                    event_type="first_planned_question",
+                ),
+            )
+            logger.info(f"Athena Initial Greeting: {greeting_resp.reply[:100]}...")
 
-    # Ingest Day 1 Telemetry (144 measurements)
-    with SessionFactory() as db:
-        telem_count = generate_daily_telemetry(
-            db=db,
-            cycle_id=cycle_id,
-            day_start_dt=clock.now() - timedelta(hours=2),
-            calendar_day=1,
-            is_workout_day=False,
-            is_soccer_day=False,
+        # Step 6: Patient Answers Athena's First Question (with delay)
+        clock.advance(hours=2) # 06:00 UTC = 09:00 local
+        logger.info("Patient responding to Athena's first greeting...")
+        patient_day1_reply = await generate_patient_reply(
+            gateway=gateway,
+            athena_question=greeting_resp.reply,
+            context_note="Первый день в программе, чувствую себя бодро.",
+            is_dry_run=dry_run,
         )
-        simulation_state["total_measurements_ingested"] += telem_count
+        with SessionFactory() as db:
+            athena_svc = AthenaChatService(db=db, gateway=gateway, now_provider=clock.now)
+            await athena_svc.handle_turn(
+                patient_id=patient_id,
+                cycle_id=cycle_id,
+                request=AthenaChatRequest(
+                    message=patient_day1_reply,
+                    event_type="routine_answer",
+                ),
+            )
+            logger.info(f"Patient replied: {patient_day1_reply}")
+    else:
+        logger.info("Athena Day 1 initial greeting already completed in DB.")
 
-    # Day 1 completes: Advance clock to Day 2 07:05 UTC (24h + 5m mark)
-    clock.advance(hours=22, minutes=5)
     with SessionFactory() as db:
-        journal_svc = AthenaDailyJournalService(db=db, gateway=gateway, now_provider=clock.now)
-        j1, saved_j1, _ = await journal_svc.close_daily_journal(
-            cycle_id=cycle_id,
-            calendar_week=1,
-            calendar_day=1,
-            as_of=clock.now(),
-        )
-        logger.info(f"Day 1 Athena Daily Journal closed (status: {j1.athena_clinical_assessment.status})")
+        j1_exists = db.scalars(
+            select(ModelReport).where(ModelReport.cycle_id == cycle_id, ModelReport.report_type == f"{ATHENA_DAILY_JOURNAL_REPORT_TYPE}_w1_d1")
+        ).first()
+
+    if not j1_exists:
+        # Ingest Day 1 Telemetry (144 measurements)
+        with SessionFactory() as db:
+            telem_count = generate_daily_telemetry(
+                db=db,
+                cycle_id=cycle_id,
+                day_start_dt=clock.now() - timedelta(hours=2),
+                calendar_day=1,
+                is_workout_day=False,
+                is_soccer_day=False,
+            )
+            simulation_state["total_measurements_ingested"] += telem_count
+
+        # Day 1 completes: Advance clock to Day 2 07:05 UTC (24h + 5m mark)
+        clock.advance(hours=22, minutes=5)
+        with SessionFactory() as db:
+            journal_svc = AthenaDailyJournalService(db=db, gateway=gateway, now_provider=clock.now)
+            j1, saved_j1, _ = await journal_svc.close_daily_journal(
+                cycle_id=cycle_id,
+                calendar_week=1,
+                calendar_day=1,
+                as_of=clock.now(),
+            )
+            logger.info(f"Day 1 Athena Daily Journal closed (status: {j1.athena_clinical_assessment.status})")
+    else:
+        logger.info("Day 1 Athena Daily Journal already closed in DB.")
+        clock.advance(hours=24, minutes=5)
 
     simulation_state["days_completed"] = 1
 
     # ==========================================================================
     # DAY-BY-DAY AUTONOMOUS SIMULATION LOOP (Days 2 to Target End Day)
     # ==========================================================================
-    current_day = 2
+    # Resolve starting day dynamically based on completed daily journals
+    with SessionFactory() as db:
+        completed_days = []
+        for d in range(1, max_days + 1):
+            w = ((d - 1) // 7) + 1
+            s_d = ((d - 1) % 7) + 1
+            j = db.scalars(
+                select(ModelReport).where(
+                    ModelReport.cycle_id == cycle_id,
+                    ModelReport.report_type == f"{ATHENA_DAILY_JOURNAL_REPORT_TYPE}_w{w}_d{s_d}",
+                )
+            ).first()
+            if j:
+                completed_days.append(d)
+
+        last_done_day = max(completed_days) if completed_days else 1
+        current_day = last_done_day + 1 if last_done_day < max_days else max_days
+        simulation_state["days_completed"] = last_done_day
+
+        weekly_svc = WeeklyConsiliumService(db=db, gateway=gateway, now_provider=clock.now)
+        existing_ref = weekly_svc.get_referral_lifecycle_state(cycle_id)
+        if existing_ref:
+            simulation_state["referral_issued"] = True
+            ref_origin_sprint = existing_ref.get("origin_sprint_number") or 1
+            simulation_state["referral_day"] = ref_origin_sprint * 7
+            simulation_state["referral_timestamp_utc"] = existing_ref.get("created_at_utc")
+            simulation_state["referral_reason"] = existing_ref.get("clinical_reason_for_referral")
+            simulation_state["referral_specialty"] = ", ".join(existing_ref.get("target_specialties", []))
+            simulation_state["referral_initiating_model"] = existing_ref.get("referral_source")
+            if simulation_state["referral_day"] <= 46:
+                simulation_state["target_end_day"] = simulation_state["referral_day"] + post_referral_days
+            else:
+                simulation_state["target_end_day"] = 60
+            logger.info(f"Existing referral detected from DB on Day {simulation_state['referral_day']}! Target end day: {simulation_state['target_end_day']}")
+
+    clock.set(start_utc + timedelta(days=current_day - 1))
+    logger.info(f"Resuming autonomous simulation from Day {current_day} (Clock: {clock.now().isoformat()})")
 
     while current_day <= simulation_state["target_end_day"]:
         cal_week = ((current_day - 1) // 7) + 1
@@ -643,136 +713,206 @@ async def run_simulation(
 
         # 1. Morning Telemetry Ingestion (07:00 UTC = 10:00 MSK)
         with SessionFactory() as db:
-            telem_count = generate_daily_telemetry(
-                db=db,
-                cycle_id=cycle_id,
-                day_start_dt=clock.now(),
-                calendar_day=current_day,
-                is_workout_day=is_workout,
-                is_soccer_day=is_soccer,
-            )
-            simulation_state["total_measurements_ingested"] += telem_count
+            existing_telem = db.scalars(
+                select(HealthMeasurement).where(
+                    HealthMeasurement.cycle_id == cycle_id,
+                    HealthMeasurement.measured_at >= clock.now() - timedelta(minutes=5),
+                    HealthMeasurement.measured_at <= clock.now() + timedelta(hours=24),
+                )
+            ).first()
+            if not existing_telem:
+                telem_count = generate_daily_telemetry(
+                    db=db,
+                    cycle_id=cycle_id,
+                    day_start_dt=clock.now(),
+                    calendar_day=current_day,
+                    is_workout_day=is_workout,
+                    is_soccer_day=is_soccer,
+                )
+                simulation_state["total_measurements_ingested"] += telem_count
+            else:
+                logger.info(f"Telemetry for Day {current_day} already ingested.")
 
         # 2. Morning Wellness Daily Run (07:30 UTC)
         clock.advance(minutes=30)
         with SessionFactory() as db:
-            wellness_svc = WellnessDailyService(db=db, gateway=gateway, now_provider=clock.now)
-            w_rep, is_new = await wellness_svc.process_wellness_for_day(
-                cycle_id=cycle_id,
-                calendar_week=cal_week,
-                calendar_day=current_day,
-                as_of=clock.now(),
+            w_existing = db.scalars(
+                select(ModelReport).where(
+                    ModelReport.cycle_id == cycle_id,
+                    ModelReport.report_type == WELLNESS_DAILY_REPORT_TYPE,
+                )
+            ).all()
+            w_done = any(
+                ((r.content or {}).get("window") or {}).get("calendar_week") == cal_week
+                and ((r.content or {}).get("window") or {}).get("calendar_day") == sprint_day
+                for r in w_existing
             )
-            logger.info(f"Wellness Daily Day {current_day}: status={w_rep.status.value}, trigger={w_rep.trigger.value if w_rep.trigger else 'N/A'}")
+            if not w_done:
+                wellness_svc = WellnessDailyService(db=db, gateway=gateway, now_provider=clock.now)
+                w_rep, is_new = await wellness_svc.process_wellness_for_day(
+                    cycle_id=cycle_id,
+                    calendar_week=cal_week,
+                    calendar_day=sprint_day,
+                    as_of=clock.now(),
+                )
+                logger.info(f"Wellness Daily Day {current_day} (W{cal_week}D{sprint_day}): status={w_rep.status.value}, trigger={w_rep.trigger.value if w_rep.trigger else 'N/A'}")
+            else:
+                logger.info(f"Wellness Daily Day {current_day} (W{cal_week}D{sprint_day}) already exists in DB.")
 
         # 3. Athena Proactive / Routine Chat Turn (08:00 UTC)
         clock.advance(minutes=30)
         with SessionFactory() as db:
-            athena_svc = AthenaChatService(db=db, gateway=gateway, now_provider=clock.now)
-            athena_turn_resp = await athena_svc.handle_turn(
-                patient_id=patient_id,
-                cycle_id=cycle_id,
-                request=AthenaChatRequest(
-                    message=None,
-                    event_type="daily_pulse",
-                ),
+            chat_turns_today = db.scalars(
+                select(ModelReport).where(
+                    ModelReport.cycle_id == cycle_id,
+                    ModelReport.report_type == ATHENA_CLINICAL_LOG_REPORT_TYPE,
+                    ModelReport.created_at >= clock.now() - timedelta(hours=2),
+                    ModelReport.created_at <= clock.now() + timedelta(hours=22),
+                )
+            ).all()
+
+        if len(chat_turns_today) < 2:
+            with SessionFactory() as db:
+                athena_svc = AthenaChatService(db=db, gateway=gateway, now_provider=clock.now)
+                athena_turn_resp = await athena_svc.handle_turn(
+                    patient_id=patient_id,
+                    cycle_id=cycle_id,
+                    request=AthenaChatRequest(
+                        message=None,
+                        event_type="daily_pulse",
+                    ),
+                )
+                athena_msg = athena_turn_resp.reply or ""
+                logger.info(f"Athena Question: {athena_msg[:100]}...")
+
+            # 4. Patient Delayed Reply (10:00 UTC, 2 hours later)
+            clock.advance(hours=2)
+            patient_context = f"День {current_day}."
+            if is_workout:
+                patient_context += " Вечером планирую пойти в спортзал."
+            if is_soccer:
+                patient_context += " Сегодня играл в футбол, немного тянет поясницу."
+            if simulation_state["referral_issued"]:
+                patient_context += " К врачу пока не ходил: много работы на удаленке, чувствую себя нормально, схожу на днях."
+
+            patient_reply = await generate_patient_reply(
+                gateway=gateway,
+                athena_question=athena_msg,
+                context_note=patient_context,
+                is_dry_run=dry_run,
             )
-            athena_msg = athena_turn_resp.reply or ""
-            logger.info(f"Athena Question: {athena_msg[:100]}...")
 
-        # 4. Patient Delayed Reply (10:00 UTC, 2 hours later)
-        clock.advance(hours=2)
-        patient_context = f"День {current_day}."
-        if is_workout:
-            patient_context += " Вечером планирую пойти в спортзал."
-        if is_soccer:
-            patient_context += " Сегодня играл в футбол, немного тянет поясницу."
-        if simulation_state["referral_issued"]:
-            patient_context += " К врачу пока не ходил: много работы на удаленке, чувствую себя нормально, схожу на днях."
-
-        patient_reply = await generate_patient_reply(
-            gateway=gateway,
-            athena_question=athena_msg,
-            context_note=patient_context,
-            is_dry_run=dry_run,
-        )
-
-        with SessionFactory() as db:
-            athena_svc = AthenaChatService(db=db, gateway=gateway, now_provider=clock.now)
-            await athena_svc.handle_turn(
-                patient_id=patient_id,
-                cycle_id=cycle_id,
-                request=AthenaChatRequest(
-                    message=patient_reply,
-                    event_type="routine_answer",
-                ),
-            )
-            logger.info(f"Patient Replied: {patient_reply}")
+            with SessionFactory() as db:
+                athena_svc = AthenaChatService(db=db, gateway=gateway, now_provider=clock.now)
+                await athena_svc.handle_turn(
+                    patient_id=patient_id,
+                    cycle_id=cycle_id,
+                    request=AthenaChatRequest(
+                        message=patient_reply,
+                        event_type="routine_answer",
+                    ),
+                )
+                logger.info(f"Patient Replied: {patient_reply}")
+        else:
+            logger.info(f"Athena chat turns for Day {current_day} already exist in DB.")
+            clock.advance(hours=2)
 
         # 5. SPECIAL EVENT: Day 10 New Lab Images Upload & Lab Revision
         if current_day == 10:
-            logger.info(">>> [DAY 10 SPECIAL EVENT] Uploading LAB_05.jpg & LAB_06.jpg for Lab Revision! <<<")
-            lab10_files = [
-                UploadFile(file=io.BytesIO((patient_dir / "02_Lab_Revision_Day_10" / "LAB_05.jpg").read_bytes()), filename="LAB_05.jpg", headers={"content-type": "image/jpeg"}),
-                UploadFile(file=io.BytesIO((patient_dir / "02_Lab_Revision_Day_10" / "LAB_06.jpg").read_bytes()), filename="LAB_06.jpg", headers={"content-type": "image/jpeg"}),
-            ]
             with SessionFactory() as db:
-                lab_ocr_svc = LabVisionOcrService(db=db, gateway=gateway, now_provider=clock.now)
-                l10_resp = await lab_ocr_svc.process_lab_images(cycle_id=cycle_id, files=lab10_files)
-                logger.info(f"Day 10 Vision OCR Ingested: {l10_resp.extracted_count} markers. Has unreviewed: {l10_resp.has_unreviewed_lab_changes}")
-
-                # Run Lab Revision Consilium (Deputy + Chief Physician)
                 lab_rev_svc = LabRevisionConsiliumService(db=db, gateway=gateway, now_provider=clock.now)
-                rev_resp = await lab_rev_svc.run_lab_revision_consilium(cycle_id=cycle_id)
-                logger.info(f"Lab Revision Consilium executed! Synthesis: {rev_resp.synthesis_summary[:120]}...")
+                ledger_st = lab_rev_svc.get_lab_ledger_state(cycle_id)
+                has_day10_labs = (ledger_st.ledger_version >= 2)
+            if not has_day10_labs:
+                logger.info(">>> [DAY 10 SPECIAL EVENT] Uploading LAB_05.jpg & LAB_06.jpg for Lab Revision! <<<")
+                lab10_files = [
+                    UploadFile(file=io.BytesIO((patient_dir / "02_Lab_Revision_Day_10" / "LAB_05.jpg").read_bytes()), filename="LAB_05.jpg", headers={"content-type": "image/jpeg"}),
+                    UploadFile(file=io.BytesIO((patient_dir / "02_Lab_Revision_Day_10" / "LAB_06.jpg").read_bytes()), filename="LAB_06.jpg", headers={"content-type": "image/jpeg"}),
+                ]
+                with SessionFactory() as db:
+                    lab_ocr_svc = LabVisionOcrService(db=db, gateway=gateway, now_provider=clock.now)
+                    l10_resp = await lab_ocr_svc.process_lab_images(cycle_id=cycle_id, files=lab10_files)
+                    logger.info(f"Day 10 Vision OCR Ingested: {l10_resp.extracted_count} markers. Has unreviewed: {l10_resp.has_unreviewed_lab_changes}")
+
+                    # Run Lab Revision Consilium (Deputy + Chief Physician)
+                    lab_rev_svc = LabRevisionConsiliumService(db=db, gateway=gateway, now_provider=clock.now)
+                    rev_resp = await lab_rev_svc.run_lab_revision_consilium(cycle_id=cycle_id)
+                    logger.info(f"Lab Revision Consilium executed! Status: {rev_resp.evaluation_status}")
+            else:
+                logger.info("Day 10 Lab Revision already completed in DB.")
 
         # 6. Weekly Consilium (Every 7 Days: Day 7, Day 14, Day 21, etc.)
         if sprint_day == 7:
             logger.info(f">>> [WEEK {cal_week} CONSILIUM] 168-Hour Window Elapsed. Running Weekly Consilium! <<<")
             with SessionFactory() as db:
                 weekly_svc = WeeklyConsiliumService(db=db, gateway=gateway, now_provider=clock.now)
-                w_cons_resp = await weekly_svc.run_weekly_consilium(
-                    cycle_id=cycle_id,
-                    sprint_id=f"sprint_{cycle_id}_w{cal_week}",
-                )
-                logger.info(f"Weekly Consilium Week {cal_week} concluded! Summary: {w_cons_resp.overall_sprint_summary[:120]}...")
+                is_w_done = weekly_svc.is_weekly_consilium_completed(cycle_id, cal_week)
+                if not is_w_done:
+                    w_cons_resp = await weekly_svc.run_weekly_consilium(
+                        cycle_id=cycle_id,
+                        sprint_id=f"sprint_{cycle_id}_w{cal_week}",
+                    )
+                    logger.info(f"Weekly Consilium Week {cal_week} concluded! Sprint: {w_cons_resp.sprint_id}")
+                else:
+                    logger.info(f"Weekly Consilium Week {cal_week} already completed in DB.")
 
-        # 7. Check for Medical Referral Recommendation
+        # 7. Check for Medical Referral Recommendation & Document Generation
         with SessionFactory() as db:
             weekly_svc = WeeklyConsiliumService(db=db, gateway=gateway, now_provider=clock.now)
             ref_state = weekly_svc.get_referral_lifecycle_state(cycle_id)
 
-            if ref_state and not simulation_state["referral_issued"]:
-                # First referral detected!
-                simulation_state["referral_issued"] = True
-                simulation_state["referral_day"] = current_day
-                simulation_state["referral_timestamp_utc"] = clock.now().isoformat()
-                simulation_state["referral_reason"] = ref_state.get("clinical_reason_for_referral", "Medical evaluation recommended")
-                simulation_state["referral_specialty"] = ref_state.get("specialty_recommended", "Therapist / Cardiologist")
-                simulation_state["referral_initiating_model"] = ref_state.get("initiating_model", "gemini-4-argon")
+            if ref_state:
+                if not simulation_state["referral_issued"]:
+                    simulation_state["referral_issued"] = True
+                    simulation_state["referral_day"] = current_day
+                    simulation_state["referral_timestamp_utc"] = clock.now().isoformat()
+                    simulation_state["referral_reason"] = ref_state.get("clinical_reason_for_referral", "Medical evaluation recommended")
+                    simulation_state["referral_specialty"] = ", ".join(ref_state.get("target_specialties", [])) if ref_state.get("target_specialties") else "Therapist / Cardiologist"
+                    simulation_state["referral_initiating_model"] = ref_state.get("referral_source", "gemini-4-argon")
 
-                logger.warning("!" * 70)
-                logger.warning(f"[MEDICAL REFERRAL DETECTED ON DAY {current_day}]")
-                logger.warning(f"Reason: {simulation_state['referral_reason']}")
-                logger.warning(f"Specialty: {simulation_state['referral_specialty']}")
-                logger.warning("!" * 70)
+                    logger.warning("!" * 70)
+                    logger.warning(f"[MEDICAL REFERRAL DETECTED ON DAY {current_day}]")
+                    logger.warning(f"Reason: {simulation_state['referral_reason']}")
+                    logger.warning(f"Specialty: {simulation_state['referral_specialty']}")
+                    logger.warning("!" * 70)
 
-                # Generate Official Referral Doctor Document
-                ref_doc_svc = ReferralDocumentService(db=db, gateway=gateway, now_provider=clock.now)
-                doc_res = await ref_doc_svc.generate_referral_document(cycle_id=cycle_id, patient_id=patient_id)
-                logger.info(f"Doctor Observation Document generated! ID: {doc_res.document_id}")
+                    if current_day <= 46:
+                        simulation_state["target_end_day"] = current_day + post_referral_days
+                        logger.info(f"Rule B applied: Target end day updated to Day {simulation_state['target_end_day']} (Day {current_day} + 14 days)")
+                    else:
+                        simulation_state["target_end_day"] = 60
+                        logger.info(f"Rule C applied: Target end day set to Day 60 (late referral on Day {current_day})")
 
-                # Apply User Rules for Stop Condition:
-                # If referral issued <= Day 46: observe patient for 14 post-referral days!
-                # If referral issued > Day 46: continue up to Day 60!
-                if current_day <= 46:
-                    simulation_state["target_end_day"] = current_day + post_referral_days
-                    logger.info(f"Rule B applied: Target end day updated to Day {simulation_state['target_end_day']} (Day {current_day} + 14 days)")
-                else:
-                    simulation_state["target_end_day"] = 60
-                    logger.info(f"Rule C applied: Target end day set to Day 60 (late referral on Day {current_day})")
+                # Generate Official Referral Doctor Document if not ready
+                if ref_state.get("document_generation_state") != "ready" or not ref_state.get("document_report_id"):
+                    ref_doc_svc = ReferralDocumentService(db=db, gateway=gateway, now_provider=clock.now)
+                    doc_res = await ref_doc_svc.generate_referral_document(cycle_id=cycle_id, patient_id=patient_id)
+                    logger.info(f"Doctor Observation Document generated! ID: {doc_res.document_report_id}")
 
-        # 8. Check Stop Conditions
+        # 8. Advance Clock to Next Day 07:05 UTC (Close Daily Journal for Current Day)
+        clock.advance(hours=21, minutes=5)
+        with SessionFactory() as db:
+            j_existing = db.scalars(
+                select(ModelReport).where(
+                    ModelReport.cycle_id == cycle_id,
+                    ModelReport.report_type == f"{ATHENA_DAILY_JOURNAL_REPORT_TYPE}_w{cal_week}_d{sprint_day}",
+                )
+            ).first()
+            if not j_existing:
+                journal_svc = AthenaDailyJournalService(db=db, gateway=gateway, now_provider=clock.now)
+                j_rec, _, _ = await journal_svc.close_daily_journal(
+                    cycle_id=cycle_id,
+                    calendar_week=cal_week,
+                    calendar_day=sprint_day,
+                    as_of=clock.now(),
+                )
+                logger.info(f"Day {current_day} (W{cal_week}D{sprint_day}) Athena Daily Journal closed (status: {j_rec.athena_clinical_assessment.status})")
+            else:
+                logger.info(f"Day {current_day} (W{cal_week}D{sprint_day}) Athena Daily Journal already exists in DB.")
+
+        simulation_state["days_completed"] = current_day
+
+        # 9. Check Stop Conditions
         if simulation_state["referral_issued"] and current_day >= simulation_state["target_end_day"]:
             simulation_state["stop_reason"] = "STOP_B_POST_REFERRAL_WINDOW_COMPLETED"
             logger.info(f"Simulation completed 14 post-referral days on Day {current_day}. Stopping scenario!")
@@ -783,19 +923,6 @@ async def run_simulation(
             logger.info("Maximum 60 virtual days reached without early referral stop. Stopping scenario!")
             break
 
-        # 9. Advance Clock to Next Day 07:05 UTC (Close Daily Journal for Current Day)
-        clock.advance(hours=21, minutes=5)
-        with SessionFactory() as db:
-            journal_svc = AthenaDailyJournalService(db=db, gateway=gateway, now_provider=clock.now)
-            j_rec, _, _ = await journal_svc.close_daily_journal(
-                cycle_id=cycle_id,
-                calendar_week=cal_week,
-                calendar_day=current_day,
-                as_of=clock.now(),
-            )
-            logger.info(f"Day {current_day} Athena Daily Journal closed (status: {j_rec.athena_clinical_assessment.status})")
-
-        simulation_state["days_completed"] = current_day
         current_day += 1
 
     # End of Simulation Loop

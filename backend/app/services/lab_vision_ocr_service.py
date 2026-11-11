@@ -320,6 +320,7 @@ class LabVisionOcrService:
                     response_schema=VisionOcrModelOutput,
                     model=GeminiModelRole.VISION,
                     inline_images=inline_images,
+                    max_output_tokens=32768,
                 )
 
                 doc_metadata = parsed_output.document_metadata

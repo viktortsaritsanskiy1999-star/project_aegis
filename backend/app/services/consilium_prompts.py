@@ -1053,6 +1053,21 @@ YOUR MANDATORY CLINICAL DIRECTIVES:
    - Do NOT confuse blood and urine markers with similar names (e.g. "protein_urine" vs "total_protein_serum").
    - Multi-page correlation: If multiple pages belong to the same study, link them together while strictly respecting row-level sample dates.
 
+5. MANDATORY JSON ROOT STRUCTURE:
+   The top-level JSON must have EXACTLY two keys:
+   {{
+     "document_metadata": {{
+       "sample_date": "<YYYY-MM-DD or null>",
+       "issue_date": "<YYYY-MM-DD or null>",
+       "laboratory_name": "<string or null>",
+       "page_count": {page_count},
+       "notes": "<string or null>"
+     }},
+     "markers": [
+       ... array of recognized indicators ...
+     ]
+   }}
+
 Output must conform strictly to the VisionOcrModelOutput JSON schema."""
 
 
@@ -1911,7 +1926,38 @@ MANDATORY CLINICAL & LEGAL SAFETY DIRECTIVES:
    - Never prescribe medications or dosages.
 
 CRITICAL JSON FORMATTING RULE:
-Respond ONLY with a valid JSON object strictly conforming to the ReferralDoctorDocumentOutput schema. Do not use unescaped double quotes inside JSON string values."""
+Respond ONLY with a valid JSON object strictly conforming to the ReferralDoctorDocumentOutput schema. Do not use unescaped double quotes inside JSON string values.
+
+MANDATORY JSON RESPONSE FORMAT:
+{{
+  "document_title": "AEGIS — HEALTH OBSERVATION SUMMARY FOR YOUR DOCTOR",
+  "informational_disclaimer": "This document is an informational health observation summary prepared by the Aegis Health Observation System solely to assist discussion between the patient and a licensed healthcare professional. It is not an official medical discharge summary, prescription, or confirmed diagnosis.",
+  "recommended_specialties": ["Cardiologist / Lipidologist", "Pulmonologist / Internist (General Practitioner)"],
+  "consultation_urgency": "routine",
+  "executive_summary_for_patient": "High-level summary for the patient explaining why an outpatient consultation is recommended.",
+  "patient_and_observation_period": "Detailed description of observation period, baseline anamnesis context, and data sources.",
+  "reason_for_in_person_consultation": "Detailed clinical rationale for consultation based on consilium findings.",
+  "objective_measurements_and_examination_results": [
+    "Objective finding 1 (labs, vitals, ECG)",
+    "Objective finding 2"
+  ],
+  "timeline_of_reported_symptoms_and_changes": [
+    "Patient self-reported entry 1",
+    "Patient self-reported entry 2"
+  ],
+  "important_patterns_and_unresolved_concerns": [
+    "Observed pattern or concern 1",
+    "Observed pattern or concern 2"
+  ],
+  "ai_observations_requiring_verification": [
+    "AI preliminary hypothesis 1 for clinician verification",
+    "AI preliminary hypothesis 2"
+  ],
+  "questions_and_examinations_for_clinician": [
+    "Question or potential examination 1 for discussion with clinician",
+    "Question or potential examination 2"
+  ]
+}}"""
 
 
 # ==============================================================================

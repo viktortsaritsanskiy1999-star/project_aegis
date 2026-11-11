@@ -350,7 +350,7 @@ class GeminiGateway:
         model: GeminiModelRole | str = GeminiModelRole.FLASH,
         system_instruction: Optional[str] = None,
         response_mime_type: str = "application/json",
-        max_output_tokens: int = 8192,
+        max_output_tokens: int = 16384,
         inline_images: Optional[List[Dict[str, str]]] = None,
         contents: Optional[List[Dict[str, Any]]] = None,
         audit_context: Optional[AuditContext] = None,
@@ -531,16 +531,20 @@ class GeminiGateway:
                 ctx = audit_context or get_current_audit_context()
 
                 usage_metadata = payload.get("usageMetadata") if isinstance(payload, dict) else None
+                candidates = payload.get("candidates") if isinstance(payload, dict) else None
+                finish_reason = candidates[0].get("finishReason") if (candidates and isinstance(candidates, list) and isinstance(candidates[0], dict)) else None
+
                 diagnostic_info = None
                 if usage_metadata:
                     p_tok = usage_metadata.get("promptTokenCount", 0)
                     c_tok = usage_metadata.get("candidatesTokenCount", 0)
                     tot_tok = usage_metadata.get("totalTokenCount", 0)
                     cached_tok = usage_metadata.get("cachedContentTokenCount", 0)
-                    diagnostic_info = f"[USAGE] prompt={p_tok}, candidates={c_tok}, total={tot_tok}, cached={cached_tok}"
+                    diagnostic_info = f"[USAGE] prompt={p_tok}, candidates={c_tok}, total={tot_tok}, cached={cached_tok}, finish_reason={finish_reason}"
+                    self._last_diagnostic_info = diagnostic_info
                     if not hasattr(self, "usage_records") or self.usage_records is None:
                         self.usage_records = []
-                    self.usage_records.append({
+                    rec = {
                         "call_id": call_id,
                         "model_role": model.value if isinstance(model, GeminiModelRole) else str(model),
                         "model_name": resolved_model,
@@ -548,9 +552,19 @@ class GeminiGateway:
                         "candidates_tokens": c_tok,
                         "cached_tokens": cached_tok,
                         "total_tokens": tot_tok,
+                        "finish_reason": finish_reason,
                         "latency_ms": round(latency_ms, 2),
                         "stage": ctx.stage if ctx else "unknown",
-                    })
+                    }
+                    self.usage_records.append(rec)
+                    try:
+                        from pathlib import Path
+                        usage_log_file = Path("backend/data/synthetic_patient_001_gemini_usage.jsonl")
+                        usage_log_file.parent.mkdir(parents=True, exist_ok=True)
+                        with open(usage_log_file, "a", encoding="utf-8") as uf:
+                            uf.write(json.dumps(rec, ensure_ascii=False) + "\n")
+                    except Exception:
+                        pass
 
                 if not _skip_audit_record and self.is_audit_enabled():
                     self._record_audit_event(
@@ -601,7 +615,7 @@ class GeminiGateway:
         prompt: str,
         model: GeminiModelRole | str = GeminiModelRole.FLASH,
         system_instruction: Optional[str] = None,
-        max_output_tokens: int = 8192,
+        max_output_tokens: int = 16384,
         inline_images: Optional[List[Dict[str, str]]] = None,
         audit_context: Optional[AuditContext] = None,
         _skip_audit_record: bool = False,
@@ -692,6 +706,7 @@ class GeminiGateway:
             schema_name=None,
             validation_error=None,
             latency_ms=latency_ms,
+            diagnostic_log=getattr(self, "_last_diagnostic_info", None),
         )
         return parsed
 
@@ -701,7 +716,7 @@ class GeminiGateway:
         response_schema: Type[T],
         model: GeminiModelRole | str = GeminiModelRole.FLASH,
         system_instruction: Optional[str] = None,
-        max_output_tokens: int = 8192,
+        max_output_tokens: int = 16384,
         inline_images: Optional[List[Dict[str, str]]] = None,
         audit_context: Optional[AuditContext] = None,
     ) -> T:
@@ -821,6 +836,7 @@ class GeminiGateway:
             schema_name=response_schema.__name__,
             validation_error=None,
             latency_ms=latency_ms,
+            diagnostic_log=getattr(self, "_last_diagnostic_info", None),
         )
         return validated
 

@@ -99,9 +99,9 @@ class Settings(BaseSettings):
         alias="AEGIS_GEMINI_VISION_MODEL",
     )
     gemini_timeout_seconds: float = Field(
-        default=60.0,
+        default=180.0,
         ge=1.0,
-        le=300.0,
+        le=600.0,
         alias="AEGIS_GEMINI_TIMEOUT_SECONDS",
     )
     gemini_max_retries: int = Field(
