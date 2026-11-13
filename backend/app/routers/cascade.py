@@ -452,6 +452,11 @@ async def submit_lab_images_intake_endpoint(
             detail=str(exc),
         )
     except LabVisionValidationError as exc:
+        if exc.__cause__ and isinstance(exc.__cause__, GeminiGatewayError):
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail=f"Gemini Vision OCR extraction failed: {exc.__cause__}",
+            )
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=str(exc),

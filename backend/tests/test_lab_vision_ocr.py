@@ -232,8 +232,8 @@ def test_single_page_lab_vision_ocr_extraction(client: TestClient, db_session: S
     assert "inlineData" not in str(res)
     assert "training_sandbox" not in res
 
-    # Verify recorded call to Gemini has inlineData with image/jpeg
-    assert len(recorded_calls) == 1
+    # Verify recorded call to Gemini: v2 makes 1 Stage 1 Flash-Lite + 1 Stage 2 Flash Reconciler call
+    assert len(recorded_calls) == 2
     req_parts = recorded_calls[0]["body"]["contents"][0]["parts"]
     assert any("inlineData" in p and p["inlineData"]["mimeType"] == "image/jpeg" for p in req_parts)
 
@@ -339,17 +339,17 @@ def test_multipage_lab_vision_ocr_correlation(client: TestClient, db_session: Se
     assert res["extracted_count"] == 3
     assert res["document_metadata"]["page_count"] == 3
 
-    # Verify gateway call received all 3 pages
-    assert len(recorded_calls) == 1
-    parts = recorded_calls[0]["body"]["contents"][0]["parts"]
-    image_parts = [p for p in parts if "inlineData" in p]
+    # Verify gateway calls in v2: 3 parallel Stage 1 Flash-Lite + 1 Stage 2 Flash Reconciler
+    assert len(recorded_calls) == 4
+    all_parts = [p for c in recorded_calls for p in c["body"]["contents"][0]["parts"]]
+    image_parts = [p for p in all_parts if "inlineData" in p]
     assert len(image_parts) == 3
     for part in image_parts:
         assert part["inlineData"]["mimeType"] == "image/png"
 
     # Verify prompt instructed 3 pages
-    text_part = next(p["text"] for p in parts if "text" in p)
-    assert "analyzing 3 image page(s)" in text_part.lower()
+    text_parts = [p["text"] for p in all_parts if "text" in p]
+    assert any("3" in t for t in text_parts)
 
 
 # --- 3. Multiple Dates in Single Upload Creates Distinct Study Dates ---

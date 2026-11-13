@@ -425,7 +425,43 @@ class Stage7B3MockGateway:
             }
             self.recorded_calls.append(call_record)
 
-            # 1. Gemini Vision OCR
+            # 1. Gemini Vision OCR (v2 Stage 1 Flash-Lite, Stage 2 Flash Reconciler, and Legacy)
+            if (
+                "page-level vision ocr" in prompt.lower()
+                or "visionocrpageextraction" in prompt.lower()
+            ):
+                page_payload = {
+                    "page_number": 1,
+                    "source_filename": "blood_report_1.jpg",
+                    "laboratory_name": "InVitro Diagnostics",
+                    "page_sample_date": "2026-11-01",
+                    "page_issue_date": "2026-11-01",
+                    "order_id": "ORD-7B3-001",
+                    "markers": self.dynamic_ocr_markers,
+                }
+                return httpx.Response(200, json=_gemini_envelope(page_payload))
+
+            if (
+                "master laboratory document reconciler" in prompt.lower()
+                or "visionocrreconciliationoutput" in prompt.lower()
+                or "visionocrbatchreconciliationoutput" in prompt.lower()
+            ):
+                recon_payload = {
+                    "total_pages_reconciled": 1,
+                    "document_metadata": {
+                        "order_id": "ORD-7B3-001",
+                        "laboratory_name": "InVitro Diagnostics",
+                        "sample_date": "2026-11-01",
+                        "issue_date": "2026-11-01",
+                        "page_count": 1,
+                        "notes": "Verified laboratory document",
+                    },
+                    "study_linkages": [],
+                    "reconciled_markers": self.dynamic_ocr_markers,
+                    "reconciliation_notes": "Reconciled test report",
+                }
+                return httpx.Response(200, json=_gemini_envelope(recon_payload))
+
             if (
                 "vision" in url_path
                 or "visionocrmodeloutput" in prompt.lower()

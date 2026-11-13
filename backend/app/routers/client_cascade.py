@@ -538,6 +538,11 @@ async def submit_client_lab_document_intake(
         if isinstance(exc, (ConsiliumConcurrencyConflictError, ReportVersionConflictError)):
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
         if isinstance(exc, LabVisionValidationError):
+            if isinstance(exc.__cause__, GeminiGatewayError):
+                raise HTTPException(
+                    status_code=status.HTTP_502_BAD_GATEWAY,
+                    detail=f"Gemini Vision OCR extraction failed. Please retry later: {exc.__cause__}",
+                ) from exc
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
         if isinstance(exc, GeminiGatewayError):
             raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Gemini Vision OCR extraction failed. Please retry later.") from exc

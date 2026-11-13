@@ -98,6 +98,37 @@ class Settings(BaseSettings):
         default="gemini-3.8-flash",
         alias="AEGIS_GEMINI_VISION_MODEL",
     )
+    # Laboratory Vision OCR v2 Cascade Configuration (Gemini 3.5 Flash-Lite + Gemini 3.8 Flash)
+    lab_ocr_max_batch_size: int = Field(
+        default=6,
+        ge=1,
+        le=6,
+        alias="AEGIS_LAB_OCR_MAX_BATCH_SIZE",
+    )
+    lab_ocr_concurrency: int = Field(
+        default=6,
+        ge=1,
+        le=6,
+        alias="AEGIS_LAB_OCR_CONCURRENCY",
+    )
+    lab_ocr_max_document_pages: int = Field(
+        default=15,
+        ge=1,
+        le=15,
+        alias="AEGIS_LAB_OCR_MAX_DOCUMENT_PAGES",
+    )
+    lab_ocr_max_single_file_bytes: int = Field(
+        default=10 * 1024 * 1024,  # 10 MB
+        ge=1024,
+        le=50 * 1024 * 1024,
+        alias="AEGIS_LAB_OCR_MAX_SINGLE_FILE_BYTES",
+    )
+    lab_ocr_max_total_bytes: int = Field(
+        default=60 * 1024 * 1024,  # 60 MB
+        ge=1024,
+        le=200 * 1024 * 1024,
+        alias="AEGIS_LAB_OCR_MAX_TOTAL_BYTES",
+    )
     gemini_timeout_seconds: float = Field(
         default=180.0,
         ge=1.0,

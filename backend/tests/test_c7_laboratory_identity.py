@@ -53,6 +53,7 @@ def _build_mock_gateway(
     responses: Optional[List[Dict[str, Any]]] = None,
     default_response: Optional[Dict[str, Any]] = None,
 ) -> GeminiGateway:
+    import copy
     resp_queue = list(responses) if responses else []
 
     async def handler(request: httpx.Request) -> httpx.Response:
@@ -61,10 +62,14 @@ def _build_mock_gateway(
             "url": str(request.url),
             "body": body,
         })
+        is_flash_lite = "flash-lite" in str(request.url)
         if resp_queue:
-            payload = resp_queue.pop(0)
+            if is_flash_lite:
+                payload = copy.deepcopy(resp_queue[0])
+            else:
+                payload = copy.deepcopy(resp_queue.pop(0))
         else:
-            payload = default_response or {}
+            payload = copy.deepcopy(default_response or {})
 
         return httpx.Response(
             status_code=200,
@@ -204,7 +209,7 @@ def test_reupload_invariance_a_to_a_skips_gemini(
     data_1 = resp_1.json()
     assert data_1["ledger_version"] == 1
     assert data_1["extracted_count"] == 2
-    assert len(recorded_calls) == 1
+    assert len(recorded_calls) == 2
 
     # Verify ledger state in DB
     lab_service = LabRevisionConsiliumService(db=db_session)
@@ -224,7 +229,7 @@ def test_reupload_invariance_a_to_a_skips_gemini(
     data_2 = resp_2.json()
 
     # Gemini Vision must NOT have been called a second time
-    assert len(recorded_calls) == 1
+    assert len(recorded_calls) == 2
     # Ledger version unchanged, no duplicates in history
     assert data_2["ledger_version"] == 1
     state_2 = lab_service.get_lab_ledger_state(cycle.cycle_id)
@@ -328,7 +333,7 @@ def test_reupload_invariance_a_b_a_preserves_version_and_history(
     )
     assert resp_a.status_code == 200
     assert resp_a.json()["ledger_version"] == 1
-    assert len(recorded_calls) == 1
+    assert len(recorded_calls) == 2
 
     # 2. Upload B
     resp_b = client.post(
@@ -339,7 +344,7 @@ def test_reupload_invariance_a_b_a_preserves_version_and_history(
     )
     assert resp_b.status_code == 200
     assert resp_b.json()["ledger_version"] == 2
-    assert len(recorded_calls) == 2
+    assert len(recorded_calls) == 4
 
     lab_service = LabRevisionConsiliumService(db=db_session)
     state_after_b = lab_service.get_lab_ledger_state(cycle.cycle_id)
@@ -357,7 +362,7 @@ def test_reupload_invariance_a_b_a_preserves_version_and_history(
     data_a2 = resp_a2.json()
 
     # Gemini must NOT have been called for re-upload A
-    assert len(recorded_calls) == 2
+    assert len(recorded_calls) == 4
     # Must preserve current ledger version 2, NOT revert to 1, NOT bump to 3
     assert data_a2["ledger_version"] == 2
 
@@ -433,7 +438,7 @@ def test_multipage_fingerprint_order_invariance(
     )
     assert resp_1.status_code == 200
     assert resp_1.json()["ledger_version"] == 1
-    assert len(recorded_calls) == 1
+    assert len(recorded_calls) == 3
 
     # 2. Upload pages in reversed order [page2, page1]
     files_order_2 = [
@@ -448,7 +453,7 @@ def test_multipage_fingerprint_order_invariance(
     )
     assert resp_2.status_code == 200
     # Must skip Gemini Vision because sorted hashes produce identical document_fingerprint
-    assert len(recorded_calls) == 1
+    assert len(recorded_calls) == 3
     assert resp_2.json()["ledger_version"] == 1
 
 
@@ -550,8 +555,8 @@ def test_different_photo_same_multi_marker_panel_deduplicated(
         headers=auth_headers,
     )
     assert resp_2.status_code == 200
-    # Gemini was called for photo 2
-    assert len(recorded_calls) == 2
+    # Gemini was called for photo 2 (v2: 2 calls for photo 1 + 2 calls for photo 2 = 4 total)
+    assert len(recorded_calls) == 4
 
     # But ledger must NOT have been mutated: version is still 1, history count is still 3
     assert resp_2.json()["ledger_version"] == 1

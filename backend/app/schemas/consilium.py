@@ -1901,6 +1901,10 @@ class VisionOcrMarkerItem(BaseModel):
     is_critical_flag: bool = Field(default=False)
     requires_user_verification: bool = Field(default=False)
     is_recognition_ambiguous: bool = Field(default=False)
+    row_id: Optional[str] = Field(default=None, max_length=64, description="Unique row identifier within the source page or document")
+    source_row_ids: List[str] = Field(default_factory=list, description="IDs of source page extraction rows reconciled into this marker")
+    page_number: Optional[int] = Field(default=None, ge=1, description="Page number where this marker was detected")
+    source_filename: Optional[str] = Field(default=None, max_length=256, description="Source filename where this marker was detected")
 
     @field_validator(
         "is_uncertain",
@@ -2146,7 +2150,11 @@ class VisionOcrMarkerItem(BaseModel):
                         self.uncertainty_note = f"{self.uncertainty_note}; {unit_note}"
 
         # 4. Final verification requirement resolution
-        if self.is_recognition_ambiguous or (not self.sample_date or not self.sample_date.strip()):
+        if (
+            self.is_recognition_ambiguous
+            or (not self.sample_date or not self.sample_date.strip())
+            or (self.uncertainty_note and any(sig in self.uncertainty_note for sig in ("Fabricated", "omitted", "Preserved Stage 1")))
+        ):
             self.requires_user_verification = True
             return True
 
@@ -2197,8 +2205,11 @@ class VisionOcrModelOutput(BaseModel):
             # If model returned "indicators" instead of "markers"
             if "markers" not in data and "indicators" in data:
                 data["markers"] = data.pop("indicators")
+            # If document_metadata is already an instantiated VisionOcrDocumentMetadata object, preserve it
+            if "document_metadata" in data and isinstance(data.get("document_metadata"), VisionOcrDocumentMetadata):
+                pass
             # If model returned metadata fields at root level
-            if "document_metadata" not in data or not isinstance(data.get("document_metadata"), dict):
+            elif "document_metadata" not in data or not isinstance(data.get("document_metadata"), dict):
                 meta = {}
                 for k in ("sample_date", "issue_date", "laboratory_name", "page_count", "notes"):
                     if k in data:
@@ -2234,6 +2245,242 @@ class LabVisionIntakeClientResponse(BaseModel):
         "Laboratory documents processed server-side. Raw image bytes and unverified "
         "OCR hypotheses are never logged or exposed to the client."
     )
+
+
+class VisionOcrPageExtraction(BaseModel):
+    """
+    Structured extraction produced by Stage 1 (Gemini 3.5 Flash-Lite) for a SINGLE laboratory report page.
+    Captures complete raw indicators, row-level provenance, and page-level metadata without omissions.
+    Includes four structural cues: printed dates, order IDs & types, printed page numbers, and table state.
+    """
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    page_number: int = Field(default=1, ge=1, description="1-based index of this page within the document")
+    source_filename: str = Field(default="page_1", min_length=1, max_length=256, description="Original filename of this page or PDF")
+    source_file_id: Optional[str] = Field(default=None, max_length=64, description="Optional unique identifier of the source file upload")
+    page_sample_date: Optional[str] = Field(default=None, max_length=32, description="Specimen collection date printed on this page header")
+    page_issue_date: Optional[str] = Field(default=None, max_length=32, description="Report issue/printing date printed on this page header")
+    raw_date_str: Optional[str] = Field(default=None, max_length=128, description="Raw unparsed date string if date type or format is ambiguous")
+    laboratory_name: Optional[str] = Field(default=None, max_length=128, description="Name of laboratory detected on this page")
+    order_id: Optional[str] = Field(default=None, max_length=128, description="Order, accession, barcode, or card ID detected on this page")
+    order_id_type: Optional[str] = Field(default=None, max_length=64, description="Type of ID: order_number, barcode, medical_card, accession, etc.")
+    printed_page_num: Optional[int] = Field(default=None, ge=1, description="Page number physically printed on the laboratory form itself")
+    total_printed_pages: Optional[int] = Field(default=None, ge=1, description="Total pages physically printed on form if available (e.g. 3 from 'Стр. 1 из 3')")
+    table_state: Optional[str] = Field(default=None, max_length=32, description="START (new table/section), CONTINUATION (table split continued), or null")
+    section_name: Optional[str] = Field(default=None, max_length=128, description="Printed laboratory section title, e.g. 'Общий анализ крови'")
+    markers: List[VisionOcrMarkerItem] = Field(default_factory=list, description="All indicators detected on this page")
+    has_unreadable_regions: bool = Field(default=False, description="True if any part of the page is illegible, torn, smudged, or cropped")
+    unreadable_regions_note: Optional[str] = Field(default=None, max_length=256, description="Details regarding unreadable regions")
+
+    @field_validator("has_unreadable_regions", mode="before")
+    @classmethod
+    def parse_has_unreadable_regions(cls, v: Any) -> bool:
+        return _parse_bool_strict(v)
+
+    @field_validator("page_sample_date", "page_issue_date", mode="before")
+    @classmethod
+    def parse_page_dates(cls, v: Any) -> Optional[str]:
+        if v is None:
+            return None
+        norm_date, is_valid = normalize_lab_date(v)
+        return norm_date if is_valid else None
+
+    @field_validator("table_state", mode="before")
+    @classmethod
+    def parse_table_state(cls, v: Any) -> Optional[str]:
+        if v is None:
+            return None
+        cleaned = str(v).strip().upper()
+        if cleaned in ("START", "CONTINUATION"):
+            return cleaned
+        return None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize_page_extraction_payload(cls, data: Any) -> Any:
+        if isinstance(data, dict):
+            data = dict(data)
+            # If payload has document_metadata, map common fields to page-level cues and remove it
+            if "document_metadata" in data:
+                dm = data.pop("document_metadata")
+                if isinstance(dm, dict):
+                    if not data.get("page_sample_date") and dm.get("sample_date"):
+                        data["page_sample_date"] = dm.get("sample_date")
+                    if not data.get("page_issue_date") and dm.get("issue_date"):
+                        data["page_issue_date"] = dm.get("issue_date")
+                    if not data.get("laboratory_name") and dm.get("laboratory_name"):
+                        data["laboratory_name"] = dm.get("laboratory_name")
+                    if not data.get("order_id") and dm.get("order_id"):
+                        data["order_id"] = dm.get("order_id")
+            # If model returned "indicators" instead of "markers"
+            if "markers" not in data and "indicators" in data:
+                data["markers"] = data.pop("indicators")
+            # Ensure markers list items inherit page_number and source_filename if missing
+            page_num = data.get("page_number", 1)
+            source_fn = data.get("source_filename", "page_1")
+            markers = data.get("markers")
+            if isinstance(markers, list):
+                for idx, m in enumerate(markers, start=1):
+                    if isinstance(m, dict):
+                        if not m.get("row_id"):
+                            m["row_id"] = f"p{page_num}_r{idx}"
+                        if not m.get("page_number"):
+                            m["page_number"] = page_num
+                        if not m.get("source_filename"):
+                            m["source_filename"] = source_fn
+        return data
+
+
+class VisionOcrPriorBatchContext(BaseModel):
+    """
+    Concise context passed from prior batches to subsequent batches in multi-batch chaining.
+    Carries header metadata and seen marker keys without blowing up the prompt context window.
+    """
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    laboratory_name: Optional[str] = Field(default=None, max_length=128)
+    order_id: Optional[str] = Field(default=None, max_length=128)
+    default_sample_date: Optional[str] = Field(default=None, max_length=32)
+    already_seen_marker_keys: List[str] = Field(default_factory=list, description="Unique normalized marker slugs already extracted")
+    already_seen_row_ids: List[str] = Field(default_factory=list, description="Unique row IDs already processed in earlier batches")
+    table_continuation_hints: Optional[str] = Field(default=None, max_length=512, description="Hint regarding table split at page boundary")
+    last_processed_page: Optional[int] = Field(default=None, ge=1)
+
+    @field_validator("default_sample_date", mode="before")
+    @classmethod
+    def parse_default_sample_date(cls, v: Any) -> Optional[str]:
+        if v is None:
+            return None
+        norm_date, is_valid = normalize_lab_date(v)
+        return norm_date if is_valid else None
+
+
+class VisionOcrBatchReconciliationOutput(BaseModel):
+    """
+    Structured reconciliation produced by Stage 2 (Gemini 3.8 Flash) for a batch of 1 to 6 pages.
+    Reconciles multi-page table splits, harmonizes dates, detects duplicates, and preserves row provenance.
+    """
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    batch_index: int = Field(..., ge=1, description="1-based index of this batch")
+    batch_page_count: int = Field(..., ge=1, le=12, description="Number of pages in this batch (1 to 6, max 12)")
+    processed_page_numbers: List[int] = Field(default_factory=list, description="List of page numbers processed in this batch")
+    document_metadata: VisionOcrDocumentMetadata = Field(default_factory=VisionOcrDocumentMetadata)
+    reconciled_markers: List[VisionOcrMarkerItem] = Field(default_factory=list, description="Reconciled laboratory indicators")
+    cross_page_notes: Optional[str] = Field(default=None, max_length=512, description="Notes on table splits or cross-page alignment")
+    next_batch_context: Optional[VisionOcrPriorBatchContext] = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize_batch_output_payload(cls, data: Any) -> Any:
+        if isinstance(data, dict):
+            # If model returned "markers" instead of "reconciled_markers"
+            if "reconciled_markers" not in data and "markers" in data:
+                data["reconciled_markers"] = data.pop("markers")
+            elif "reconciled_markers" not in data and "indicators" in data:
+                data["reconciled_markers"] = data.pop("indicators")
+            # If document_metadata is already an instantiated VisionOcrDocumentMetadata object, preserve it
+            if "document_metadata" in data and isinstance(data.get("document_metadata"), VisionOcrDocumentMetadata):
+                pass
+            # If model returned metadata fields at root level
+            elif "document_metadata" not in data or not isinstance(data.get("document_metadata"), dict):
+                meta = {}
+                for k in ("sample_date", "issue_date", "laboratory_name", "page_count", "notes", "order_id", "page_sample_date", "page_issue_date"):
+                    if k in data:
+                        val = data.pop(k)
+                        clean_k = k.replace("page_", "")
+                        meta[clean_k] = val
+                if meta:
+                    data["document_metadata"] = meta
+            elif isinstance(data.get("document_metadata"), dict):
+                for k in ("sample_date", "issue_date", "laboratory_name", "page_count", "notes", "order_id", "page_sample_date", "page_issue_date"):
+                    if k in data:
+                        val = data.pop(k)
+                        clean_k = k.replace("page_", "")
+                        data["document_metadata"].setdefault(clean_k, val)
+        return data
+
+
+class VisionOcrStudyLinkage(BaseModel):
+    """
+    Provenance grouping identifying which pages belong to which specific laboratory study/order.
+    """
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    study_id: Optional[str] = Field(default=None, max_length=128, description="Order, accession, or study ID")
+    laboratory_name: Optional[str] = Field(default=None, max_length=128)
+    sample_date: Optional[str] = Field(default=None, max_length=32)
+    page_numbers: List[int] = Field(default_factory=list, description="Global page numbers belonging to this study")
+    confidence: Optional[str] = Field(default="high", max_length=32, description="high, moderate, or doubtful")
+    linkage_notes: Optional[str] = Field(default=None, max_length=512)
+
+    @field_validator("sample_date", mode="before")
+    @classmethod
+    def parse_sample_date(cls, v: Any) -> Optional[str]:
+        if v is None:
+            return None
+        norm_date, is_valid = normalize_lab_date(v)
+        return norm_date if is_valid else None
+
+
+class VisionOcrReconciliationOutput(BaseModel):
+    """
+    Structured output produced by the single Gemini 3.8 Flash Reconciler covering ALL document pages (1 to 15).
+    Reconciles multi-page studies, detects split tables, harmonizes headers and dates, and tracks row provenance.
+    """
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    total_pages_reconciled: int = Field(default=1, ge=1, le=15, description="Total number of pages analyzed")
+    document_metadata: VisionOcrDocumentMetadata = Field(default_factory=VisionOcrDocumentMetadata)
+    reconciled_markers: List[VisionOcrMarkerItem] = Field(default_factory=list, description="All reconciled laboratory indicators")
+    study_linkages: List[VisionOcrStudyLinkage] = Field(default_factory=list, description="Page groupings by laboratory study/order")
+    reconciliation_notes: Optional[str] = Field(default=None, max_length=1024, description="Details on table stitches, separate studies, or ambiguities")
+
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize_reconciliation_output_payload(cls, data: Any) -> Any:
+        if isinstance(data, dict):
+            data = dict(data)
+            # Normalize total_pages_reconciled
+            if "total_pages_reconciled" not in data:
+                doc_meta = data.get("document_metadata")
+                if isinstance(doc_meta, dict) and doc_meta.get("page_count"):
+                    try:
+                        data["total_pages_reconciled"] = min(15, max(1, int(doc_meta["page_count"])))
+                    except (ValueError, TypeError):
+                        data["total_pages_reconciled"] = 1
+                elif "page_count" in data:
+                    try:
+                        data["total_pages_reconciled"] = min(15, max(1, int(data.pop("page_count"))))
+                    except (ValueError, TypeError):
+                        data["total_pages_reconciled"] = 1
+                else:
+                    data["total_pages_reconciled"] = 1
+            # If model returned "markers" instead of "reconciled_markers"
+            if "reconciled_markers" not in data and "markers" in data:
+                data["reconciled_markers"] = data.pop("markers")
+            elif "reconciled_markers" not in data and "indicators" in data:
+                data["reconciled_markers"] = data.pop("indicators")
+            # If document_metadata is already an instantiated VisionOcrDocumentMetadata object, preserve it
+            if "document_metadata" in data and isinstance(data.get("document_metadata"), VisionOcrDocumentMetadata):
+                pass
+            # If model returned metadata fields at root level
+            elif "document_metadata" not in data or not isinstance(data.get("document_metadata"), dict):
+                meta = {}
+                for k in ("sample_date", "issue_date", "laboratory_name", "page_count", "notes", "order_id", "page_sample_date", "page_issue_date"):
+                    if k in data:
+                        val = data.pop(k)
+                        clean_k = k.replace("page_", "")
+                        meta[clean_k] = val
+                if meta:
+                    data["document_metadata"] = meta
+            elif isinstance(data.get("document_metadata"), dict):
+                for k in ("sample_date", "issue_date", "laboratory_name", "page_count", "notes", "order_id", "page_sample_date", "page_issue_date"):
+                    if k in data:
+                        val = data.pop(k)
+                        clean_k = k.replace("page_", "")
+                        data["document_metadata"].setdefault(clean_k, val)
+        return data
 
 
 class EcgRecordingType(str, Enum):

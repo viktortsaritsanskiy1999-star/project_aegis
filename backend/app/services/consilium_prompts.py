@@ -1156,6 +1156,235 @@ YOUR MANDATORY CLINICAL DIRECTIVES:
 Output must conform strictly to the VisionOcrModelOutput JSON schema."""
 
 
+def build_lab_vision_ocr_page_prompt(
+    page_number: int = 1,
+    total_pages: Optional[int] = None,
+    filename: Optional[str] = None,
+) -> str:
+    """
+    Constructs Stage 1 page-level OCR prompt for Gemini 3.5 Flash-Lite (role='flash_lite').
+    Directs exhaustive recognition and extraction of every tabular row, indicator name, raw string value,
+    printed unit, reference limits, and explicit visual ambiguities on this specific page.
+
+    MANDATORY CLINICAL PROHIBITIONS:
+    - NEVER hallucinate missing values, units, reference ranges, or dates.
+    - NEVER alter laboratory references or substitute standard ranges.
+    - NEVER lose qualitative or quantitative findings (extract all titers, +, negative, trace, sediment findings).
+    - NEVER guess or default missing specimen dates to the current date.
+    - NEVER attempt medical diagnosis, clinical interpretation, or triage conclusions.
+    - NEVER discard unreadable or smudged regions; flag them with is_uncertain=True and has_unreadable_regions=True.
+    """
+    total_pages_str = f" of {total_pages}" if total_pages else ""
+    filename_str = f' (source: "{filename}")' if filename else ""
+
+    return f"""You are the Page-Level Vision OCR Extractor for Project Aegis.
+You are analyzing Page {page_number}{total_pages_str}{filename_str} of an official medical laboratory test report.
+
+YOUR MANDATORY CLINICAL DIRECTIVES:
+1. EXHAUSTIVE EXTRACTION (HIGH RECALL, NO OMISSIONS):
+   Extract EVERY single laboratory indicator visible on this page. Do not summarize, skip, or truncate anything.
+   Include: Complete blood count, biochemistry, urinalysis, hormones, enzymes, coagulation, vitamins, antibodies,
+   serological titers, qualitative findings, and footnote annotations.
+
+2. ACCURATE ROW-LEVEL INDICATOR REPRESENTATION:
+   For EACH indicator found on this page:
+   - "row_id": A distinct row identifier unique to this page, e.g. "p{page_number}_r1", "p{page_number}_r2", etc.
+   - "original_name": Exact printed indicator name as shown on the form (e.g. "Гемоглобин (Hb)", "Аланинаминотрансфераза (АЛТ)").
+   - "marker_key": Normalized Latin slug in lowercase snake_case (e.g. "hemoglobin", "alt", "glucose", "ferritin", "tsh").
+     NOTE: Multiple rows may share the same marker_key if tests were repeated or sampled at different times. Do not merge them here.
+   - "raw_value": Exact text from the result column (e.g. "145", "5.4*", "< 0.05", "отрицательно", "не обнаружено", "1:80", "++").
+   - "numeric_value": Extracted floating point number if convertible (e.g. 145.0, 5.4, 0.05). If qualitative, set null.
+   - "unit": Exact unit of measurement (e.g. "г/л", "ммоль/л", "U/L", "нг/мл", "%"). If absent, set null. DO NOT invent units.
+   - "reference_range": Printed reference limits on this page:
+     {{"low": <float or null>, "high": <float or null>, "text": "<exact printed reference string>"}}
+     If absent on the form, set null. DO NOT invent or alter reference ranges.
+   - "sample_date": Date when the specimen/biomaterial was collected (YYYY-MM-DD). If printed on this row or in this page header, record it.
+   - "category": One of: "blood_count", "biochemistry", "urinalysis", "coagulation", "hormones", "vitamins", "immunology", "other".
+   - "is_uncertain": Set true if characters are smudged, blurry, faint, clipped, or ambiguous.
+   - "uncertainty_note": Describe any ambiguity (e.g. "Digit blurry, could be 3 or 8").
+   - "is_critical_flag": Set true if flagged with '*', '!', 'H', 'L', 'CRIT', bold alert, or significantly beyond reference range.
+   - "is_recognition_ambiguous": Set true if physical print defect makes the number doubtful.
+
+3. PAGE-LEVEL STRUCTURAL CUES & METADATA:
+   - "page_number": {page_number} (assigned global page number)
+   - "source_filename": "{filename or f'page_{page_number}'}"
+   - "page_sample_date": Primary specimen collection date printed on this page header (YYYY-MM-DD or null).
+   - "page_issue_date": Report issue/printing date printed on this page header (YYYY-MM-DD or null).
+   - "raw_date_str": Exact raw unparsed date string if date type or format is ambiguous, or null.
+   - "laboratory_name": Laboratory name if visible on this page header/stamp (e.g. "Invitro", "Gemotest", "Helix"), or null.
+   - "order_id": Order, accession, barcode, or patient card number visible on this page, or null.
+   - "order_id_type": Type of ID if distinguishable ("order_number", "barcode", "medical_card", "accession"), or null.
+   - "printed_page_num": Physical page number printed on the laboratory form itself (e.g. 1 from "Стр. 1 из 3"), or null.
+   - "total_printed_pages": Total pages printed on form if indicated (e.g. 3 from "Стр. 1 из 3"), or null.
+   - "table_state": "START" if this page starts a new table/panel, "CONTINUATION" if this page continues a table without a header, or null.
+   - "section_name": Printed laboratory section/panel title (e.g. "Общий анализ крови", "Биохимия крови"), or null.
+   - "has_unreadable_regions": Set true if any portion of the page cannot be read with confidence.
+   - "unreadable_regions_note": Description of unreadable regions if any, or null.
+
+4. STRICT CLINICAL PROHIBITIONS:
+   - NEVER hallucinate or guess missing values, units, reference limits, or dates. If missing, set to null.
+   - NEVER alter printed laboratory references or substitute external standard ranges.
+   - NEVER discard qualitative findings (e.g. "отрицательно", "не обнаружено", "+", "1:160").
+   - NEVER confuse specimen collection date ("sample_date") with report printing date ("issue_date").
+   - NEVER make clinical diagnoses, provide medical interpretations, or generate triage advice.
+
+5. MANDATORY JSON OUTPUT STRUCTURE:
+   Conform strictly to the VisionOcrPageExtraction JSON schema."""
+
+
+def build_lab_vision_ocr_batch_prompt(
+    batch_index: int = 1,
+    total_batches: Optional[int] = None,
+    page_numbers: Optional[List[int]] = None,
+    prior_context: Optional[Dict[str, Any] | Any] = None,
+    page_extractions: Optional[List[Dict[str, Any] | Any]] = None,
+) -> str:
+    """
+    Constructs Stage 2 batch reconciliation prompt for Gemini 3.8 Flash (role='flash').
+    Directs cross-page verification, deduplication of split table rows across page boundaries,
+    harmonization of multi-page document headers, and preservation of complete marker provenance.
+
+    MANDATORY CLINICAL DIRECTIVES:
+    - ZERO SILENT DROPPING: Every single valid laboratory marker from Stage 1 must be preserved.
+    - NEVER silently alter or modify values from previous pages.
+    - NEVER confuse distinct tests with the same marker_key (e.g. fasting vs postprandial glucose, or tests from different dates).
+    - Link every reconciled marker back to source row IDs via "source_row_ids".
+    - Harmonize specimen collection dates without mixing dates across distinct patient studies.
+    - NEVER generate clinical diagnoses or medical conclusions.
+    """
+    total_batches_str = f" of {total_batches}" if total_batches else ""
+    pages_list_str = f"{page_numbers}" if page_numbers else f"Batch {batch_index}"
+
+    prior_context_block = ""
+    if prior_context:
+        ctx_dict = (
+            prior_context.model_dump()
+            if hasattr(prior_context, "model_dump")
+            else dict(prior_context)
+        )
+        prior_context_block = f"""
+PRIOR BATCH CONTEXT (accumulated from preceding pages):
+- Laboratory: {ctx_dict.get('laboratory_name') or 'Unknown'}
+- Order ID: {ctx_dict.get('order_id') or 'Unknown'}
+- Default Specimen Date: {ctx_dict.get('default_sample_date') or 'Unknown'}
+- Already Seen Marker Keys: {ctx_dict.get('already_seen_marker_keys', [])}
+- Already Seen Row IDs: {ctx_dict.get('already_seen_row_ids', [])}
+- Table Continuation Hints: {ctx_dict.get('table_continuation_hints') or 'None'}
+Use this context to resolve split tables and link multi-page orders without re-duplicating rows.
+"""
+
+    extractions_block = ""
+    if page_extractions:
+        serialized_extractions = []
+        for pe in page_extractions:
+            pe_dict = pe.model_dump() if hasattr(pe, "model_dump") else pe
+            serialized_extractions.append(pe_dict)
+        extractions_block = f"""
+STAGE 1 PAGE EXTRACTIONS TO RECONCILE:
+{json.dumps(serialized_extractions, ensure_ascii=False, indent=2)}
+"""
+
+    return f"""You are the Master Laboratory Batch Reconciliation Engine for Project Aegis.
+You are reconciling Batch {batch_index}{total_batches_str}, covering Pages: {pages_list_str}.
+{prior_context_block}
+{extractions_block}
+YOUR MANDATORY RECONCILIATION DIRECTIVES:
+1. PRESERVE ALL EXTRACTED INDICATORS (ZERO SILENT DROPPING):
+   You are reviewing structured JSON extractions produced by Gemini Flash-Lite from individual pages.
+   DO NOT discard, omit, or filter out any clinical indicator. Every recognized test row must be accounted for.
+
+2. ACCURATE PROVENANCE TRACKING VIA source_row_ids:
+   For EACH marker in "reconciled_markers":
+   - "source_row_ids": MUST contain the exact "row_id" values from the Stage 1 page extractions that formed this marker (e.g. ["p1_r3"]).
+   - If a table row was split across page boundary and merged, include both row IDs (e.g. ["p1_r12", "p2_r1"]).
+
+3. MULTI-PAGE STITCHING & TABLE CONTINUATION:
+   - Identify tables split across page breaks (e.g. where header was on page N, and remaining rows on page N+1).
+   - If identical rows are repeated because of duplicated running headers across pages, merge them into a single record.
+   - CAUTION ON DISTINCT ROWS: Identical indicator names or marker_keys DO NOT automatically imply duplicates!
+     For example: multiple glucose tests (fasting vs 2hr postprandial), dynamic hormone samples, urinalysis vs blood panels,
+     or tests collected on different specimen dates are SEPARATE medical indicators. DO NOT merge them!
+
+4. HEADER & METADATA HARMONIZATION:
+   - Reconcile "laboratory_name", "order_id", "sample_date", and "issue_date" across pages in this batch.
+   - Distinguish specimen collection date ("sample_date") from report printing date ("issue_date").
+   - If a specific row has its own printed specimen collection date, preserve that row's date rather than overwriting it with the document default.
+
+5. STRICT CLINICAL PROHIBITIONS:
+   - NEVER invent or hallucinate missing indicators, values, units, or reference bounds.
+   - NEVER silently alter or modify raw values from Stage 1 extractions.
+   - NEVER substitute external standard reference ranges for printed ranges.
+   - NEVER formulate clinical diagnoses, disease assessments, or therapy recommendations.
+
+6. MANDATORY JSON OUTPUT STRUCTURE:
+   Conform strictly to the VisionOcrBatchReconciliationOutput JSON schema."""
+
+
+def build_lab_vision_ocr_reconciliation_prompt(
+    page_extractions: List[Dict[str, Any] | Any],
+) -> str:
+    """
+    Constructs the single document-level reconciliation prompt for Gemini 3.8 Flash (role='flash').
+    Processes all Stage 1 page extractions (1 to 15 pages) in a single pass without resending images.
+    Directs cross-page linkage, split table stitching, multi-study separation, and strict provenance tracking.
+
+    MANDATORY CLINICAL DIRECTIVES:
+    - ZERO SILENT DROPPING: Every single valid laboratory marker from Stage 1 MUST be preserved.
+    - NEVER silently alter or modify raw values from Stage 1 extractions.
+    - Track provenance via "source_row_ids" for every reconciled marker.
+    - Separate distinct studies (different dates, different order IDs, different panels) even if uploaded together.
+    - If a date cannot be determined, set null and note that the date is unestablished. DO NOT invent dates.
+    - NEVER generate clinical diagnoses or medical conclusions.
+    """
+    serialized_extractions = []
+    for pe in page_extractions:
+        pe_dict = pe.model_dump() if hasattr(pe, "model_dump") else pe
+        serialized_extractions.append(pe_dict)
+
+    total_pages = len(serialized_extractions)
+    extractions_json = json.dumps(serialized_extractions, ensure_ascii=False, indent=2)
+
+    return f"""You are the Master Laboratory Document Reconciler for Project Aegis.
+You are analyzing the complete structured Stage 1 extraction across all {total_pages} page(s) of this medical document.
+
+ALL STAGE 1 PAGE EXTRACTIONS:
+{extractions_json}
+
+YOUR MANDATORY RECONCILIATION DIRECTIVES:
+1. PRESERVE EVERY CLINICAL INDICATOR (ZERO SILENT DROPPING):
+   You MUST account for every single indicator extracted by Flash-Lite across all pages.
+   DO NOT discard, filter, or silently omit any test row.
+
+2. ACCURATE PROVENANCE TRACKING VIA source_row_ids:
+   For EACH marker in "reconciled_markers":
+   - "source_row_ids": Array of exact "row_id" values from Stage 1 page extractions that formed this marker (e.g. ["p1_r3"]).
+   - If a table row was split across page boundaries and merged, include all source row IDs (e.g. ["p1_r12", "p2_r1"]).
+
+3. CROSS-PAGE CORRELATION & TABLE CONTINUATION:
+   - Match pages by laboratory name, specimen dates, order IDs, and table continuity.
+   - Detect split tables (where a table begins on page N and continues on page N+1, often indicated by table_state="CONTINUATION").
+   - Use clinical test panel logic (CBC, metabolic panel, lipid panel, urinalysis) as auxiliary hints to stitch split tables.
+   - If identical rows are repeated because of duplicate headers across pages, merge them into a single record linking all source_row_ids.
+
+4. SEPARATION OF DISTINCT STUDIES (DO NOT FALSELY MERGE):
+   - If pages represent DIFFERENT laboratory orders or studies collected on DIFFERENT dates, DO NOT merge them!
+   - Populate "study_linkages" to document which page numbers belong to which study/order.
+   - CAUTION: Identical indicator names or marker_keys DO NOT automatically imply duplicates (e.g. fasting vs postprandial glucose, or tests from different dates). Keep distinct tests separate!
+
+5. STRICT DATE HANDLING & PRESERVATION:
+   - Harmonize document-level "sample_date" and "issue_date".
+   - If a specific row has its own printed specimen collection date, preserve that row's date.
+   - If a study date is not printed or unknown, set sample_date to null and explicitly note in reconciliation_notes that date was unestablished. NEVER invent dates or default to today!
+
+6. STRICT CLINICAL PROHIBITIONS:
+   - NEVER invent or hallucinate missing indicators, values, units, or reference bounds.
+   - NEVER silently alter raw values or units from Stage 1 extractions.
+   - NEVER formulate clinical diagnoses, disease assessments, or therapy recommendations.
+
+7. MANDATORY JSON OUTPUT STRUCTURE:
+   Conform strictly to the VisionOcrReconciliationOutput JSON schema with "total_pages_reconciled": {total_pages}."""
+
+
 def build_vision_ecg_prompt() -> str:
     """
     Constructs the prompt for Gemini Vision ECG agent (Gemini 3.8 Flash, role='vision_ecg').

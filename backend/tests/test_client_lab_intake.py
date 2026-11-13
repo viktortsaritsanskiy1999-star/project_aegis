@@ -290,7 +290,8 @@ def test_01_client_lab_intake_valid_document(client_with_mock_gateway, db_sessio
     assert len(data["confirmed_markers"]) == 3
     assert data["requires_verification_count"] == 0
     assert data["has_unreviewed_lab_changes"] is True
-    assert len(recorded_calls) == 1
+    # Verify recorded call to Gemini: v2 makes 1 Stage 1 Flash-Lite + 1 Stage 2 Flash Reconciler call
+    assert len(recorded_calls) == 2
 
     # Verify queryable in ledger state
     state_resp = client.get(
@@ -483,7 +484,8 @@ def test_06_client_lab_intake_duplicate_upload(client_with_mock_gateway):
         files=[("files", ("lab.jpg", io.BytesIO(jpeg_bytes), "image/jpeg"))],
     )
     assert resp1.status_code == 200
-    assert len(recorded_calls) == 1
+    # Verify recorded call to Gemini: v2 makes 1 Stage 1 Flash-Lite + 1 Stage 2 Flash Reconciler call
+    assert len(recorded_calls) == 2
     ledger_v1 = resp1.json()["ledger_version"]
 
     # Second upload of the EXACT same document
@@ -494,7 +496,8 @@ def test_06_client_lab_intake_duplicate_upload(client_with_mock_gateway):
     )
     assert resp2.status_code == 200
     # Gemini must NOT be called again
-    assert len(recorded_calls) == 1
+    # Verify recorded call to Gemini: v2 makes 1 Stage 1 Flash-Lite + 1 Stage 2 Flash Reconciler call
+    assert len(recorded_calls) == 2
     # Ledger version remains identical (no spurious mutation)
     assert resp2.json()["ledger_version"] == ledger_v1
 
@@ -748,7 +751,8 @@ def test_11_client_lab_intake_alias_and_single_file_field(client_with_mock_gatew
     data = resp.json()
     assert data["status"] == "processed"
     assert data["extracted_count"] == 3
-    assert len(recorded_calls) == 1
+    # Verify recorded call to Gemini: v2 makes 1 Stage 1 Flash-Lite + 1 Stage 2 Flash Reconciler call
+    assert len(recorded_calls) == 2
 
 
 @pytest.mark.anyio
@@ -808,6 +812,6 @@ async def test_12_client_lab_intake_concurrent_duplicate_upload(client_with_mock
     assert d_other["cycle_id"] != d1["cycle_id"]
     assert d_other["ledger_version"] == 1
 
-    # 4. Total Gemini calls: exactly 1 for patient conc + 1 for patient other = 2 total
+    # 4. Total Gemini calls: exactly 2 for patient conc + 2 for patient other = 4 total
     # (patient conc's duplicate was deduped and did NOT call Gemini a second time)
-    assert len(recorded_calls) == 2
+    assert len(recorded_calls) == 4
