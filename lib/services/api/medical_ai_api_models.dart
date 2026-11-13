@@ -9,8 +9,8 @@ class AnamnesisQuestionnaireAnswers {
   final String ageConfirmation;
   final String gender;
   final int age;
-  final int height;
-  final int weight;
+  final num height;
+  final num weight;
   final String nicotineStatus;
   final String? nicotineYears;
   final String? nicotineFreq;
@@ -38,6 +38,74 @@ class AnamnesisQuestionnaireAnswers {
   final String? userTextSpecFactors;
   final String? userTextDietHabits;
   final String? userTextGiSignals;
+
+  // Stage 1 new fields
+  final bool? ageConfirmedUnusual;
+  final String? pregnancyStatus;
+  final String? pregnancyTrimester;
+  final num? pregnancyWeeks;
+  final String? breastfeedingStatus;
+  final bool? heightConfirmedUnusual;
+  final bool? weightConfirmedUnusual;
+  final String? weightChangeStatus;
+  final num? weightChangeAmount;
+  final String? weightChangeIntentional;
+  final List<String>? nicotineProducts;
+  final Map<String, String>? nicotineProductTenure;
+  final String? nicotineCurrentFrequency;
+  final Map<String, dynamic>? nicotineQuantities;
+  final String? nicotineQuitWhen;
+  final List<String>? alcoholTypes;
+  final Map<String, String>? alcoholVolumes;
+  final String? alcoholComment;
+  final String? userTextAlcohol;
+  final List<String>? substanceTypes;
+  final String? substanceLastUse;
+  final String? substanceNotes;
+
+  // Stage 2 new fields
+  final String? sleepDuration;
+  final List<String>? sleepSymptoms;
+  final String? sleepSchedule;
+  final String? sleepScheduleNotes;
+  final String? userTextSleep;
+  final String? dietCustomDetails;
+  final String? dietMealsPerDay;
+  final String? dietSnacksPerDay;
+  final List<String>? dietStaples;
+  final List<String>? dietOccasionalFoods;
+  final Map<String, String>? dietFoodFrequencies;
+  final String? dietExcludedFoodsText;
+  final String? dietDayDescription;
+  final String? drinksTotalVolume;
+  final List<String>? drinksTypes;
+  final List<String>? drinksCoffeeTypes;
+  final String? drinksCoffeeFrequency;
+  final String? drinksCaffeineFrequency;
+  final String? drinksDayDescription;
+  final String? userTextDrinks;
+
+  // Stage 3 new fields
+  final List<String>? giSymptoms;
+  final Map<String, Map<String, String>>? giSymptomDetails;
+  final String? workOccupation;
+  final String? workStress;
+  final String? userTextWork;
+  final String? activityDaysPerWeek;
+  final String? activityDurationMinutes;
+  final List<String>? activityTypes;
+  final String? activityOtherDetails;
+  final String? userTextSport;
+
+  // Stage 4 new fields
+  final List<String>? chronicCategories;
+  final Map<String, Map<String, String>>? chronicConditionDetails;
+  final List<String>? recentEvents;
+  final Map<String, Map<String, String>>? recentEventDetails;
+  final String? infectiousHistoryStatus;
+  final List<String>? infectiousDiagnosed;
+  final List<String>? infectiousTestedNegative;
+  final String? infectiousLastTested;
 
   const AnamnesisQuestionnaireAnswers({
     required this.ageConfirmation,
@@ -72,15 +140,75 @@ class AnamnesisQuestionnaireAnswers {
     this.userTextSpecFactors,
     this.userTextDietHabits,
     this.userTextGiSignals,
+    this.ageConfirmedUnusual,
+    this.pregnancyStatus,
+    this.pregnancyTrimester,
+    this.pregnancyWeeks,
+    this.breastfeedingStatus,
+    this.heightConfirmedUnusual,
+    this.weightConfirmedUnusual,
+    this.weightChangeStatus,
+    this.weightChangeAmount,
+    this.weightChangeIntentional,
+    this.nicotineProducts,
+    this.nicotineProductTenure,
+    this.nicotineCurrentFrequency,
+    this.nicotineQuantities,
+    this.nicotineQuitWhen,
+    this.alcoholTypes,
+    this.alcoholVolumes,
+    this.alcoholComment,
+    this.userTextAlcohol,
+    this.substanceTypes,
+    this.substanceLastUse,
+    this.substanceNotes,
+    this.sleepDuration,
+    this.sleepSymptoms,
+    this.sleepSchedule,
+    this.sleepScheduleNotes,
+    this.userTextSleep,
+    this.dietCustomDetails,
+    this.dietMealsPerDay,
+    this.dietSnacksPerDay,
+    this.dietStaples,
+    this.dietOccasionalFoods,
+    this.dietFoodFrequencies,
+    this.dietExcludedFoodsText,
+    this.dietDayDescription,
+    this.drinksTotalVolume,
+    this.drinksTypes,
+    this.drinksCoffeeTypes,
+    this.drinksCoffeeFrequency,
+    this.drinksCaffeineFrequency,
+    this.drinksDayDescription,
+    this.userTextDrinks,
+    this.giSymptoms,
+    this.giSymptomDetails,
+    this.workOccupation,
+    this.workStress,
+    this.userTextWork,
+    this.activityDaysPerWeek,
+    this.activityDurationMinutes,
+    this.activityTypes,
+    this.activityOtherDetails,
+    this.userTextSport,
+    this.chronicCategories,
+    this.chronicConditionDetails,
+    this.recentEvents,
+    this.recentEventDetails,
+    this.infectiousHistoryStatus,
+    this.infectiousDiagnosed,
+    this.infectiousTestedNegative,
+    this.infectiousLastTested,
   });
 
   factory AnamnesisQuestionnaireAnswers.fromMap(Map<String, dynamic> map) {
     return AnamnesisQuestionnaireAnswers(
       ageConfirmation: map['age_confirmation'] as String? ?? 'Confirmed',
       gender: map['gender'] as String? ?? 'Male',
-      age: map['age'] as int? ?? 30,
-      height: map['height'] as int? ?? 175,
-      weight: map['weight'] as int? ?? 70,
+      age: (map['age'] as num?)?.toInt() ?? 30,
+      height: map['height'] as num? ?? 175,
+      weight: map['weight'] as num? ?? 70,
       nicotineStatus: map['nicotine_status'] as String? ?? 'Non-user',
       nicotineYears: map['nicotine_years'] as String?,
       nicotineFreq: map['nicotine_freq'] as String?,
@@ -108,6 +236,81 @@ class AnamnesisQuestionnaireAnswers {
       userTextSpecFactors: map['user_text_spec_factors'] as String?,
       userTextDietHabits: map['user_text_diet_habits'] as String?,
       userTextGiSignals: map['user_text_gi_signals'] as String?,
+      ageConfirmedUnusual: map['age_confirmed_unusual'] as bool?,
+      pregnancyStatus: map['pregnancy_status'] as String?,
+      pregnancyTrimester: map['pregnancy_trimester'] as String?,
+      pregnancyWeeks: map['pregnancy_weeks'] as num?,
+      breastfeedingStatus: map['breastfeeding_status'] as String?,
+      heightConfirmedUnusual: map['height_confirmed_unusual'] as bool?,
+      weightConfirmedUnusual: map['weight_confirmed_unusual'] as bool?,
+      weightChangeStatus: map['weight_change_status'] as String?,
+      weightChangeAmount: map['weight_change_amount'] as num?,
+      weightChangeIntentional: map['weight_change_intentional'] as String?,
+      nicotineProducts: (map['nicotine_products'] as List<dynamic>?)?.map((e) => e.toString()).toList(),
+      nicotineProductTenure: (map['nicotine_product_tenure'] as Map<dynamic, dynamic>?)?.map((k, v) => MapEntry(k.toString(), v.toString())),
+      nicotineCurrentFrequency: map['nicotine_current_frequency'] as String?,
+      nicotineQuantities: map['nicotine_quantities'] != null ? Map<String, dynamic>.from(map['nicotine_quantities'] as Map) : null,
+      nicotineQuitWhen: map['nicotine_quit_when'] as String?,
+      alcoholTypes: (map['alcohol_types'] as List<dynamic>?)?.map((e) => e.toString()).toList(),
+      alcoholVolumes: (map['alcohol_volumes'] as Map<dynamic, dynamic>?)?.map((k, v) => MapEntry(k.toString(), v.toString())),
+      alcoholComment: map['alcohol_comment'] as String?,
+      userTextAlcohol: map['user_text_alcohol'] as String?,
+      substanceTypes: (map['substance_types'] as List<dynamic>?)?.map((e) => e.toString()).toList(),
+      substanceLastUse: map['substance_last_use'] as String?,
+      substanceNotes: map['substance_notes'] as String?,
+      sleepDuration: map['sleep_duration'] as String?,
+      sleepSymptoms: (map['sleep_symptoms'] as List<dynamic>?)?.map((e) => e.toString()).toList(),
+      sleepSchedule: map['sleep_schedule'] as String?,
+      sleepScheduleNotes: map['sleep_schedule_notes'] as String?,
+      userTextSleep: map['user_text_sleep'] as String?,
+      dietCustomDetails: map['diet_custom_details'] as String?,
+      dietMealsPerDay: map['diet_meals_per_day'] as String?,
+      dietSnacksPerDay: map['diet_snacks_per_day'] as String?,
+      dietStaples: (map['diet_staples'] as List<dynamic>?)?.map((e) => e.toString()).toList(),
+      dietOccasionalFoods: (map['diet_occasional_foods'] as List<dynamic>?)?.map((e) => e.toString()).toList(),
+      dietFoodFrequencies: (map['diet_food_frequencies'] as Map<dynamic, dynamic>?)?.map((k, v) => MapEntry(k.toString(), v.toString())),
+      dietExcludedFoodsText: map['diet_excluded_foods_text'] as String?,
+      dietDayDescription: map['diet_day_description'] as String?,
+      drinksTotalVolume: map['drinks_total_volume'] as String?,
+      drinksTypes: (map['drinks_types'] as List<dynamic>?)?.map((e) => e.toString()).toList(),
+      drinksCoffeeTypes: (map['drinks_coffee_types'] as List<dynamic>?)?.map((e) => e.toString()).toList(),
+      drinksCoffeeFrequency: map['drinks_coffee_frequency'] as String?,
+      drinksCaffeineFrequency: map['drinks_caffeine_frequency'] as String?,
+      drinksDayDescription: map['drinks_day_description'] as String?,
+      userTextDrinks: map['user_text_drinks'] as String?,
+      giSymptoms: (map['gi_symptoms'] as List<dynamic>?)?.map((e) => e.toString()).toList(),
+      giSymptomDetails: (map['gi_symptom_details'] as Map<dynamic, dynamic>?)?.map(
+        (k, v) => MapEntry(
+          k.toString(),
+          (v as Map<dynamic, dynamic>).map((ik, iv) => MapEntry(ik.toString(), iv.toString())),
+        ),
+      ),
+      workOccupation: map['work_occupation'] as String?,
+      workStress: map['work_stress'] as String?,
+      userTextWork: map['user_text_work'] as String?,
+      activityDaysPerWeek: map['activity_days_per_week'] as String?,
+      activityDurationMinutes: map['activity_duration_minutes'] as String?,
+      activityTypes: (map['activity_types'] as List<dynamic>?)?.map((e) => e.toString()).toList(),
+      activityOtherDetails: map['activity_other_details'] as String?,
+      userTextSport: map['user_text_sport'] as String?,
+      chronicCategories: (map['chronic_categories'] as List<dynamic>?)?.map((e) => e.toString()).toList(),
+      chronicConditionDetails: (map['chronic_condition_details'] as Map<dynamic, dynamic>?)?.map(
+        (k, v) => MapEntry(
+          k.toString(),
+          (v as Map<dynamic, dynamic>).map((ik, iv) => MapEntry(ik.toString(), iv.toString())),
+        ),
+      ),
+      recentEvents: (map['recent_events'] as List<dynamic>?)?.map((e) => e.toString()).toList(),
+      recentEventDetails: (map['recent_event_details'] as Map<dynamic, dynamic>?)?.map(
+        (k, v) => MapEntry(
+          k.toString(),
+          (v as Map<dynamic, dynamic>).map((ik, iv) => MapEntry(ik.toString(), iv.toString())),
+        ),
+      ),
+      infectiousHistoryStatus: map['infectious_history_status'] as String?,
+      infectiousDiagnosed: (map['infectious_diagnosed'] as List<dynamic>?)?.map((e) => e.toString()).toList(),
+      infectiousTestedNegative: (map['infectious_tested_negative'] as List<dynamic>?)?.map((e) => e.toString()).toList(),
+      infectiousLastTested: map['infectious_last_tested'] as String?,
     );
   }
 
@@ -146,6 +349,66 @@ class AnamnesisQuestionnaireAnswers {
     if (userTextSpecFactors != null) map['user_text_spec_factors'] = userTextSpecFactors;
     if (userTextDietHabits != null) map['user_text_diet_habits'] = userTextDietHabits;
     if (userTextGiSignals != null) map['user_text_gi_signals'] = userTextGiSignals;
+    if (ageConfirmedUnusual != null) map['age_confirmed_unusual'] = ageConfirmedUnusual;
+    if (pregnancyStatus != null) map['pregnancy_status'] = pregnancyStatus;
+    if (pregnancyTrimester != null) map['pregnancy_trimester'] = pregnancyTrimester;
+    if (pregnancyWeeks != null) map['pregnancy_weeks'] = pregnancyWeeks;
+    if (breastfeedingStatus != null) map['breastfeeding_status'] = breastfeedingStatus;
+    if (heightConfirmedUnusual != null) map['height_confirmed_unusual'] = heightConfirmedUnusual;
+    if (weightConfirmedUnusual != null) map['weight_confirmed_unusual'] = weightConfirmedUnusual;
+    if (weightChangeStatus != null) map['weight_change_status'] = weightChangeStatus;
+    if (weightChangeAmount != null) map['weight_change_amount'] = weightChangeAmount;
+    if (weightChangeIntentional != null) map['weight_change_intentional'] = weightChangeIntentional;
+    if (nicotineProducts != null) map['nicotine_products'] = nicotineProducts;
+    if (nicotineProductTenure != null) map['nicotine_product_tenure'] = nicotineProductTenure;
+    if (nicotineCurrentFrequency != null) map['nicotine_current_frequency'] = nicotineCurrentFrequency;
+    if (nicotineQuantities != null) map['nicotine_quantities'] = nicotineQuantities;
+    if (nicotineQuitWhen != null) map['nicotine_quit_when'] = nicotineQuitWhen;
+    if (alcoholTypes != null) map['alcohol_types'] = alcoholTypes;
+    if (alcoholVolumes != null) map['alcohol_volumes'] = alcoholVolumes;
+    if (alcoholComment != null) map['alcohol_comment'] = alcoholComment;
+    if (userTextAlcohol != null) map['user_text_alcohol'] = userTextAlcohol;
+    if (substanceTypes != null) map['substance_types'] = substanceTypes;
+    if (substanceLastUse != null) map['substance_last_use'] = substanceLastUse;
+    if (substanceNotes != null) map['substance_notes'] = substanceNotes;
+    if (sleepDuration != null) map['sleep_duration'] = sleepDuration;
+    if (sleepSymptoms != null) map['sleep_symptoms'] = sleepSymptoms;
+    if (sleepSchedule != null) map['sleep_schedule'] = sleepSchedule;
+    if (sleepScheduleNotes != null) map['sleep_schedule_notes'] = sleepScheduleNotes;
+    if (userTextSleep != null) map['user_text_sleep'] = userTextSleep;
+    if (dietCustomDetails != null) map['diet_custom_details'] = dietCustomDetails;
+    if (dietMealsPerDay != null) map['diet_meals_per_day'] = dietMealsPerDay;
+    if (dietSnacksPerDay != null) map['diet_snacks_per_day'] = dietSnacksPerDay;
+    if (dietStaples != null) map['diet_staples'] = dietStaples;
+    if (dietOccasionalFoods != null) map['diet_occasional_foods'] = dietOccasionalFoods;
+    if (dietFoodFrequencies != null) map['diet_food_frequencies'] = dietFoodFrequencies;
+    if (dietExcludedFoodsText != null) map['diet_excluded_foods_text'] = dietExcludedFoodsText;
+    if (dietDayDescription != null) map['diet_day_description'] = dietDayDescription;
+    if (drinksTotalVolume != null) map['drinks_total_volume'] = drinksTotalVolume;
+    if (drinksTypes != null) map['drinks_types'] = drinksTypes;
+    if (drinksCoffeeTypes != null) map['drinks_coffee_types'] = drinksCoffeeTypes;
+    if (drinksCoffeeFrequency != null) map['drinks_coffee_frequency'] = drinksCoffeeFrequency;
+    if (drinksCaffeineFrequency != null) map['drinks_caffeine_frequency'] = drinksCaffeineFrequency;
+    if (drinksDayDescription != null) map['drinks_day_description'] = drinksDayDescription;
+    if (userTextDrinks != null) map['user_text_drinks'] = userTextDrinks;
+    if (giSymptoms != null) map['gi_symptoms'] = giSymptoms;
+    if (giSymptomDetails != null) map['gi_symptom_details'] = giSymptomDetails;
+    if (workOccupation != null) map['work_occupation'] = workOccupation;
+    if (workStress != null) map['work_stress'] = workStress;
+    if (userTextWork != null) map['user_text_work'] = userTextWork;
+    if (activityDaysPerWeek != null) map['activity_days_per_week'] = activityDaysPerWeek;
+    if (activityDurationMinutes != null) map['activity_duration_minutes'] = activityDurationMinutes;
+    if (activityTypes != null) map['activity_types'] = activityTypes;
+    if (activityOtherDetails != null) map['activity_other_details'] = activityOtherDetails;
+    if (userTextSport != null) map['user_text_sport'] = userTextSport;
+    if (chronicCategories != null) map['chronic_categories'] = chronicCategories;
+    if (chronicConditionDetails != null) map['chronic_condition_details'] = chronicConditionDetails;
+    if (recentEvents != null) map['recent_events'] = recentEvents;
+    if (recentEventDetails != null) map['recent_event_details'] = recentEventDetails;
+    if (infectiousHistoryStatus != null) map['infectious_history_status'] = infectiousHistoryStatus;
+    if (infectiousDiagnosed != null) map['infectious_diagnosed'] = infectiousDiagnosed;
+    if (infectiousTestedNegative != null) map['infectious_tested_negative'] = infectiousTestedNegative;
+    if (infectiousLastTested != null) map['infectious_last_tested'] = infectiousLastTested;
     return map;
   }
 }

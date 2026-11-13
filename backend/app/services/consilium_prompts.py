@@ -62,13 +62,46 @@ def build_anamnesis_m1_context_from_answers(
     system_folders["musculoskeletal"]["axial_load_height"] = answers.height
     system_folders["musculoskeletal"]["axial_load_weight"] = answers.weight
 
+    # 1.1 Pregnancy and Lactation (endocrine, cvs, kidneys)
+    if answers.pregnancy_status:
+        ps_lower = answers.pregnancy_status.lower()
+        if ps_lower in ("да", "yes", "возможно, но не подтверждено", "possible_unconfirmed", "pregnant", "possible"):
+            system_folders["endocrine"]["pregnancy_status"] = answers.pregnancy_status
+            system_folders["endocrine"]["gestational_metabolic_state"] = "Active gestation / pregnancy adaptations"
+            system_folders["cvs"]["pregnancy_status"] = answers.pregnancy_status
+            system_folders["cvs"]["gestational_hemodynamic_shift"] = "Gestational hypervolemia & altered cardiac output"
+            system_folders["kidneys"]["pregnancy_status"] = answers.pregnancy_status
+            system_folders["kidneys"]["gestational_gfr_elevation"] = "Physiological gestational hyperfiltration"
+            if answers.pregnancy_trimester:
+                system_folders["endocrine"]["pregnancy_trimester"] = answers.pregnancy_trimester
+            if answers.pregnancy_weeks is not None:
+                system_folders["endocrine"]["pregnancy_weeks"] = answers.pregnancy_weeks
+
+    if answers.breastfeeding_status:
+        bs_lower = answers.breastfeeding_status.lower()
+        system_folders["endocrine"]["breastfeeding_status"] = answers.breastfeeding_status
+        if bs_lower in ("да", "yes"):
+            system_folders["endocrine"]["lactation_load"] = "Active lactation (prolactin / metabolic demand)"
+
+    # 1.2 Weight Dynamics (endocrine, cvs)
+    if answers.weight_change_status:
+        wcs_lower = answers.weight_change_status.lower()
+        system_folders["endocrine"]["weight_change_status"] = answers.weight_change_status
+        if "потерял" in wcs_lower or "lost" in wcs_lower:
+            system_folders["endocrine"]["weight_dynamics"] = f"Weight loss: {answers.weight_change_amount or ''} kg (intentional: {answers.weight_change_intentional})"
+            if answers.weight_change_intentional and answers.weight_change_intentional.lower() in ("нет", "no"):
+                system_folders["endocrine"]["unintentional_weight_loss"] = "Unintentional weight loss reported (catabolic/endocrine risk)"
+        elif "набрал" in wcs_lower or "gained" in wcs_lower:
+            system_folders["endocrine"]["weight_dynamics"] = f"Weight gain: {answers.weight_change_amount or ''} kg (intentional: {answers.weight_change_intentional})"
+            system_folders["cvs"]["weight_gain_hemodynamic_strain"] = "Increased cardiac workload due to recent weight gain"
+
     # 2. Nicotine (respiratory, cvs, immune)
     nic_status = answers.nicotine_status
     system_folders["respiratory"]["smoking_nicotine_status"] = nic_status
     system_folders["respiratory"]["smoking_status"] = nic_status
     system_folders["cvs"]["vessel_nicotine_status"] = nic_status
     system_folders["cvs"]["vessel_status"] = nic_status
-    if nic_status.lower() not in ("non-user", "не курю", "quit", "бросил"):
+    if nic_status.lower() not in ("non-user", "не курю", "quit", "бросил", "никогда", "never"):
         system_folders["immune"]["broncho_local_imm_disruption"] = True
     if answers.nicotine_years:
         system_folders["respiratory"]["smoking_nicotine_years"] = answers.nicotine_years
@@ -80,12 +113,22 @@ def build_anamnesis_m1_context_from_answers(
         system_folders["respiratory"]["smoking_freq"] = answers.nicotine_freq
         system_folders["cvs"]["vessel_nicotine_freq"] = answers.nicotine_freq
         system_folders["cvs"]["vessel_freq"] = answers.nicotine_freq
+    if answers.nicotine_products:
+        system_folders["respiratory"]["nicotine_products"] = answers.nicotine_products
+        if any(p in str(answers.nicotine_products) for p in ("Вейп", "Кальян", "Ингаляционные", "vape", "hookah")):
+            system_folders["respiratory"]["inhalation_aerosol_stress"] = "Aerosol / thermal airway stress"
+    if answers.nicotine_product_tenure:
+        system_folders["respiratory"]["nicotine_product_tenure"] = answers.nicotine_product_tenure
+    if answers.nicotine_current_frequency:
+        system_folders["cvs"]["vessel_nicotine_current_frequency"] = answers.nicotine_current_frequency
+    if answers.nicotine_quantities:
+        system_folders["respiratory"]["nicotine_quantities"] = answers.nicotine_quantities
 
     # 3. Alcohol (gi_tract, nervous, kidneys, endocrine, cvs)
     alc_status = answers.alcohol_status
     alc_lower = alc_status.lower()
     alc_type = (answers.alcohol_type or "").lower()
-    if alc_lower not in ("non-user", "zero", "не пью", "0"):
+    if alc_lower not in ("non-user", "zero", "не пью", "не употребляю", "none", "0"):
         system_folders["gi_tract"]["liver_tox_load"] = "Alcohol consumption recorded"
         system_folders["nervous"]["gaba_neuro_load"] = "Ethanol-induced GABA modulation"
     if "пиво" in alc_type or "beer" in alc_type:
@@ -93,8 +136,14 @@ def build_anamnesis_m1_context_from_answers(
         system_folders["endocrine"]["visceral_adipose_trigger"] = True
     if any(s in alc_type for s in ("крепкое", "вино", "vodka", "wine", "spirits", "liquor", "hard liquor")):
         system_folders["cvs"]["cardiomyopathy_risk"] = True
+    if answers.alcohol_types:
+        system_folders["gi_tract"]["alcohol_types"] = answers.alcohol_types
+        if any("энергет" in t.lower() or "energy" in t.lower() for t in answers.alcohol_types):
+            system_folders["cvs"]["alco_energy_arrhythmic_risk"] = "Combined ethanol and stimulant cardiac stress"
+    if answers.alcohol_volumes:
+        system_folders["gi_tract"]["alcohol_volumes"] = answers.alcohol_volumes
 
-    # 4. Specific Factors (nervous, cvs, gi_tract, respiratory)
+    # 4. Specific Factors / Дополнительные факторы здоровья (nervous, cvs, gi_tract, respiratory)
     spec_lower = f"{answers.spec_factors} {answers.user_text_spec_factors or ''}".lower()
     if any(s in spec_lower for s in ("стимуляция", "кофеин", "предтреник", "spec_stim", "stim")):
         system_folders["nervous"]["synaptic_overdrive"] = "Stimulation (caffeine, pre-workouts)"
@@ -107,6 +156,22 @@ def build_anamnesis_m1_context_from_answers(
         system_folders["nervous"]["heb_psych_effect"] = "Active inhalation components"
     if any(s in spec_lower for s in ("восстановление", "spec_recovery", "recovery")):
         system_folders["nervous"]["receptor_downregulation_history"] = "Receptor apparatus recovery period"
+    if answers.substance_types:
+        system_folders["nervous"]["substance_types"] = answers.substance_types
+        system_folders["nervous"]["substance_last_use"] = answers.substance_last_use
+        for s in answers.substance_types:
+            s_low = s.lower()
+            if "каннабис" in s_low or "cannabis" in s_low:
+                system_folders["nervous"]["cannabinoid_system_modulation"] = "Cannabinoid exposure"
+                system_folders["cvs"]["cannabis_tachycardia_orthostatic_risk"] = "Orthostatic / tachyarrhythmic risk"
+            elif "стимул" in s_low or "stimulant" in s_low:
+                system_folders["nervous"]["sympathetic_hyperdrive"] = "Non-prescription stimulant exposure"
+                system_folders["cvs"]["vasoconstrictive_crisis_risk"] = "Sympathomimetic vasoconstrictive risk"
+            elif "седат" in s_low or "sedative" in s_low:
+                system_folders["nervous"]["cns_depression_risk"] = "Non-prescription sedative exposure"
+            elif "опиоид" in s_low or "opioid" in s_low:
+                system_folders["respiratory"]["respiratory_depression_risk"] = "Opioid respiratory depression risk"
+                system_folders["nervous"]["opioid_receptor_engagement"] = "Opioid exposure"
 
     # 5. Sleep (endocrine, nervous)
     sleep = answers.sleep_quality
@@ -270,6 +335,26 @@ def build_anamnesis_m1_context_from_answers(
         "critical_infections": answers.critical_infections,
         "heredity_risks": answers.heredity_risks,
         "medications": answers.medications,
+        # Stage 1: New fields
+        "pregnancy_status": answers.pregnancy_status,
+        "pregnancy_trimester": answers.pregnancy_trimester,
+        "pregnancy_weeks": answers.pregnancy_weeks,
+        "breastfeeding_status": answers.breastfeeding_status,
+        "weight_change_status": answers.weight_change_status,
+        "weight_change_amount": answers.weight_change_amount,
+        "weight_change_intentional": answers.weight_change_intentional,
+        "nicotine_products": answers.nicotine_products,
+        "nicotine_product_tenure": answers.nicotine_product_tenure,
+        "nicotine_current_frequency": answers.nicotine_current_frequency,
+        "nicotine_quantities": answers.nicotine_quantities,
+        "nicotine_quit_when": answers.nicotine_quit_when,
+        "alcohol_types": answers.alcohol_types,
+        "alcohol_volumes": answers.alcohol_volumes,
+        "alcohol_comment": answers.alcohol_comment,
+        "user_text_alcohol": answers.user_text_alcohol,
+        "substance_types": answers.substance_types,
+        "substance_last_use": answers.substance_last_use,
+        "substance_notes": answers.substance_notes,
     }
     user_texts = {
         k: v

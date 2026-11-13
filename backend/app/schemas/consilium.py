@@ -3,7 +3,7 @@ from decimal import Decimal, InvalidOperation
 import math
 import re
 from enum import Enum
-from typing import Any, Dict, List, Literal, Optional, Tuple
+from typing import Any, Dict, List, Literal, Optional, Tuple, Union
 from pydantic import BaseModel, Field, ConfigDict, field_validator, model_validator
 from app.schemas.reports import ClientModelReportResponse
 
@@ -147,49 +147,111 @@ class AnamnesisQuestionnaireAnswers(BaseModel):
     # Card 1: Biological Profile
     gender: str = Field(..., max_length=32)
     age: int = Field(..., ge=18, le=120)
+    age_confirmed_unusual: Optional[bool] = Field(default=None)
+    pregnancy_status: Optional[str] = Field(default=None, max_length=64)
+    pregnancy_trimester: Optional[str] = Field(default=None, max_length=128)
+    pregnancy_weeks: Optional[Union[int, float]] = Field(default=None, ge=1, le=45)
+    breastfeeding_status: Optional[str] = Field(default=None, max_length=64)
 
     # Card 2: Dimensions
-    height: int = Field(..., ge=50, le=260)
-    weight: int = Field(..., ge=30, le=350)
+    height: Union[int, float] = Field(..., ge=50, le=260)
+    weight: Union[int, float] = Field(..., ge=20, le=500)
+    height_confirmed_unusual: Optional[bool] = Field(default=None)
+    weight_confirmed_unusual: Optional[bool] = Field(default=None)
+    weight_change_status: Optional[str] = Field(default=None, max_length=64)
+    weight_change_amount: Optional[Union[int, float]] = Field(default=None, ge=0)
+    weight_change_intentional: Optional[str] = Field(default=None, max_length=64)
 
     # Card 3: Nicotine
     nicotine_status: str = Field(..., min_length=1, max_length=128)
     nicotine_years: Optional[str] = Field(default=None, max_length=128)
     nicotine_freq: Optional[str] = Field(default=None, max_length=128)
+    nicotine_products: Optional[List[str]] = Field(default=None)
+    nicotine_product_tenure: Optional[Dict[str, str]] = Field(default=None)
+    nicotine_current_frequency: Optional[str] = Field(default=None, max_length=128)
+    nicotine_quantities: Optional[Dict[str, Any]] = Field(default=None)
+    nicotine_quit_when: Optional[str] = Field(default=None, max_length=128)
 
     # Card 4: Alcohol
     alcohol_status: str = Field(..., min_length=1, max_length=128)
     alcohol_type: Optional[str] = Field(default=None, max_length=128)
+    alcohol_types: Optional[List[str]] = Field(default=None)
+    alcohol_volumes: Optional[Dict[str, str]] = Field(default=None)
+    alcohol_comment: Optional[str] = Field(default=None, max_length=1024)
+    user_text_alcohol: Optional[str] = Field(default=None, max_length=1024)
 
-    # Card 5: Specific Factors
+    # Card 5: Specific Factors / Дополнительные факторы здоровья
     spec_factors: str = Field(..., min_length=1, max_length=512)
+    substance_types: Optional[List[str]] = Field(default=None)
+    substance_last_use: Optional[str] = Field(default=None, max_length=128)
+    substance_notes: Optional[str] = Field(default=None, max_length=1024)
 
-    # Card 6: Sleep
+    # Card 6: Sleep & Recovery (Stage 2)
     sleep_quality: str = Field(..., min_length=1, max_length=128)
+    sleep_duration: Optional[str] = Field(default=None, max_length=128)
+    sleep_symptoms: Optional[List[str]] = Field(default=None)
+    sleep_schedule: Optional[str] = Field(default=None, max_length=128)
+    sleep_schedule_notes: Optional[str] = Field(default=None, max_length=1024)
+    user_text_sleep: Optional[str] = Field(default=None, max_length=1024)
 
-    # Card 7: Diet Types
+    # Card 7: Diet & Eating Habits (Stage 2)
     diet_types: str = Field(..., min_length=1, max_length=512)
-
-    # Card 8: Dietary Habits
+    diet_custom_details: Optional[str] = Field(default=None, max_length=512)
+    diet_meals_per_day: Optional[str] = Field(default=None, max_length=128)
+    diet_snacks_per_day: Optional[str] = Field(default=None, max_length=128)
+    diet_staples: Optional[List[str]] = Field(default=None)
+    diet_occasional_foods: Optional[List[str]] = Field(default=None)
+    diet_food_frequencies: Optional[Dict[str, str]] = Field(default=None)
+    diet_excluded_foods_text: Optional[str] = Field(default=None, max_length=1024)
+    diet_day_description: Optional[str] = Field(default=None, max_length=1024)
     diet_habits: str = Field(..., min_length=1, max_length=512)
 
-    # Card 9: GI Signals
+    # Card 8: Drinks & Hydration (Stage 2)
+    drinks_total_volume: Optional[str] = Field(default=None, max_length=128)
+    drinks_types: Optional[List[str]] = Field(default=None)
+    drinks_coffee_types: Optional[List[str]] = Field(default=None)
+    drinks_coffee_frequency: Optional[str] = Field(default=None, max_length=128)
+    drinks_caffeine_frequency: Optional[str] = Field(default=None, max_length=128)
+    drinks_day_description: Optional[str] = Field(default=None, max_length=1024)
+    user_text_drinks: Optional[str] = Field(default=None, max_length=1024)
+
+    # Card 9: GI Signals / Digestion & Gastrointestinal Health (Stage 3)
     gi_signals: str = Field(..., min_length=1, max_length=512)
+    gi_symptoms: Optional[List[str]] = Field(default=None)
+    gi_symptom_details: Optional[Dict[str, Dict[str, str]]] = Field(default=None)
 
-    # Card 10 & 10.1: Work Mode & Sport
+    # Card 10: Work & Daily Routine (Stage 3)
     work_type: str = Field(..., min_length=1, max_length=128)
+    work_occupation: Optional[str] = Field(default=None, max_length=256)
     work_schedule: Optional[str] = Field(default=None, max_length=128)
-    sport_level: Optional[str] = Field(default=None, max_length=128)
+    work_stress: Optional[str] = Field(default=None, max_length=64)
+    user_text_work: Optional[str] = Field(default=None, max_length=1024)
 
-    # Card 11: Chronic Conditions
+    # Card 11: Physical Activity (Stage 3)
+    sport_level: Optional[str] = Field(default=None, max_length=128)
+    activity_days_per_week: Optional[str] = Field(default=None, max_length=64)
+    activity_duration_minutes: Optional[str] = Field(default=None, max_length=64)
+    activity_types: Optional[List[str]] = Field(default=None)
+    activity_other_details: Optional[str] = Field(default=None, max_length=256)
+    user_text_sport: Optional[str] = Field(default=None, max_length=1024)
+
+    # Card 12: Chronic Conditions & Medical History (Stage 4)
     chronic_diseases: str = Field(..., min_length=1, max_length=1024)
     onco_status: Optional[str] = Field(default=None, max_length=128)
+    chronic_categories: Optional[List[str]] = Field(default=None)
+    chronic_condition_details: Optional[Dict[str, Dict[str, str]]] = Field(default=None)
 
-    # Card 12: Recent Illness
+    # Card 13: Recent Illnesses & Health Events (Stage 4)
     recent_illness: str = Field(..., min_length=1, max_length=512)
+    recent_events: Optional[List[str]] = Field(default=None)
+    recent_event_details: Optional[Dict[str, Dict[str, str]]] = Field(default=None)
 
-    # Card 13: Screening & Safe Space
+    # Card 14: Infectious Disease History (Stage 4)
     critical_infections: str = Field(..., min_length=1, max_length=512)
+    infectious_history_status: Optional[str] = Field(default=None, max_length=128)
+    infectious_diagnosed: Optional[List[str]] = Field(default=None)
+    infectious_tested_negative: Optional[List[str]] = Field(default=None)
+    infectious_last_tested: Optional[str] = Field(default=None, max_length=256)
 
     # Card 14: Heredity
     heredity_risks: str = Field(..., min_length=1, max_length=1024)
@@ -224,6 +286,401 @@ class AnamnesisQuestionnaireAnswers(BaseModel):
         if s in ("female", "f", "женский", "ж"):
             return "Female"
         raise ValueError("Gender must be 'Male' or 'Female'.")
+
+    @field_validator("age", mode="before")
+    @classmethod
+    def validate_age(cls, v: Any) -> int:
+        if isinstance(v, str):
+            v_clean = v.strip()
+            try:
+                val_f = float(v_clean.replace(",", "."))
+                if not val_f.is_integer():
+                    raise ValueError(f"Возраст должен быть целым числом: {v}")
+                val = int(val_f)
+            except ValueError:
+                raise ValueError(f"Недопустимое значение возраста: {v}")
+        elif isinstance(v, (int, float)):
+            if isinstance(v, float) and not v.is_integer():
+                raise ValueError(f"Возраст должен быть целым числом: {v}")
+            val = int(v)
+        else:
+            raise ValueError(f"Недопустимый тип значения возраста: {type(v)}")
+        if math.isnan(val) or math.isinf(val):
+            raise ValueError("Возраст не может быть NaN или Infinity")
+        if val < 18 or val > 120:
+            raise ValueError(f"Возраст {val} лет выходит за допустимые пределы (18–120 лет)")
+        return val
+
+    @field_validator("height", mode="before")
+    @classmethod
+    def validate_height(cls, v: Any) -> Union[int, float]:
+        if isinstance(v, str):
+            v_clean = v.strip().replace(",", ".")
+            try:
+                val = float(v_clean)
+            except ValueError:
+                raise ValueError(f"Недопустимое значение роста: {v}")
+        elif isinstance(v, (int, float)):
+            val = float(v)
+        else:
+            raise ValueError(f"Недопустимый тип значения роста: {type(v)}")
+        if math.isnan(val) or math.isinf(val):
+            raise ValueError("Значение роста не может быть NaN или Infinity")
+        if val < 50.0 or val > 260.0:
+            raise ValueError(f"Рост {val} см выходит за допустимые пределы (50–260 см)")
+        return int(val) if val.is_integer() else val
+
+    @field_validator("weight", mode="before")
+    @classmethod
+    def validate_weight(cls, v: Any) -> Union[int, float]:
+        if isinstance(v, str):
+            v_clean = v.strip().replace(",", ".")
+            try:
+                val = float(v_clean)
+            except ValueError:
+                raise ValueError(f"Недопустимое значение веса: {v}")
+        elif isinstance(v, (int, float)):
+            val = float(v)
+        else:
+            raise ValueError(f"Недопустимый тип значения веса: {type(v)}")
+        if math.isnan(val) or math.isinf(val):
+            raise ValueError("Значение веса не может быть NaN или Infinity")
+        if val < 20.0 or val > 500.0:
+            raise ValueError(f"Вес {val} кг выходит за допустимые пределы (20–500 кг)")
+        return int(val) if val.is_integer() else val
+
+    @field_validator("pregnancy_weeks", mode="before")
+    @classmethod
+    def validate_pregnancy_weeks(cls, v: Any) -> Optional[Union[int, float]]:
+        if v is None or v == "":
+            return None
+        if isinstance(v, str):
+            v_clean = v.strip().replace(",", ".")
+            try:
+                val = float(v_clean)
+            except ValueError:
+                raise ValueError(f"Недопустимое значение срока беременности: {v}")
+        elif isinstance(v, (int, float)):
+            val = float(v)
+        else:
+            raise ValueError(f"Недопустимый тип срока беременности: {type(v)}")
+        if math.isnan(val) or math.isinf(val):
+            raise ValueError("Срок беременности не может быть NaN или Infinity")
+        if val < 1.0 or val > 45.0:
+            raise ValueError(f"Срок беременности {val} нед. выходит за физиологический диапазон (1–45 недель)")
+        return int(val) if val.is_integer() else val
+
+    @field_validator("weight_change_amount", mode="before")
+    @classmethod
+    def validate_weight_change_amount(cls, v: Any) -> Optional[Union[int, float]]:
+        if v is None or v == "":
+            return None
+        if isinstance(v, str):
+            v_clean = v.strip().replace(",", ".")
+            try:
+                val = float(v_clean)
+            except ValueError:
+                raise ValueError(f"Недопустимое значение изменения веса: {v}")
+        elif isinstance(v, (int, float)):
+            val = float(v)
+        else:
+            raise ValueError(f"Недопустимый тип изменения веса: {type(v)}")
+        if math.isnan(val) or math.isinf(val):
+            raise ValueError("Величина изменения веса не может быть NaN или Infinity")
+        if val < 0.0:
+            raise ValueError("Величина изменения веса не может быть отрицательной (знак минус запрещен)")
+        return int(val) if val.is_integer() else val
+
+    @model_validator(mode="after")
+    def validate_clinical_consistency(self) -> "AnamnesisQuestionnaireAnswers":
+        # 1. Pregnancy consistency
+        preg_status = (self.pregnancy_status or "").strip().lower()
+        if preg_status in ("да", "yes", "pregnant", "возможно", "possible"):
+            if self.pregnancy_trimester and self.pregnancy_weeks is not None:
+                tri = self.pregnancy_trimester.lower()
+                weeks = float(self.pregnancy_weeks)
+                if any(x in tri for x in ("первый", "1", "first")):
+                    if weeks > 13.9:
+                        raise ValueError(
+                            f"Срок беременности {weeks} нед. противоречит выбранному первому триместру (до 13 недель 6 дней)."
+                        )
+                elif any(x in tri for x in ("второй", "2", "second")):
+                    if weeks < 14.0 or weeks > 27.9:
+                        raise ValueError(
+                            f"Срок беременности {weeks} нед. противоречит выбранному второму триместру (14–27 недель 6 дней)."
+                        )
+                elif any(x in tri for x in ("третий", "3", "third")):
+                    if weeks < 28.0:
+                        raise ValueError(
+                            f"Срок беременности {weeks} нед. противоречит выбранному третьему триместру (с 28-й недели)."
+                        )
+        elif preg_status in ("нет", "no", "предпочитаю не отвечать", "prefer_not_to_say", "declined"):
+            if self.pregnancy_trimester is not None or self.pregnancy_weeks is not None:
+                raise ValueError(
+                    "Срок и триместр беременности не могут быть указаны, если беременность отсутствует или не подтверждена."
+                )
+
+        # 2. Weight change consistency
+        wc_status = (self.weight_change_status or "").strip().lower()
+        if wc_status in ("вес примерно одинаковый", "stable", "не знаю / не отслеживаю", "unknown", ""):
+            if self.weight_change_amount is not None or self.weight_change_intentional is not None:
+                raise ValueError(
+                    "Величина и намеренность изменения веса не могут быть указаны, если вес оставался стабильным или не отслеживался."
+                )
+        elif wc_status in ("набрал(а) вес", "gained", "потерял(а) вес", "lost"):
+            if self.weight_change_amount is not None:
+                if self.weight_change_amount <= 0:
+                    raise ValueError("Величина изменения веса должна быть строго положительным числом (> 0).")
+                if wc_status in ("потерял(а) вес", "lost") and float(self.weight_change_amount) >= float(self.weight):
+                    raise ValueError(
+                        f"Величина снижения веса ({self.weight_change_amount} кг) не может превышать или равняться текущему весу ({self.weight} кг)."
+                    )
+
+        # 3. Nicotine consistency & mutual exclusion
+        nic_status = (self.nicotine_status or "").strip().lower()
+        if nic_status in ("никогда", "never", "non-user", "не курю", "предпочитаю не отвечать", "prefer_not_to_say"):
+            if self.nicotine_products or self.nicotine_product_tenure or self.nicotine_current_frequency or self.nicotine_quantities:
+                raise ValueError("Выбор 'Никогда' или 'Предпочитаю не отвечать' исключает указание табачных продуктов, стажа и частоты.")
+        else:
+            if self.nicotine_products:
+                tenures = self.nicotine_product_tenure or {}
+                for prod in self.nicotine_products:
+                    if prod not in tenures or not tenures[prod]:
+                        raise ValueError(f"Для продукта '{prod}' обязательно должен быть указан стаж употребления.")
+            if nic_status in ("употреблял(а) раньше, сейчас нет", "former", "quit"):
+                if self.nicotine_current_frequency is not None:
+                    raise ValueError("Для бывшего употребления табака текущая частота не должна указываться.")
+
+        # 4. Alcohol consistency & mutual exclusion
+        alc_status = (self.alcohol_status or "").strip().lower()
+        if alc_status in ("не употребляю", "none", "non-drinker", "non-user", "не пью", "0", "предпочитаю не отвечать", "prefer_not_to_say"):
+            if self.alcohol_types or self.alcohol_volumes:
+                raise ValueError("Выбор 'Не употребляю' или 'Предпочитаю не отвечать' исключает выбор типов напитков и объемов.")
+
+        # 5. Substances consistency & mutual exclusion
+        if self.substance_types:
+            has_negative = any(s.strip().lower() in ("не употребляю", "предпочитаю не отвечать", "none", "prefer_not_to_say", "prefer not to say", "declined") for s in self.substance_types)
+            if has_negative and len(self.substance_types) > 1:
+                raise ValueError("Варианты 'Не употребляю' и 'Предпочитаю не отвечать' являются взаимоисключающими.")
+            if has_negative and self.substance_last_use is not None:
+                raise ValueError("Для статуса 'Не употребляю' / 'Предпочитаю не отвечать' время последнего употребления не указывается.")
+
+        # 6. Sleep symptoms mutual exclusion
+        if self.sleep_symptoms:
+            has_none_sleep = any(s.strip().lower() in ("none of the above", "ничего из перечисленного", "none") for s in self.sleep_symptoms)
+            if has_none_sleep and len(self.sleep_symptoms) > 1:
+                raise ValueError("Вариант 'Ничего из перечисленного' исключает выбор других симптомов сна.")
+
+        # 7. Diet type, staples, and details consistency
+        dt_low = (self.diet_types or "").lower()
+        if any(w in dt_low for w in ("other", "другое", "special diet")):
+            if not self.diet_custom_details or not self.diet_custom_details.strip():
+                raise ValueError("Для специального или другого типа питания необходимо указать подробности (diet_custom_details).")
+
+        if self.diet_staples:
+            staples_low = [s.lower() for s in self.diet_staples]
+            has_meat = any("meat" in s or "мясо" in s or "птица" in s or "poultry" in s for s in staples_low)
+            has_fish = any("fish" in s or "рыба" in s or "seafood" in s or "морепродукт" in s for s in staples_low)
+            has_dairy = any("dairy" in s or "молоч" in s or "milk" in s for s in staples_low)
+            has_eggs = any("egg" in s or "яйц" in s for s in staples_low)
+
+            if "vegan" in dt_low or "веган" in dt_low:
+                if has_meat or has_fish or has_dairy or has_eggs:
+                    raise ValueError("Веганский тип питания несовместим с продуктами животного происхождения (мясо, рыба, молочные продукты, яйца).")
+            elif "vegetarian" in dt_low or "вегетариан" in dt_low:
+                if has_meat or has_fish:
+                    raise ValueError("Вегетарианский тип питания несовместим с мясом, птицей или рыбой.")
+            elif "pescatarian" in dt_low or "пескетариан" in dt_low:
+                if has_meat:
+                    raise ValueError("Пескетарианский тип питания несовместим с мясом или птицей.")
+
+        # 8. Diet occasional foods and frequencies
+        if self.diet_occasional_foods:
+            has_none_occ = any(s.strip().lower() in ("none of the above", "ничего из перечисленного", "none") for s in self.diet_occasional_foods)
+            if has_none_occ and len(self.diet_occasional_foods) > 1:
+                raise ValueError("Вариант 'Ничего из перечисленного' исключает выбор отдельных периодических продуктов.")
+            if has_none_occ and self.diet_food_frequencies:
+                raise ValueError("Для варианта 'Ничего из перечисленного' частоты употребления продуктов не указываются.")
+            if not has_none_occ:
+                freqs = self.diet_food_frequencies or {}
+                for prod in self.diet_occasional_foods:
+                    if prod not in freqs or not freqs[prod]:
+                        raise ValueError(f"Для периодического продукта '{prod}' обязательно должна быть указана частота употребления.")
+
+        # 9. Drinks coffee and caffeine consistency
+        if self.drinks_types:
+            dt_types_low = [d.lower() for d in self.drinks_types]
+            has_coffee = any("coffee and coffee beverages" in d or "кофе и кофейные напитки" in d or (d.startswith("coffee") and "decaf" not in d) for d in dt_types_low)
+            if has_coffee:
+                if not self.drinks_coffee_types:
+                    raise ValueError("При выборе кофе необходимо указать хотя бы один вид кофейного напитка (drinks_coffee_types).")
+                if not self.drinks_coffee_frequency:
+                    raise ValueError("При выборе кофе необходимо указать частоту употребления (drinks_coffee_frequency).")
+            else:
+                if self.drinks_coffee_types or self.drinks_coffee_frequency:
+                    raise ValueError("Виды и частота кофе не могут быть указаны, если кофе не выбран в списке напитков.")
+
+        # 10. GI symptoms and details consistency (Stage 3)
+        if self.gi_symptoms:
+            has_none_gi = any(s.strip().lower() in ("none of the above", "ничего из перечисленного", "none", "no discomfort") for s in self.gi_symptoms)
+            if has_none_gi and len(self.gi_symptoms) > 1:
+                raise ValueError("Вариант 'None of the above' исключает выбор других симптомов ЖКТ.")
+            if has_none_gi and self.gi_symptom_details:
+                raise ValueError("Для варианта 'None of the above' уточнения симптомов ЖКТ не указываются.")
+            if not has_none_gi:
+                details = self.gi_symptom_details or {}
+                for sym in self.gi_symptoms:
+                    sym_data = details.get(sym)
+                    if not sym_data or not isinstance(sym_data, dict):
+                        raise ValueError(f"Для симптома ЖКТ '{sym}' необходимо указать частоту и давность.")
+                    freq = sym_data.get("frequency")
+                    dur = sym_data.get("duration")
+                    if not freq or not str(freq).strip():
+                        raise ValueError(f"Для симптома ЖКТ '{sym}' не указана частота (frequency).")
+                    if not dur or not str(dur).strip():
+                        raise ValueError(f"Для симптома ЖКТ '{sym}' не указана давность (duration).")
+                for detail_sym in details:
+                    if detail_sym not in self.gi_symptoms:
+                        raise ValueError(f"Уточнение указано для невыбранного симптома ЖКТ: '{detail_sym}'.")
+
+        # 11. Physical activity consistency (Stage 3)
+        if self.sport_level:
+            sl_low = self.sport_level.lower()
+            is_almost_none = any(w in sl_low for w in ("almost no", "нет активности", "couch", "none"))
+            if is_almost_none:
+                if self.activity_days_per_week or self.activity_duration_minutes or self.activity_types or self.activity_other_details:
+                    raise ValueError("Для уровня 'Almost no physical activity' количественные параметры тренировок не указываются.")
+            else:
+                if self.activity_types:
+                    has_other = any(t.strip().lower() == "other" or "другое" in t.strip().lower() for t in self.activity_types)
+                    if has_other and (not self.activity_other_details or not self.activity_other_details.strip()):
+                        raise ValueError("При выборе активности 'Other' необходимо указать её название (activity_other_details).")
+                    if not has_other and self.activity_other_details:
+                        raise ValueError("Поле activity_other_details не может быть указано, если 'Other' не выбран.")
+
+        # 12. Chronic conditions consistency (Stage 4)
+        if self.chronic_categories is not None:
+            if len(self.chronic_categories) == 0:
+                raise ValueError("Список категорий хронических заболеваний (chronic_categories) не может быть пустым.")
+            neg_cats = {"no diagnosed chronic conditions", "not sure / haven't been evaluated"}
+            cats_low = [c.strip().lower() for c in self.chronic_categories]
+            has_neg = any(c in neg_cats for c in cats_low)
+            if has_neg:
+                if len(self.chronic_categories) > 1:
+                    raise ValueError("Варианты отсутствия диагнозов или неопределённости взаимоисключающие с диагнозами и друг с другом.")
+                if self.chronic_condition_details:
+                    raise ValueError("При выборе отсутствия хронических заболеваний детали диагнозов не указываются.")
+                if self.onco_status:
+                    raise ValueError("Онкологический статус не может быть указан при отсутствии хронических заболеваний.")
+            else:
+                details = self.chronic_condition_details or {}
+                allowed_statuses = {
+                    "Ongoing / Still present",
+                    "Controlled or stable",
+                    "In remission (if applicable)",
+                    "Previously diagnosed, no current symptoms",
+                    "Not sure",
+                }
+                allowed_bothers = {
+                    "No, it doesn't currently bother me",
+                    "Yes, I occasionally experience symptoms",
+                    "Yes, I frequently experience symptoms",
+                    "Not sure",
+                }
+                no_symptom_bothers = {"No, it doesn't currently bother me", "Not sure"}
+                allowed_onco = {"Remission", "Newly diagnosed", "Active treatment", "Relapse"}
+
+                for cat in self.chronic_categories:
+                    cat_data = details.get(cat)
+                    if not cat_data or not isinstance(cat_data, dict):
+                        raise ValueError(f"Для категории '{cat}' необходимо указать детали диагноза (chronic_condition_details).")
+                    diag = (cat_data.get("diagnosis") or "").strip()
+                    if not diag:
+                        raise ValueError(f"Для категории '{cat}' необходимо указать название диагноза (diagnosis).")
+                    c_status = (cat_data.get("current_status") or "").strip()
+                    if c_status not in allowed_statuses:
+                        raise ValueError(f"Для категории '{cat}' указан некорректный текущий статус: '{c_status}'.")
+                    bothers = (cat_data.get("currently_bothers") or "").strip()
+                    if bothers not in allowed_bothers:
+                        raise ValueError(f"Для категории '{cat}' необходимо указать, беспокоит ли состояние сейчас (currently_bothers).")
+                    sym_text = (cat_data.get("current_symptoms_text") or "").strip()
+                    if bothers in no_symptom_bothers and sym_text:
+                        raise ValueError(f"Для категории '{cat}' при отсутствии текущих симптомов поле current_symptoms_text не должно заполняться.")
+                    if cat == "Cancer or oncological history":
+                        onco_detail = (cat_data.get("onco_status") or "").strip()
+                        if onco_detail not in allowed_onco or self.onco_status not in allowed_onco or onco_detail != self.onco_status:
+                            raise ValueError("Для категории онкологического анамнеза необходимо указать корректный и согласованный onco_status.")
+
+                for detail_cat in details:
+                    if detail_cat not in self.chronic_categories:
+                        raise ValueError(f"Указаны детали для невыбранной категории хронических заболеваний: '{detail_cat}'.")
+
+                if "Cancer or oncological history" not in self.chronic_categories and self.onco_status:
+                    raise ValueError("Поле onco_status не может быть указано, если категория онкологического анамнеза не выбрана.")
+
+        # 13. Recent illnesses & health events consistency (Stage 4)
+        if self.recent_events is not None:
+            if len(self.recent_events) == 0:
+                raise ValueError("Список недавних событий (recent_events) не может быть пустым.")
+            ev_low = [e.strip().lower() for e in self.recent_events]
+            if any(e in ("covid-19", "covid", "ill_covid") for e in ev_low):
+                raise ValueError("COVID-19 не должен быть отдельным пунктом; он объединяется с респираторными вирусными инфекциями.")
+            has_none_ev = any(e in ("none of the above", "none") for e in ev_low)
+            if has_none_ev:
+                if len(self.recent_events) > 1:
+                    raise ValueError("Вариант 'None of the above' взаимоисключает другие недавние события.")
+                if self.recent_event_details:
+                    raise ValueError("При выборе 'None of the above' детализация недавних событий не указывается.")
+            else:
+                ev_details = self.recent_event_details or {}
+                allowed_tf_codes = {"0_7_days", "8_30_days", "31_90_days"}
+                allowed_recovery = {"Fully recovered", "Improving", "Symptoms are still present"}
+                for ev in self.recent_events:
+                    ev_data = ev_details.get(ev)
+                    if not ev_data or not isinstance(ev_data, dict):
+                        raise ValueError(f"Для события '{ev}' необходимо указать давность и состояние восстановления.")
+                    tf_code = (ev_data.get("timeframe_code") or "").strip()
+                    if tf_code not in allowed_tf_codes:
+                        raise ValueError(f"Для события '{ev}' указан некорректный непересекающийся интервал (timeframe_code): '{tf_code}'.")
+                    rec_status = (ev_data.get("recovery_status") or "").strip()
+                    if rec_status not in allowed_recovery:
+                        raise ValueError(f"Для события '{ev}' указано некорректное состояние восстановления (recovery_status): '{rec_status}'.")
+                for detail_ev in ev_details:
+                    if detail_ev not in self.recent_events:
+                        raise ValueError(f"Указаны детали для невыбранного недавнего события: '{detail_ev}'.")
+
+        # 14. Infectious disease history consistency (Stage 4)
+        allowed_inf_statuses = {
+            "I have been diagnosed with one or more of these infections",
+            "I have not been diagnosed with any of these infections",
+            "I have had negative test results",
+            "I don't know / I haven't been tested",
+            "Prefer not to answer",
+        }
+        if self.infectious_history_status is not None:
+            if self.infectious_history_status not in allowed_inf_statuses:
+                raise ValueError(f"Недопустимый статус инфекционного анамнеза: '{self.infectious_history_status}'.")
+            if self.infectious_history_status == "I have been diagnosed with one or more of these infections":
+                if not self.infectious_diagnosed or len(self.infectious_diagnosed) == 0:
+                    raise ValueError("При указании диагностированных инфекций необходимо выбрать хотя бы одну инфекцию (infectious_diagnosed).")
+                if self.infectious_tested_negative or (self.infectious_last_tested and self.infectious_last_tested.strip()):
+                    raise ValueError("Сведения об отрицательных тестах не должны указываться одновременно с веткой подтверждённых диагнозов.")
+            elif self.infectious_history_status == "I have had negative test results":
+                if self.infectious_diagnosed or (self.user_text_critical_infections and self.user_text_critical_infections.strip()):
+                    raise ValueError("При выборе ветки отрицательных тестов диагностированные инфекции не указываются.")
+            else:
+                if (
+                    self.infectious_diagnosed
+                    or self.infectious_tested_negative
+                    or (self.infectious_last_tested and self.infectious_last_tested.strip())
+                    or (self.user_text_critical_infections and self.user_text_critical_infections.strip())
+                ):
+                    raise ValueError(f"Для статуса '{self.infectious_history_status}' детали диагностированных инфекций или тестов не указываются.")
+        else:
+            if self.infectious_diagnosed or self.infectious_tested_negative or self.infectious_last_tested:
+                raise ValueError("Поля инфекционного анамнеза не могут передаваться без указания infectious_history_status.")
+
+        return self
 
 
 class AnamnesisIntakeRequest(BaseModel):

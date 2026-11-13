@@ -1116,12 +1116,16 @@ class VaultService extends ChangeNotifier {
     if (age == null || age < 18 || age > 120) return null;
 
     final heightRaw = global['height'];
-    final int? height = heightRaw is int ? heightRaw : int.tryParse(heightRaw?.toString().trim() ?? '');
+    final num? height = heightRaw is num
+        ? heightRaw
+        : num.tryParse(heightRaw?.toString().replaceAll(',', '.').trim() ?? '');
     if (height == null || height < 50 || height > 260) return null;
 
     final weightRaw = global['weight'];
-    final int? weight = weightRaw is int ? weightRaw : int.tryParse(weightRaw?.toString().trim() ?? '');
-    if (weight == null || weight < 30 || weight > 350) return null;
+    final num? weight = weightRaw is num
+        ? weightRaw
+        : num.tryParse(weightRaw?.toString().replaceAll(',', '.').trim() ?? '');
+    if (weight == null || weight < 20 || weight > 500) return null;
 
     final nicotineStatus = global['nicotine_status']?.toString().trim();
     if (nicotineStatus == null || nicotineStatus.isEmpty) return null;
@@ -1129,8 +1133,14 @@ class VaultService extends ChangeNotifier {
     final alcoholStatus = global['alcohol_status']?.toString().trim();
     if (alcoholStatus == null || alcoholStatus.isEmpty) return null;
 
-    final specFactors = global['spec_factors']?.toString().trim();
-    if (specFactors == null || specFactors.isEmpty) return null;
+    String? specFactors = global['spec_factors']?.toString().trim();
+    if (specFactors == null || specFactors.isEmpty) {
+      if (global['substance_types'] is List && (global['substance_types'] as List).isNotEmpty) {
+        specFactors = (global['substance_types'] as List).join(', ');
+      } else {
+        specFactors = 'None';
+      }
+    }
 
     final sleepQuality = global['sleep_quality']?.toString().trim();
     if (sleepQuality == null || sleepQuality.isEmpty) return null;
@@ -1138,8 +1148,14 @@ class VaultService extends ChangeNotifier {
     final dietTypes = global['diet_types']?.toString().trim();
     if (dietTypes == null || dietTypes.isEmpty) return null;
 
-    final dietHabits = global['diet_habits']?.toString().trim();
-    if (dietHabits == null || dietHabits.isEmpty) return null;
+    String? dietHabits = global['diet_habits']?.toString().trim();
+    if (dietHabits == null || dietHabits.isEmpty) {
+      if (global['diet_meals_per_day'] != null) {
+        dietHabits = '${global['diet_meals_per_day']} meals/day';
+      } else {
+        dietHabits = 'Regular meals';
+      }
+    }
 
     final giSignals = global['gi_signals']?.toString().trim();
     if (giSignals == null || giSignals.isEmpty) return null;
@@ -1161,6 +1177,142 @@ class VaultService extends ChangeNotifier {
 
     final medications = global['medications']?.toString().trim();
     if (medications == null || medications.isEmpty) return null;
+
+    final pregWeeksRaw = global['pregnancy_weeks'];
+    final num? pregWeeks = pregWeeksRaw is num
+        ? pregWeeksRaw
+        : num.tryParse(pregWeeksRaw?.toString().replaceAll(',', '.').trim() ?? '');
+
+    final wtChangeAmtRaw = global['weight_change_amount'];
+    final num? wtChangeAmt = wtChangeAmtRaw is num
+        ? wtChangeAmtRaw
+        : num.tryParse(wtChangeAmtRaw?.toString().replaceAll(',', '.').trim() ?? '');
+
+    List<String>? nicotineProducts;
+    if (global['nicotine_products'] is List) {
+      nicotineProducts = (global['nicotine_products'] as List).map((e) => e.toString()).toList();
+    }
+
+    Map<String, String>? nicotineProductTenure;
+    if (global['nicotine_product_tenure'] is Map) {
+      nicotineProductTenure = (global['nicotine_product_tenure'] as Map).map((k, v) => MapEntry(k.toString(), v.toString()));
+    }
+
+    Map<String, dynamic>? nicotineQuantities;
+    if (global['nicotine_quantities'] is Map) {
+      nicotineQuantities = Map<String, dynamic>.from(global['nicotine_quantities'] as Map);
+    }
+
+    List<String>? alcoholTypes;
+    if (global['alcohol_types'] is List) {
+      alcoholTypes = (global['alcohol_types'] as List).map((e) => e.toString()).toList();
+    }
+
+    Map<String, String>? alcoholVolumes;
+    if (global['alcohol_volumes'] is Map) {
+      alcoholVolumes = (global['alcohol_volumes'] as Map).map((k, v) => MapEntry(k.toString(), v.toString()));
+    }
+
+    List<String>? substanceTypes;
+    if (global['substance_types'] is List) {
+      substanceTypes = (global['substance_types'] as List).map((e) => e.toString()).toList();
+    }
+
+    List<String>? sleepSymptoms;
+    if (global['sleep_symptoms'] is List) {
+      sleepSymptoms = (global['sleep_symptoms'] as List).map((e) => e.toString()).toList();
+    }
+
+    List<String>? dietStaples;
+    if (global['diet_staples'] is List) {
+      dietStaples = (global['diet_staples'] as List).map((e) => e.toString()).toList();
+    }
+
+    List<String>? dietOccasionalFoods;
+    if (global['diet_occasional_foods'] is List) {
+      dietOccasionalFoods = (global['diet_occasional_foods'] as List).map((e) => e.toString()).toList();
+    }
+
+    Map<String, String>? dietFoodFrequencies;
+    if (global['diet_food_frequencies'] is Map) {
+      dietFoodFrequencies = (global['diet_food_frequencies'] as Map).map((k, v) => MapEntry(k.toString(), v.toString()));
+    }
+
+    List<String>? drinksTypes;
+    if (global['drinks_types'] is List) {
+      drinksTypes = (global['drinks_types'] as List).map((e) => e.toString()).toList();
+    }
+
+    List<String>? drinksCoffeeTypes;
+    if (global['drinks_coffee_types'] is List) {
+      drinksCoffeeTypes = (global['drinks_coffee_types'] as List).map((e) => e.toString()).toList();
+    }
+
+    List<String>? giSymptoms;
+    if (global['gi_symptoms'] is List) {
+      giSymptoms = (global['gi_symptoms'] as List).map((e) => e.toString()).toList();
+    }
+
+    Map<String, Map<String, String>>? giSymptomDetails;
+    if (global['gi_symptom_details'] is Map) {
+      giSymptomDetails = (global['gi_symptom_details'] as Map).map(
+        (k, v) => MapEntry(
+          k.toString(),
+          (v is Map)
+              ? v.map((ik, iv) => MapEntry(ik.toString(), iv.toString()))
+              : <String, String>{},
+        ),
+      );
+    }
+
+    List<String>? activityTypes;
+    if (global['activity_types'] is List) {
+      activityTypes = (global['activity_types'] as List).map((e) => e.toString()).toList();
+    }
+
+    List<String>? chronicCategories;
+    if (global['chronic_categories'] is List) {
+      chronicCategories = (global['chronic_categories'] as List).map((e) => e.toString()).toList();
+    }
+
+    Map<String, Map<String, String>>? chronicConditionDetails;
+    if (global['chronic_condition_details'] is Map) {
+      chronicConditionDetails = (global['chronic_condition_details'] as Map).map(
+        (k, v) => MapEntry(
+          k.toString(),
+          (v is Map)
+              ? v.map((ik, iv) => MapEntry(ik.toString(), iv.toString()))
+              : <String, String>{},
+        ),
+      );
+    }
+
+    List<String>? recentEvents;
+    if (global['recent_events'] is List) {
+      recentEvents = (global['recent_events'] as List).map((e) => e.toString()).toList();
+    }
+
+    Map<String, Map<String, String>>? recentEventDetails;
+    if (global['recent_event_details'] is Map) {
+      recentEventDetails = (global['recent_event_details'] as Map).map(
+        (k, v) => MapEntry(
+          k.toString(),
+          (v is Map)
+              ? v.map((ik, iv) => MapEntry(ik.toString(), iv.toString()))
+              : <String, String>{},
+        ),
+      );
+    }
+
+    List<String>? infectiousDiagnosed;
+    if (global['infectious_diagnosed'] is List) {
+      infectiousDiagnosed = (global['infectious_diagnosed'] as List).map((e) => e.toString()).toList();
+    }
+
+    List<String>? infectiousTestedNegative;
+    if (global['infectious_tested_negative'] is List) {
+      infectiousTestedNegative = (global['infectious_tested_negative'] as List).map((e) => e.toString()).toList();
+    }
 
     return AnamnesisQuestionnaireAnswers(
       ageConfirmation: ageConf,
@@ -1189,12 +1341,72 @@ class VaultService extends ChangeNotifier {
       medications: medications,
       userTextMedications: global['text_medications']?.toString().trim(),
       userTextHeredityRisks: global['text_heredity_risks']?.toString().trim(),
-      userTextChronicDiseases: global['text_chronic_diseases']?.toString().trim(),
-      userTextRecentIllness: global['text_recent_illness']?.toString().trim(),
-      userTextCriticalInfections: global['text_critical_infections']?.toString().trim(),
+      userTextChronicDiseases: global['user_text_chronic_diseases']?.toString().trim() ?? global['text_chronic_diseases']?.toString().trim(),
+      userTextRecentIllness: global['user_text_recent_illness']?.toString().trim() ?? global['text_recent_illness']?.toString().trim(),
+      userTextCriticalInfections: global['user_text_critical_infections']?.toString().trim() ?? global['text_critical_infections']?.toString().trim(),
       userTextSpecFactors: global['text_spec_factors']?.toString().trim(),
       userTextDietHabits: global['text_diet_habits']?.toString().trim(),
       userTextGiSignals: global['text_gi_signals']?.toString().trim(),
+      ageConfirmedUnusual: global['age_confirmed_unusual'] == true,
+      pregnancyStatus: global['pregnancy_status']?.toString().trim(),
+      pregnancyTrimester: global['pregnancy_trimester']?.toString().trim(),
+      pregnancyWeeks: pregWeeks,
+      breastfeedingStatus: global['breastfeeding_status']?.toString().trim(),
+      heightConfirmedUnusual: global['height_confirmed_unusual'] == true,
+      weightConfirmedUnusual: global['weight_confirmed_unusual'] == true,
+      weightChangeStatus: global['weight_change_status']?.toString().trim(),
+      weightChangeAmount: wtChangeAmt,
+      weightChangeIntentional: global['weight_change_intentional']?.toString().trim(),
+      nicotineProducts: nicotineProducts,
+      nicotineProductTenure: nicotineProductTenure,
+      nicotineCurrentFrequency: global['nicotine_current_frequency']?.toString().trim(),
+      nicotineQuantities: nicotineQuantities,
+      nicotineQuitWhen: global['nicotine_quit_when']?.toString().trim(),
+      alcoholTypes: alcoholTypes,
+      alcoholVolumes: alcoholVolumes,
+      alcoholComment: global['alcohol_comment']?.toString().trim(),
+      userTextAlcohol: global['user_text_alcohol']?.toString().trim() ?? global['text_alcohol']?.toString().trim(),
+      substanceTypes: substanceTypes,
+      substanceLastUse: global['substance_last_use']?.toString().trim(),
+      substanceNotes: global['substance_notes']?.toString().trim() ?? global['text_spec_factors']?.toString().trim(),
+      sleepDuration: global['sleep_duration']?.toString().trim(),
+      sleepSymptoms: sleepSymptoms,
+      sleepSchedule: global['sleep_schedule']?.toString().trim(),
+      sleepScheduleNotes: global['sleep_schedule_notes']?.toString().trim(),
+      userTextSleep: global['user_text_sleep']?.toString().trim() ?? global['text_sleep']?.toString().trim(),
+      dietCustomDetails: global['diet_custom_details']?.toString().trim(),
+      dietMealsPerDay: global['diet_meals_per_day']?.toString().trim(),
+      dietSnacksPerDay: global['diet_snacks_per_day']?.toString().trim(),
+      dietStaples: dietStaples,
+      dietOccasionalFoods: dietOccasionalFoods,
+      dietFoodFrequencies: dietFoodFrequencies,
+      dietExcludedFoodsText: global['diet_excluded_foods_text']?.toString().trim(),
+      dietDayDescription: global['diet_day_description']?.toString().trim() ?? global['text_diet_day']?.toString().trim(),
+      drinksTotalVolume: global['drinks_total_volume']?.toString().trim(),
+      drinksTypes: drinksTypes,
+      drinksCoffeeTypes: drinksCoffeeTypes,
+      drinksCoffeeFrequency: global['drinks_coffee_frequency']?.toString().trim(),
+      drinksCaffeineFrequency: global['drinks_caffeine_frequency']?.toString().trim(),
+      drinksDayDescription: global['drinks_day_description']?.toString().trim() ?? global['text_drinks']?.toString().trim(),
+      userTextDrinks: global['user_text_drinks']?.toString().trim() ?? global['text_drinks']?.toString().trim(),
+      giSymptoms: giSymptoms,
+      giSymptomDetails: giSymptomDetails,
+      workOccupation: global['work_occupation']?.toString().trim(),
+      workStress: global['work_stress']?.toString().trim(),
+      userTextWork: global['user_text_work']?.toString().trim() ?? global['text_work']?.toString().trim(),
+      activityDaysPerWeek: global['activity_days_per_week']?.toString().trim(),
+      activityDurationMinutes: global['activity_duration_minutes']?.toString().trim(),
+      activityTypes: activityTypes,
+      activityOtherDetails: global['activity_other_details']?.toString().trim(),
+      userTextSport: global['user_text_sport']?.toString().trim() ?? global['text_sport']?.toString().trim(),
+      chronicCategories: chronicCategories,
+      chronicConditionDetails: chronicConditionDetails,
+      recentEvents: recentEvents,
+      recentEventDetails: recentEventDetails,
+      infectiousHistoryStatus: global['infectious_history_status']?.toString().trim(),
+      infectiousDiagnosed: infectiousDiagnosed,
+      infectiousTestedNegative: infectiousTestedNegative,
+      infectiousLastTested: global['infectious_last_tested']?.toString().trim(),
     );
   }
 
@@ -1541,15 +1753,37 @@ class VaultService extends ChangeNotifier {
     _systemFolders['global']![cardId] = value;
     if (userText.isNotEmpty) {
       _systemFolders['global']!['text_$cardId'] = userText;
+    } else {
+      _systemFolders['global']!.remove('text_$cardId');
     }
 
     _mirrorToNotesExport('anamnesis_$cardId', value);
     if (userText.isNotEmpty) {
       _mirrorToNotesExport('anamnesis_text_$cardId', userText);
+    } else if (_systemFolders['notes_export'] != null) {
+      _systemFolders['notes_export']!.remove('anamnesis_text_$cardId');
     }
 
     _applySingleAnamnesisDerivation(cardId, value);
 
+    _persist();
+    notifyListeners();
+  }
+
+  /// Removes specific anamnesis keys and their text companions from global and notes_export.
+  void removeAnamnesisKeys(List<String> keys) {
+    if (_systemFolders['global'] != null) {
+      for (final k in keys) {
+        _systemFolders['global']!.remove(k);
+        _systemFolders['global']!.remove('text_$k');
+      }
+    }
+    if (_systemFolders['notes_export'] != null) {
+      for (final k in keys) {
+        _systemFolders['notes_export']!.remove('anamnesis_$k');
+        _systemFolders['notes_export']!.remove('anamnesis_text_$k');
+      }
+    }
     _persist();
     notifyListeners();
   }
@@ -1567,6 +1801,16 @@ class VaultService extends ChangeNotifier {
       case 'age':
         break;
 
+      case 'pregnancy_status':
+        _systemFolders['endocrine']?['pregnancy_status'] = value;
+        _systemFolders['cvs']?['pregnancy_status'] = value;
+        _systemFolders['kidneys']?['pregnancy_status'] = value;
+        break;
+
+      case 'breastfeeding_status':
+        _systemFolders['endocrine']?['breastfeeding_status'] = value;
+        break;
+
       case 'height':
       case 'weight':
         _systemFolders['endocrine']?['physical_$cardId'] = value;
@@ -1574,9 +1818,18 @@ class VaultService extends ChangeNotifier {
         _systemFolders['musculoskeletal']?['axial_load_$cardId'] = value;
         break;
 
+      case 'weight_change_status':
+        _systemFolders['endocrine']?['weight_dynamics'] = value;
+        _systemFolders['cvs']?['weight_dynamics'] = value;
+        break;
+
       case 'nicotine_status':
       case 'nicotine_years':
       case 'nicotine_freq':
+      case 'nicotine_products':
+      case 'nicotine_product_tenure':
+      case 'nicotine_current_frequency':
+      case 'nicotine_quantities':
         _systemFolders['respiratory']?['smoking_$cardId'] = value;
         _systemFolders['cvs']?['vessel_$cardId'] = value;
         _systemFolders['immune']?['broncho_local_imm_disruption'] = true;
@@ -1584,6 +1837,8 @@ class VaultService extends ChangeNotifier {
 
       case 'alcohol_status':
       case 'alcohol_type':
+      case 'alcohol_types':
+      case 'alcohol_volumes':
         _systemFolders['gi_tract']?['liver_tox_load'] = "Alcohol consumption recorded";
         _systemFolders['nervous']?['gaba_neuro_load'] = "Ethanol-induced GABA modulation";
 
@@ -1591,50 +1846,68 @@ class VaultService extends ChangeNotifier {
           _systemFolders['kidneys']?['uric_acid_risk'] = true;
           _systemFolders['endocrine']?['visceral_adipose_trigger'] = true;
         }
-        if (valueString.contains('крепкое') || valueString.contains('вино') || valueString.contains('vodka')) {
+        if (valueString.contains('крепкое') || valueString.contains('вино') || valueString.contains('vodka') || valueString.contains('spirits')) {
           _systemFolders['cvs']?['cardiomyopathy_risk'] = true;
+        }
+        if (valueString.contains('энергетик') || valueString.contains('energy')) {
+          _systemFolders['cvs']?['arrhythmia_risk'] = true;
         }
         break;
 
+      case 'substance_types':
+      case 'substance_last_use':
       case 'spec_factors':
-        if (valueString.contains('стимуляция') || valueString.contains('кофеин') || valueString.contains('предтреник')) {
-          _systemFolders['nervous']?['synaptic_overdrive'] = "Stimulation (caffeine, pre-workouts)";
+        if (valueString.contains('стимуля') || valueString.contains('кофеин') || valueString.contains('предтреник')) {
+          _systemFolders['nervous']?['synaptic_overdrive'] = "Stimulation";
           _systemFolders['cvs']?['vasoconstriction_tachy_response'] = "Vasoconstrictor potential";
           _systemFolders['gi_tract']?['mucosal_ischemia_hyperacidity'] = "Risk of hyperacidity / mucosal ischemia";
         }
-        if (valueString.contains('седация') || valueString.contains('антидепрессант')) {
-          _systemFolders['nervous']?['cns_stabilization_mod'] = "Pharmacological sedation (BP)";
+        if (valueString.contains('седатив') || valueString.contains('антидепрессант')) {
+          _systemFolders['nervous']?['cns_stabilization_mod'] = "Pharmacological sedation";
         }
-        if (valueString.contains('ингаляции') || valueString.contains('вейп')) {
+        if (valueString.contains('ингаляц') || valueString.contains('вейп') || valueString.contains('каннабис') || valueString.contains('cannabis')) {
           _systemFolders['respiratory']?['alveolar_stress'] = "Aerosol / respiratory alveolar stress";
-          _systemFolders['nervous']?['heb_psych_effect'] = "Active inhalation components";
+          _systemFolders['nervous']?['heb_psych_effect'] = "Active psychoactive components";
         }
-        if (valueString.contains('восстановление')) {
+        if (valueString.contains('опиоид') || valueString.contains('opioid')) {
+          _systemFolders['respiratory']?['hypoventilation_risk'] = true;
+          _systemFolders['nervous']?['opioid_receptor_modulation'] = true;
+        }
+        if (valueString.contains('раньше') || valueString.contains('former') || valueString.contains('восстановление')) {
           _systemFolders['nervous']?['receptor_downregulation_history'] = "Receptor apparatus recovery period";
         }
         break;
 
       case 'sleep_quality':
-        _systemFolders['endocrine']?['circadian_desynchronosis'] = "Circadian desynchronosis (Sleep quality: $value)";
-        _systemFolders['nervous']?['glymphatic_clearance_disruption'] = (value == 'Бессонница' || value == 'Сбит режим');
+      case 'sleep_duration':
+      case 'sleep_symptoms':
+        _systemFolders['endocrine']?['circadian_desynchronosis'] = "Circadian desynchronosis ($value)";
+        if (valueString.contains('бессонница') || valueString.contains('insomnia') || valueString.contains('сбит режим') || valueString.contains('awakenings') || valueString.contains('fragmented')) {
+          _systemFolders['nervous']?['glymphatic_clearance_disruption'] = true;
+        }
+        if (valueString.contains('apnea') || valueString.contains('snoring') || valueString.contains('храп') || valueString.contains('апноэ')) {
+          _systemFolders['respiratory']?['sleep_apnea_risk'] = true;
+          _systemFolders['cvs']?['nocturnal_hypoxemia_risk'] = true;
+        }
         break;
 
+      case 'diet_staples':
       case 'diet_types':
-        if (valueString.contains('мясо') || valueString.contains('meat')) {
+        if (valueString.contains('мясо') || valueString.contains('meat') || valueString.contains('poultry') || valueString.contains('птиц')) {
           _systemFolders['gi_tract']?['protease_load'] = "High protease demand (meat diet)";
           _systemFolders['kidneys']?['nitrogen_waste_load'] = "Increased nitrogen waste load";
         }
-        if (valueString.contains('овощи') || valueString.contains('vegetables')) {
+        if (valueString.contains('овощи') || valueString.contains('vegetables') || valueString.contains('greens')) {
           _systemFolders['gi_tract']?['microbiome_substrate'] = "Sufficient dietary fiber";
         }
-        if (valueString.contains('фастфуд') || valueString.contains('fastfood')) {
+        if (valueString.contains('фастфуд') || valueString.contains('fastfood') || valueString.contains('fast food')) {
           _systemFolders['endocrine']?['insulin_spike_risk'] = "High glycemic load index (fast food)";
           _systemFolders['cvs']?['endothelial_lipid_damage'] = "Atherogenic dietary profile (trans fats)";
         }
-        if (valueString.contains('рыба') || valueString.contains('fish')) {
+        if (valueString.contains('рыба') || valueString.contains('fish') || valueString.contains('seafood')) {
           _systemFolders['cvs']?['omega3_cardioprotection'] = "Omega-3 protection active";
         }
-        if (valueString.contains('молочн') || valueString.contains('milk')) {
+        if (valueString.contains('молочн') || valueString.contains('milk') || valueString.contains('dairy')) {
           _systemFolders['gi_tract']?['lactase_check'] = "Consumption of lactose-containing products";
           _systemFolders['musculoskeletal']?['minor_calcium_source'] = "Dietary calcium source in the diet";
         }
@@ -1644,11 +1917,12 @@ class VaultService extends ChangeNotifier {
         }
         break;
 
+      case 'diet_occasional_foods':
       case 'diet_habits':
-        if (valueString.contains('сладкое') || valueString.contains('sugar')) {
+        if (valueString.contains('сладкое') || valueString.contains('sugar') || valueString.contains('dessert') || valueString.contains('sweet')) {
           _systemFolders['endocrine']?['carb_metabolism_glycation'] = "Excess simple carbohydrates (glycation risk)";
         }
-        if (valueString.contains('солен') || valueString.contains('salt')) {
+        if (valueString.contains('солен') || valueString.contains('salt') || valueString.contains('chips') || valueString.contains('snacks')) {
           _systemFolders['cvs']?['volemic_hypertension_load'] = "Sodium-dependent volemic load";
           _systemFolders['kidneys']?['tubular_osmotic_load'] = "Increased tubular osmotic load";
         }
@@ -1661,9 +1935,26 @@ class VaultService extends ChangeNotifier {
           _systemFolders['gi_tract']?['nocturnal_reflux_risk'] = "Risk of nocturnal reflux";
           _systemFolders['endocrine']?['nocturnal_sth_blockade'] = "Risk of suppressing nocturnal GH (STH) secretion";
         }
-        if (valueString.contains('мало воды') || valueString.contains('water')) {
+        if (valueString.contains('мало воды') || valueString.contains('water') || valueString.contains('< 1')) {
           _systemFolders['kidneys']?['hypersthenuria_urolithiasis_risk'] = "Risk of hypersthenuria and urolithiasis";
           _systemFolders['cvs']?['hemoconcentration_viscosity_load'] = "Hemoconcentration syndrome (circulating blood volume deficit)";
+        }
+        break;
+
+      case 'drinks_total_volume':
+      case 'drinks_types':
+      case 'drinks_coffee_types':
+        if (valueString.contains('< 1') || valueString.contains('low water')) {
+          _systemFolders['kidneys']?['hypersthenuria_urolithiasis_risk'] = "Risk of hypersthenuria and urolithiasis";
+          _systemFolders['cvs']?['hemoconcentration_viscosity_load'] = "Hemoconcentration syndrome (circulating blood volume deficit)";
+        }
+        if (valueString.contains('coffee') || valueString.contains('кофе') || valueString.contains('energy') || valueString.contains('энергетик')) {
+          _systemFolders['nervous']?['adenosine_receptor_blockade'] = "Chronic adenosine receptor blockade";
+          _systemFolders['cvs']?['arrhythmogenic_potential_bp_fluctuation'] = "Catecholamine blood pressure shift (caffeine)";
+          _systemFolders['gi_tract']?['gastric_acid_stimulation'] = "Stimulation of HCl secretion by parietal cells";
+        }
+        if (valueString.contains('soda') || valueString.contains('sugary') || valueString.contains('сладк')) {
+          _systemFolders['endocrine']?['carb_metabolism_glycation'] = "Excess simple carbohydrates (glycation risk)";
         }
         break;
 
