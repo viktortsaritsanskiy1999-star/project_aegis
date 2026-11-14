@@ -215,7 +215,7 @@ void main() {
       await tester.pumpAndSettle();
 
       expect(find.text("Frequency: 1–2 times a week"), findsOneWidget);
-      expect(find.text("[Change ✏️]"), findsOneWidget);
+      expect(find.text("[Edit ✏️]"), findsOneWidget);
 
       // Tap Next -> moves to Drinks (page 8)
       final nextBtn = find.text("Next ➡️");

@@ -404,3 +404,69 @@ def test_m1_context_extraction_full_stage1_flow():
     assert log["nicotine_products"] == ["cigarettes", "vape"]
     assert log["alcohol_types"] == ["beer", "alco_energy"]
     assert log["substance_types"] == ["cannabis"]
+
+
+def test_audit_localized_english_stage1_and_exact_statuses():
+    # Exact English statuses & M1 context matching
+    ans = AnamnesisQuestionnaireAnswers(**_base_valid_answers(
+        gender="Female",
+        pregnancy_status="possible",
+        pregnancy_trimester="1st trimester",
+        pregnancy_weeks=9,
+        breastfeeding_status="No",
+        nicotine_status="Quit",
+        nicotine_products=["E-cigarettes / vape", "Waterpipe / hookah"],
+        nicotine_product_tenure={
+            "E-cigarettes / vape": "1–3 years",
+            "Waterpipe / hookah": "Less than 1 year",
+        },
+        nicotine_quit_when="6–12 months ago",
+        alcohol_status="1-2/week",
+        alcohol_type="Beer",
+        alcohol_types=["Beer", "Alcoholic energy drinks"],
+        alcohol_volumes={"Beer": "0.5 L", "Alcoholic energy drinks": "500 ml"},
+        substance_types=["Cannabis / Marijuana"],
+        substance_last_use="7 days to 1 month ago",
+        user_text_spec_factors="Occasional evening use",
+    ))
+
+    m1_context = build_anamnesis_m1_context_from_answers(ans)
+    sys_folders = m1_context["system_folders"]
+    log = m1_context["core_data_log"]
+
+    assert log["pregnancy_status"] == "possible"
+    assert "pregnancy_status" in sys_folders["endocrine"]
+    assert log["nicotine_status"] == "Quit"
+    assert "broncho_local_imm_disruption" not in sys_folders["immune"]
+    assert "inhalation_aerosol_stress" in sys_folders["respiratory"]
+    assert log["alcohol_status"] == "1-2/week"
+    assert sys_folders["kidneys"]["uric_acid_risk"] is True
+    assert "alco_energy_arrhythmic_risk" in sys_folders["cvs"]
+    assert "cannabis_tachycardia_orthostatic_risk" in sys_folders["cvs"]
+
+
+def test_audit_prefer_not_to_answer_mutual_exclusion():
+    ans = AnamnesisQuestionnaireAnswers(**_base_valid_answers(
+        gender="Female",
+        pregnancy_status="Prefer not to answer",
+        breastfeeding_status="Prefer not to say",
+        nicotine_status="Prefer not to say",
+        alcohol_status="Prefer not to say",
+        substance_types=["Prefer not to say"],
+    ))
+    assert ans.pregnancy_status == "Prefer not to answer"
+    assert ans.nicotine_status == "Prefer not to say"
+    assert ans.alcohol_status == "Prefer not to say"
+
+    with pytest.raises(ValidationError):
+        AnamnesisQuestionnaireAnswers(**_base_valid_answers(
+            nicotine_status="Prefer not to answer",
+            nicotine_products=["Conventional cigarettes"],
+            nicotine_product_tenure={"Conventional cigarettes": "1–3 years"},
+        ))
+
+    with pytest.raises(ValidationError):
+        AnamnesisQuestionnaireAnswers(**_base_valid_answers(
+            alcohol_status="Prefer not to say",
+            alcohol_types=["Beer"],
+        ))

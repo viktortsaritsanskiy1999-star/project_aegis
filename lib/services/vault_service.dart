@@ -152,6 +152,7 @@ class VaultService extends ChangeNotifier {
   AuthSessionManager? _authSessionManager;
   String? _activePatientId;
   int _sessionEpoch = 0;
+  int _hydrationRevision = 0;
   LegacyVaultStatus _legacyVaultStatus = LegacyVaultStatus.none;
   bool _isInitialized = false;
   bool _isDisposed = false;
@@ -174,6 +175,7 @@ class VaultService extends ChangeNotifier {
   String? get activePatientId => _activePatientId;
   bool get isAuthenticated => _activePatientId != null;
   int get sessionEpoch => _sessionEpoch;
+  int get hydrationRevision => _hydrationRevision;
 
   // Client-facing Primary Consilium reports
   final Map<String, ClientModelReportResponse> _clientSystemReports = {};
@@ -569,6 +571,7 @@ class VaultService extends ChangeNotifier {
 
     if (_isDisposed) return;
     _isInitialized = true;
+    _hydrationRevision++;
     notifyListeners();
   }
 
@@ -605,6 +608,7 @@ class VaultService extends ChangeNotifier {
       _applyLoadedSnapshot(loadedData);
     }
     _ensureSmartWatchStructure();
+    _hydrationRevision++;
     notifyListeners();
   }
 
@@ -638,6 +642,7 @@ class VaultService extends ChangeNotifier {
       _applyGuestDraft(guestDraft);
     }
     _ensureSmartWatchStructure();
+    _hydrationRevision++;
     notifyListeners();
   }
 
@@ -1078,9 +1083,9 @@ class VaultService extends ChangeNotifier {
       if (overwriteExisting || !currentGlobal.containsKey(keyStr)) {
         currentGlobal[keyStr] = v;
         _mirrorToNotesExport('anamnesis_$keyStr', v);
-        _applySingleAnamnesisDerivation(keyStr, v);
       }
     });
+    _rebuildAnamnesisDerivations();
 
     // 3. Persist to active patient secure vault and verify success
     final activeKey = VaultStorageService.derivePatientStorageKey(confirmedPatientId);
@@ -1095,6 +1100,7 @@ class VaultService extends ChangeNotifier {
       return false;
     }
 
+    _hydrationRevision++;
     notifyListeners();
     return true;
   }
@@ -1385,9 +1391,9 @@ class VaultService extends ChangeNotifier {
       userTextChronicDiseases: global['user_text_chronic_diseases']?.toString().trim() ?? global['text_chronic_diseases']?.toString().trim(),
       userTextRecentIllness: global['user_text_recent_illness']?.toString().trim() ?? global['text_recent_illness']?.toString().trim(),
       userTextCriticalInfections: global['user_text_critical_infections']?.toString().trim() ?? global['text_critical_infections']?.toString().trim(),
-      userTextSpecFactors: global['text_spec_factors']?.toString().trim(),
-      userTextDietHabits: global['text_diet_habits']?.toString().trim(),
-      userTextGiSignals: global['text_gi_signals']?.toString().trim(),
+      userTextSpecFactors: global['user_text_spec_factors']?.toString().trim() ?? global['text_spec_factors']?.toString().trim(),
+      userTextDietHabits: global['user_text_diet_habits']?.toString().trim() ?? global['text_diet_habits']?.toString().trim(),
+      userTextGiSignals: global['user_text_gi_signals']?.toString().trim() ?? global['text_gi_signals']?.toString().trim(),
       ageConfirmedUnusual: global['age_confirmed_unusual'] == true,
       pregnancyStatus: global['pregnancy_status']?.toString().trim(),
       pregnancyTrimester: global['pregnancy_trimester']?.toString().trim(),
@@ -1811,7 +1817,7 @@ class VaultService extends ChangeNotifier {
       _systemFolders['notes_export']!.remove('anamnesis_text_$cardId');
     }
 
-    _applySingleAnamnesisDerivation(cardId, value);
+    _rebuildAnamnesisDerivations();
 
     _persist();
     notifyListeners();
@@ -1831,11 +1837,178 @@ class VaultService extends ChangeNotifier {
         _systemFolders['notes_export']!.remove('anamnesis_text_$k');
       }
     }
+    _rebuildAnamnesisDerivations();
     _persist();
     notifyListeners();
   }
 
+  static const Map<String, Set<String>> _derivedAnamnesisKeysByFolder = {
+    'respiratory': {
+      'alveolar_stress',
+      'hypoventilation_risk',
+      'sleep_apnea_risk',
+      'bronchial_hyperreactivity',
+      'residual_lung_markers',
+      'tbc_lung_lesions',
+    },
+    'cvs': {
+      'user_gender',
+      'pregnancy_status',
+      'weight_dynamics',
+      'cardiomyopathy_risk',
+      'arrhythmia_risk',
+      'vasoconstriction_tachy_response',
+      'nocturnal_hypoxemia_risk',
+      'endothelial_lipid_damage',
+      'omega3_cardioprotection',
+      'hyperhomocysteinemia_endothelial_destruction',
+      'volemic_hypertension_load',
+      'arrhythmogenic_potential_bp_fluctuation',
+      'hemoconcentration_viscosity_load',
+      'cardio_adaptation_index',
+      'macroangiopathy_accelerated_atherosclerosis',
+      'chronic_cvs_pathology',
+      'mesoaortitis_vascular_risk',
+      'genetic_dyslipidemia_atherosclerosis',
+      'estrogen_hypercoagulation_thrombosis_risk',
+      'lipid_management_pharmacology',
+      'nsaid_hypertension_thrombotic_shift',
+    },
+    'immune': {
+      'broncho_local_imm_disruption',
+      'leukopoiesis_deficiency_risk',
+      'th2_atopic_shif_ige',
+      'antitumor_surveillance_deficit',
+      'postviral_exhaustion_formula_shift',
+      'chronic_viral_persistence_hep',
+      'cd4_destruction_immunodeficiency',
+      'specific_cellular_response',
+      'specific_treponema_antibodies',
+      'genetic_tumor_surveillance_weakness',
+    },
+    'gi_tract': {
+      'liver_tox_load',
+      'mucosal_ischemia_hyperacidity',
+      'protease_load',
+      'microbiome_substrate',
+      'lactase_check',
+      'gastric_acid_stimulation',
+      'nocturnal_reflux_risk',
+      'symptoms_motility_sibr',
+      'mucosal_barrier_destruction_malabsorption',
+      'hepatocyte_cytolysis_fibrosis',
+      'statin_liver_transaminase_control',
+      'cox1_inhibition_gastropathy_erosion',
+    },
+    'kidneys': {
+      'user_gender',
+      'pregnancy_status',
+      'uric_acid_risk',
+      'nitrogen_waste_load',
+      'tubular_osmotic_load',
+      'hypersthenuria_urolithiasis_risk',
+      'diabetic_nephropathy_hyperfiltration',
+      'prerenal_dehydration_risk',
+      'membranous_nephropathy_immune_complex',
+      'prostaglandin_block_afferent_arteriole_spasm',
+    },
+    'endocrine': {
+      'user_gender',
+      'pregnancy_status',
+      'breastfeeding_status',
+      'weight_dynamics',
+      'visceral_adipose_trigger',
+      'circadian_desynchronosis',
+      'insulin_spike_risk',
+      'carb_metabolism_glycation',
+      'nocturnal_sth_blockade',
+      'adrenal_distress_cortisol',
+      'primary_defect_db',
+      'polygenic_diabetes_predisposition',
+      'exogenous_hormonal_background',
+    },
+    'nervous': {
+      'gaba_neuro_load',
+      'synaptic_overdrive',
+      'cns_stabilization_mod',
+      'heb_psych_effect',
+      'opioid_receptor_modulation',
+      'receptor_downregulation_history',
+      'glymphatic_clearance_disruption',
+      'adenosine_receptor_blockade',
+      'sympathicotonia_stress',
+      'chronic_cns_pns_pathology',
+      'neurosyphilis_organic_risk',
+      'tau_amyloidosis_genetic_risk',
+    },
+    'musculoskeletal': {
+      'minor_calcium_source',
+      'chronic_degradation_inflammation',
+    },
+  };
+
+  static const Map<String, List<String>> _derivedAnamnesisPrefixesByFolder = {
+    'respiratory': ['smoking_'],
+    'cvs': ['load_', 'vessel_'],
+    'endocrine': ['physical_'],
+    'musculoskeletal': ['axial_load_', 'biomechanics_'],
+  };
+
+  void _clearAnamnesisDerivations() {
+    _derivedAnamnesisKeysByFolder.forEach((folderName, exactKeys) {
+      final folder = _systemFolders[folderName];
+      if (folder == null) return;
+      final prefixes = _derivedAnamnesisPrefixesByFolder[folderName] ?? const <String>[];
+      final toRemove = folder.keys.where((k) {
+        if (exactKeys.contains(k)) return true;
+        for (final p in prefixes) {
+          if (k.startsWith(p)) return true;
+        }
+        return false;
+      }).toList();
+      for (final k in toRemove) {
+        folder.remove(k);
+      }
+    });
+  }
+
+  void _rebuildAnamnesisDerivations() {
+    _clearAnamnesisDerivations();
+    final global = _systemFolders['global'];
+    if (global == null) return;
+    global.forEach((key, value) {
+      if (value == null || key.startsWith('text_') || key.startsWith('user_text_')) {
+        return;
+      }
+      _applySingleAnamnesisDerivation(key, value);
+    });
+  }
+
+  bool _isNegativeOrEmptyAnamnesisValue(String valueLower) {
+    final trimmed = valueLower.trim();
+    return trimmed.isEmpty ||
+        trimmed == '[]' ||
+        trimmed == '{}' ||
+        trimmed == 'none' ||
+        trimmed == 'no' ||
+        trimmed == 'нет' ||
+        trimmed == 'non-user' ||
+        trimmed == 'never' ||
+        trimmed == 'non-drinker' ||
+        trimmed == 'no symptoms' ||
+        trimmed == 'нет симптомов' ||
+        trimmed == 'prefer not to say' ||
+        trimmed == 'prefer not to answer' ||
+        trimmed == 'prefer_not_to_say' ||
+        trimmed == 'предпочитаю не отвечать' ||
+        trimmed == 'не употребляю' ||
+        trimmed.startsWith('no diagnosed') ||
+        trimmed.startsWith('no recent') ||
+        trimmed.startsWith('ничего из перечисленного');
+  }
+
   void _applySingleAnamnesisDerivation(String cardId, dynamic value) {
+    if (value == null) return;
     final String valueString = value.toString().toLowerCase();
 
     switch (cardId) {
@@ -1879,13 +2052,16 @@ class VaultService extends ChangeNotifier {
       case 'nicotine_quantities':
         _systemFolders['respiratory']?['smoking_$cardId'] = value;
         _systemFolders['cvs']?['vessel_$cardId'] = value;
-        _systemFolders['immune']?['broncho_local_imm_disruption'] = true;
+        if (!_isNegativeOrEmptyAnamnesisValue(valueString)) {
+          _systemFolders['immune']?['broncho_local_imm_disruption'] = true;
+        }
         break;
 
       case 'alcohol_status':
       case 'alcohol_type':
       case 'alcohol_types':
       case 'alcohol_volumes':
+        if (_isNegativeOrEmptyAnamnesisValue(valueString)) break;
         _systemFolders['gi_tract']?['liver_tox_load'] = "Alcohol consumption recorded";
         _systemFolders['nervous']?['gaba_neuro_load'] = "Ethanol-induced GABA modulation";
 
@@ -2006,6 +2182,7 @@ class VaultService extends ChangeNotifier {
         break;
 
       case 'gi_signals':
+        if (_isNegativeOrEmptyAnamnesisValue(valueString)) break;
         _systemFolders['gi_tract']?['symptoms_motility_sibr'] = "Dyspepsia symptoms / GI motility disorders recorded";
         break;
 
@@ -2042,10 +2219,12 @@ class VaultService extends ChangeNotifier {
         break;
 
       case 'onco_status':
+        if (_isNegativeOrEmptyAnamnesisValue(valueString)) break;
         _systemFolders['immune']?['antitumor_surveillance_deficit'] = "Increased oncological alertness";
         break;
 
       case 'recent_illness':
+        if (_isNegativeOrEmptyAnamnesisValue(valueString)) break;
         _systemFolders['immune']?['postviral_exhaustion_formula_shift'] = "Post-viral asthenia syndrome / leukogram shift";
         _systemFolders['respiratory']?['residual_lung_markers'] = "Residual lung tissue changes";
         if (valueString.contains('отравление') || valueString.contains('кишечная')) {

@@ -410,7 +410,7 @@ class AnamnesisQuestionnaireAnswers(BaseModel):
     def validate_clinical_consistency(self) -> "AnamnesisQuestionnaireAnswers":
         # 1. Pregnancy consistency
         preg_status = (self.pregnancy_status or "").strip().lower()
-        if preg_status in ("да", "yes", "pregnant", "возможно", "possible"):
+        if preg_status in ("да", "yes", "pregnant", "возможно", "possible", "possible_unconfirmed", "possibly, but not confirmed"):
             if self.pregnancy_trimester and self.pregnancy_weeks is not None:
                 tri = self.pregnancy_trimester.lower()
                 weeks = float(self.pregnancy_weeks)
@@ -429,7 +429,7 @@ class AnamnesisQuestionnaireAnswers(BaseModel):
                         raise ValueError(
                             f"Срок беременности {weeks} нед. противоречит выбранному третьему триместру (с 28-й недели)."
                         )
-        elif preg_status in ("нет", "no", "предпочитаю не отвечать", "prefer_not_to_say", "declined"):
+        elif preg_status in ("нет", "no", "предпочитаю не отвечать", "prefer_not_to_say", "prefer not to say", "prefer not to answer", "declined"):
             if self.pregnancy_trimester is not None or self.pregnancy_weeks is not None:
                 raise ValueError(
                     "Срок и триместр беременности не могут быть указаны, если беременность отсутствует или не подтверждена."
@@ -453,7 +453,7 @@ class AnamnesisQuestionnaireAnswers(BaseModel):
 
         # 3. Nicotine consistency & mutual exclusion
         nic_status = (self.nicotine_status or "").strip().lower()
-        if nic_status in ("никогда", "never", "non-user", "не курю", "предпочитаю не отвечать", "prefer_not_to_say"):
+        if nic_status in ("никогда", "never", "non-user", "не курю", "предпочитаю не отвечать", "prefer_not_to_say", "prefer not to say", "prefer not to answer"):
             if self.nicotine_products or self.nicotine_product_tenure or self.nicotine_current_frequency or self.nicotine_quantities:
                 raise ValueError("Выбор 'Никогда' или 'Предпочитаю не отвечать' исключает указание табачных продуктов, стажа и частоты.")
         else:
@@ -468,13 +468,13 @@ class AnamnesisQuestionnaireAnswers(BaseModel):
 
         # 4. Alcohol consistency & mutual exclusion
         alc_status = (self.alcohol_status or "").strip().lower()
-        if alc_status in ("не употребляю", "none", "non-drinker", "non-user", "не пью", "0", "предпочитаю не отвечать", "prefer_not_to_say"):
+        if alc_status in ("не употребляю", "none", "non-drinker", "non-user", "не пью", "0", "предпочитаю не отвечать", "prefer_not_to_say", "prefer not to say", "prefer not to answer"):
             if self.alcohol_types or self.alcohol_volumes:
                 raise ValueError("Выбор 'Не употребляю' или 'Предпочитаю не отвечать' исключает выбор типов напитков и объемов.")
 
         # 5. Substances consistency & mutual exclusion
         if self.substance_types:
-            has_negative = any(s.strip().lower() in ("не употребляю", "предпочитаю не отвечать", "none", "prefer_not_to_say", "prefer not to say", "declined") for s in self.substance_types)
+            has_negative = any(s.strip().lower() in ("не употребляю", "предпочитаю не отвечать", "none", "prefer_not_to_say", "prefer not to say", "prefer not to answer", "declined") for s in self.substance_types)
             if has_negative and len(self.substance_types) > 1:
                 raise ValueError("Варианты 'Не употребляю' и 'Предпочитаю не отвечать' являются взаимоисключающими.")
             if has_negative and self.substance_last_use is not None:

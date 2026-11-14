@@ -71,18 +71,18 @@ void main() {
       await tester.pumpAndSettle();
 
       // Tap Next without confirming unusual age -> rejected with prompt
-      await tester.tap(find.text("Next"));
+      await tester.tap(find.text("Next ➡️"));
       await tester.pumpAndSettle();
 
-      expect(find.textContaining("Вы указали возраст: 105"), findsWidgets);
-      expect(find.text("Подтвердить правильность ввода"), findsOneWidget);
+      expect(find.textContaining("You entered age: 105"), findsWidgets);
+      expect(find.text("Confirm age"), findsOneWidget);
 
       // Tap confirm button
-      await tester.tap(find.text("Подтвердить правильность ввода"));
+      await tester.tap(find.text("Confirm age"));
       await tester.pumpAndSettle();
 
       // Now tap Next -> succeeds and moves to Card 2
-      await tester.tap(find.text("Next"));
+      await tester.tap(find.text("Next ➡️"));
       await tester.pumpAndSettle();
 
       expect(find.text("Your Dimensions"), findsOneWidget);
@@ -121,43 +121,43 @@ void main() {
       await tester.pumpAndSettle();
 
       // Female reveals pregnancy question
-      expect(find.text("Беременны ли вы сейчас?"), findsOneWidget);
-      expect(find.text("Кормите ли вы грудью?"), findsOneWidget);
+      expect(find.text("Are you currently pregnant?"), findsOneWidget);
+      expect(find.text("Are you currently breastfeeding?"), findsOneWidget);
 
-      // Select "Да"
-      await tester.ensureVisible(find.text("Да").first);
-      await tester.tap(find.text("Да").first);
+      // Select "Yes"
+      await tester.ensureVisible(find.text("Yes").first);
+      await tester.tap(find.text("Yes").first);
       await tester.pumpAndSettle();
 
       // Select 1st trimester, but enter week 22 (conflict!)
-      await tester.ensureVisible(find.text("1-й триместр (до 13 нед. 6 дн.)"));
-      await tester.tap(find.text("1-й триместр (до 13 нед. 6 дн.)"));
-      final weeksField = find.widgetWithText(TextField, "Срок беременности (в неделях, 1–45, необязательно)");
+      await tester.ensureVisible(find.text("1st trimester (up to 13 weeks 6 days)"));
+      await tester.tap(find.text("1st trimester (up to 13 weeks 6 days)"));
+      final weeksField = find.widgetWithText(TextField, "Pregnancy duration (weeks, 1–45, optional)");
       await tester.ensureVisible(weeksField);
       await tester.enterText(weeksField, '22');
 
-      // Select breastfeeding "Нет"
-      await tester.ensureVisible(find.text("Нет").last);
-      await tester.tap(find.text("Нет").last);
+      // Select breastfeeding "No"
+      await tester.ensureVisible(find.text("No").last);
+      await tester.tap(find.text("No").last);
       await tester.pumpAndSettle();
 
       // Tap Next -> blocked due to inconsistency
-      await tester.ensureVisible(find.text("Next"));
-      await tester.tap(find.text("Next"));
+      await tester.ensureVisible(find.text("Next ➡️"));
+      await tester.tap(find.text("Next ➡️"));
       await tester.pumpAndSettle();
 
-      expect(find.textContaining("не соответствует 1-му триместру"), findsOneWidget);
+      expect(find.textContaining("do not match the 1st trimester"), findsOneWidget);
 
       // Correct weeks to 10
       await tester.enterText(weeksField, '10');
       await tester.pumpAndSettle();
 
-      await tester.ensureVisible(find.text("Next"));
-      await tester.tap(find.text("Next"));
+      await tester.ensureVisible(find.text("Next ➡️"));
+      await tester.tap(find.text("Next ➡️"));
       await tester.pumpAndSettle();
 
       expect(find.text("Your Dimensions"), findsOneWidget);
-      expect(vault.getSystemContext('global')['pregnancy_status'], 'Да');
+      expect(vault.getSystemContext('global')['pregnancy_status'], 'Yes');
       expect(vault.getSystemContext('global')['pregnancy_trimester'], '1st trimester');
       expect(vault.getSystemContext('global')['pregnancy_weeks'], 10);
       expect(vault.getSystemContext('global')['breastfeeding_status'], 'No');
@@ -196,31 +196,31 @@ void main() {
       await tester.enterText(fields.at(0), '175');
       await tester.enterText(fields.at(1), '70');
 
-      // Select "Потерял(а) вес"
-      await tester.ensureVisible(find.text("Потерял(а) вес"));
-      await tester.tap(find.text("Потерял(а) вес"));
+      // Select "Lost weight"
+      await tester.ensureVisible(find.text("Lost weight"));
+      await tester.tap(find.text("Lost weight"));
       await tester.pumpAndSettle();
 
       // Enter loss amount 75 (> 70 current weight!)
-      final amtField = find.widgetWithText(TextField, "На сколько килограммов? (например, 5)");
+      final amtField = find.widgetWithText(TextField, "By how many kilograms? (e.g., 5)");
       await tester.ensureVisible(amtField);
       await tester.enterText(amtField, '75');
-      await tester.ensureVisible(find.text("Да").last);
-      await tester.tap(find.text("Да").last); // Intentional
+      await tester.ensureVisible(find.text("Yes").last);
+      await tester.tap(find.text("Yes").last); // Intentional
       await tester.pumpAndSettle();
 
-      await tester.ensureVisible(find.text("Next"));
-      await tester.tap(find.text("Next"));
+      await tester.ensureVisible(find.text("Next ➡️"));
+      await tester.tap(find.text("Next ➡️"));
       await tester.pumpAndSettle();
 
-      expect(find.textContaining("не может превышать текущий вес"), findsOneWidget);
+      expect(find.textContaining("cannot exceed or equal your current weight"), findsOneWidget);
 
       // Correct loss to 5 kg
       await tester.enterText(amtField, '5');
       await tester.pumpAndSettle();
 
-      await tester.ensureVisible(find.text("Next"));
-      await tester.tap(find.text("Next"));
+      await tester.ensureVisible(find.text("Next ➡️"));
+      await tester.tap(find.text("Next ➡️"));
       await tester.pumpAndSettle();
 
       expect(find.text("Nicotine 🚬"), findsOneWidget);
@@ -253,8 +253,8 @@ void main() {
 
       expect(find.text("Nicotine 🚬"), findsOneWidget);
 
-      // User selects "1️⃣ Никогда не употреблял(а)"
-      await tester.tap(find.text("1️⃣ Никогда не употреблял(а)"));
+      // User selects "1️⃣ Never used"
+      await tester.tap(find.text("1️⃣ Never used"));
       await tester.pumpAndSettle();
 
       expect(vault.getSystemContext('global')['nicotine_status'], 'Non-user');
@@ -284,27 +284,27 @@ void main() {
       pageView.controller!.jumpToPage(5);
       await tester.pumpAndSettle();
 
-      expect(find.text("Дополнительные факторы здоровья 🛡️"), findsOneWidget);
+      expect(find.text("Additional Health Factors 🛡️"), findsOneWidget);
 
       // Select Cannabis
-      await tester.ensureVisible(find.text("Каннабис / марихуана"));
-      await tester.tap(find.text("Каннабис / марихуана"));
+      await tester.ensureVisible(find.text("Cannabis / Marijuana"));
+      await tester.tap(find.text("Cannabis / Marijuana"));
       await tester.pumpAndSettle();
-      expect(find.text("Когда это было в последний раз?"), findsOneWidget);
+      expect(find.text("When was the last time?"), findsOneWidget);
 
-      // Now select "🚫 Не употребляю" -> clears Cannabis and hides subquestion
-      await tester.ensureVisible(find.text("🚫 Не употребляю"));
-      await tester.tap(find.text("🚫 Не употребляю"));
+      // Now select "🚫 None (I do not use any)" -> clears Cannabis and hides subquestion
+      await tester.ensureVisible(find.text("🚫 None (I do not use any)"));
+      await tester.tap(find.text("🚫 None (I do not use any)"));
       await tester.pumpAndSettle();
 
-      expect(find.text("Когда это было в последний раз?"), findsNothing);
+      expect(find.text("When was the last time?"), findsNothing);
 
-      await tester.ensureVisible(find.text("Continue ➡️"));
-      await tester.tap(find.text("Continue ➡️"));
+      await tester.ensureVisible(find.text("Next ➡️"));
+      await tester.tap(find.text("Next ➡️"));
       await tester.pumpAndSettle();
 
       expect(find.text("Sleep 🌙"), findsOneWidget);
-      expect(vault.getSystemContext('global')['substance_types'], ['Не употребляю']);
+      expect(vault.getSystemContext('global')['substance_types'], ['None']);
       expect(vault.getSystemContext('global')['substance_last_use'], isNull);
 
       vault.dispose();

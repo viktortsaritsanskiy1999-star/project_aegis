@@ -26,6 +26,7 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
   bool _isSubmitting = false;
   int? _lastSeenEpoch;
   String? _lastSeenPatientId;
+  int? _lastSeenHydrationRevision;
 
   // --- STAGE 1 ENHANCED STATES ---
   // Card 1: Bio Profile
@@ -177,15 +178,107 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
   void didChangeDependencies() {
     super.didChangeDependencies();
     final vault = Provider.of<VaultService>(context, listen: true);
-    if (_lastSeenPatientId != null &&
-        (_lastSeenPatientId != vault.activePatientId || _lastSeenEpoch != vault.sessionEpoch)) {
+    final patientOrEpochChanged =
+        _lastSeenPatientId != vault.activePatientId ||
+        (_lastSeenEpoch != null && _lastSeenEpoch != vault.sessionEpoch);
+    if (patientOrEpochChanged) {
       _resetLocalState();
-    } else if (_lastSeenPatientId == null && vault.activePatientId != null) {
+      _restoreLocalStateFromVault(vault);
+    } else if (_lastSeenHydrationRevision == null ||
+        _lastSeenHydrationRevision != vault.hydrationRevision) {
       _restoreLocalStateFromVault(vault);
     }
     _lastSeenPatientId = vault.activePatientId;
     _lastSeenEpoch = vault.sessionEpoch;
+    _lastSeenHydrationRevision = vault.hydrationRevision;
   }
+
+  static const Map<String, String> _legacyNicotineProductMap = {
+    'Обычные сигареты': 'Conventional cigarettes',
+    'Вейп / электронные сигареты': 'E-cigarettes / vape',
+    'Нагреваемый табак (IQOS и аналоги)': 'Heated tobacco (IQOS, etc.)',
+    'Кальян': 'Waterpipe / hookah',
+    'Другие ингаляционные продукты': 'Other inhaled nicotine products',
+  };
+
+  static const Map<String, String> _legacyNicotineTenureMap = {
+    'Менее 1 года': 'Less than 1 year',
+    '1–3 года': '1–3 years',
+    '3–5 лет': '3–5 years',
+    '5–10 лет': '5–10 years',
+    'Более 10 лет': 'More than 10 years',
+  };
+
+  static const Map<String, String> _legacyNicotineFreqMap = {
+    'Реже 1 дня в месяц': 'Less than 1 day a month',
+    '1–3 дня в месяц': '1–3 days a month',
+    '1–3 дня в неделю': '1–3 days a week',
+    '4–6 дней в неделю': '4–6 days a week',
+    'Ежедневно': 'Daily',
+  };
+
+  static const Map<String, String> _legacyNicotineQuitMap = {
+    'Менее 1 месяца назад': 'Less than 1 month ago',
+    '1–6 месяцев назад': '1–6 months ago',
+    '6–12 месяцев назад': '6–12 months ago',
+    '1–5 лет назад': '1–5 years ago',
+    'Более 5 лет назад': 'More than 5 years ago',
+  };
+
+  static const Map<String, String> _legacyVapeTypeMap = {
+    'Солевой никотин': 'Salt nicotine',
+    'Щелочной никотин': 'Freebase nicotine',
+    'Без никотина': 'Nicotine-free',
+    'Не знаю': 'Not sure',
+  };
+
+  static const Map<String, String> _legacyAlcoholTypeMap = {
+    'Пиво': 'Beer',
+    'Вино': 'Wine',
+    'Игристое вино / шампанское': 'Sparkling wine / Champagne',
+    'Коктейли, сидр': 'Cocktails / Cider',
+    'Алкогольные энергетики': 'Alcoholic energy drinks',
+    'Крепкие напитки (40% и выше)': 'Strong spirits (40%+)',
+    'Крепкие напитки до 40%': 'Spirits (<40%)',
+    'Другое': 'Other',
+  };
+
+  static const Map<String, String> _legacyAlcoholVolMap = {
+    '0.33 л': '0.33 L',
+    '0.5 л': '0.5 L',
+    '1 л': '1 L',
+    '1.5 л+': '1.5 L+',
+    '150 мл (бокал)': '150 ml (glass)',
+    '300 мл': '300 ml',
+    '750 мл (бутылка)': '750 ml (bottle)',
+    '200 мл': '200 ml',
+    '400 мл': '400 ml',
+    '600 мл+': '600 ml+',
+    '250 мл': '250 ml',
+    '500 мл': '500 ml',
+    '1 л+': '1 L+',
+    '50 мл (шот)': '50 ml (shot)',
+    '100 мл': '100 ml',
+    '500 мл+': '500 ml+',
+  };
+
+  static const Map<String, String> _legacySubstanceTypeMap = {
+    'Каннабис / марихуана': 'Cannabis / Marijuana',
+    'Стимулирующие вещества': 'Stimulants',
+    'Седативные вещества без назначения врача': 'Non-prescribed sedatives',
+    'Опиоиды без назначения врача': 'Non-prescribed opioids',
+    'Другие психоактивные вещества': 'Other psychoactive substances',
+    'Употреблял(а) ранее, сейчас нет': 'Used in the past, not currently',
+    'Не употребляю': 'None',
+    'Предпочитаю не отвечать': 'Prefer not to say',
+  };
+
+  static const Map<String, String> _legacySubstanceLastUseMap = {
+    'Менее 7 дней назад': 'Less than 7 days ago',
+    'От 7 дней до 1 месяца назад': '7 days to 1 month ago',
+    'Более 1 месяца назад': 'More than 1 month ago',
+    'Не хочу уточнять': 'Prefer not to say',
+  };
 
   void _restoreLocalStateFromVault(VaultService vault) {
     final global = vault.getSystemContext('global');
@@ -202,7 +295,25 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
       _ageConfirmedUnusual = true;
     }
     if (_pregnancyStatus == null && global['pregnancy_status'] != null) {
-      _pregnancyStatus = global['pregnancy_status'].toString();
+      final p = global['pregnancy_status'].toString().trim();
+      final pLower = p.toLowerCase();
+      if (pLower == 'да' || pLower == 'yes') {
+        _pregnancyStatus = 'Yes';
+      } else if (pLower == 'возможно, но не подтверждено' ||
+          pLower == 'possible' ||
+          pLower == 'possible_unconfirmed' ||
+          pLower == 'possibly, but not confirmed') {
+        _pregnancyStatus = 'possible';
+      } else if (pLower == 'нет' || pLower == 'no') {
+        _pregnancyStatus = 'No';
+      } else if (pLower == 'предпочитаю не отвечать' ||
+          pLower == 'prefer_not_to_say' ||
+          pLower == 'prefer not to say' ||
+          pLower == 'prefer not to answer') {
+        _pregnancyStatus = 'prefer_not_to_say';
+      } else {
+        _pregnancyStatus = p;
+      }
     }
     if (_pregnancyTrimester == null && global['pregnancy_trimester'] != null) {
       _pregnancyTrimester = global['pregnancy_trimester'].toString();
@@ -211,7 +322,20 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
       _pregnancyWeeksController.text = global['pregnancy_weeks'].toString();
     }
     if (_breastfeedingStatus == null && global['breastfeeding_status'] != null) {
-      _breastfeedingStatus = global['breastfeeding_status'].toString();
+      final bf = global['breastfeeding_status'].toString().trim();
+      final bfLower = bf.toLowerCase();
+      if (bfLower == 'да' || bfLower == 'yes') {
+        _breastfeedingStatus = 'Yes';
+      } else if (bfLower == 'нет' || bfLower == 'no') {
+        _breastfeedingStatus = 'No';
+      } else if (bfLower == 'предпочитаю не отвечать' ||
+          bfLower == 'prefer not to say' ||
+          bfLower == 'prefer not to answer' ||
+          bfLower == 'prefer_not_to_say') {
+        _breastfeedingStatus = 'Prefer not to say';
+      } else {
+        _breastfeedingStatus = bf;
+      }
     }
     if (hController.text.isEmpty && global['height'] != null) {
       hController.text = global['height'].toString();
@@ -235,47 +359,96 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
       _weightChangeIntentional = global['weight_change_intentional'].toString();
     }
     if (_nicotineStatus == null && global['nicotine_status'] != null) {
-      _nicotineStatus = global['nicotine_status'].toString();
+      final n = global['nicotine_status'].toString().trim();
+      final nLower = n.toLowerCase();
+      if (nLower == 'non-user' || nLower == 'never') {
+        _nicotineStatus = 'Never';
+      } else if (nLower == 'occasional') {
+        _nicotineStatus = 'Occasional';
+      } else if (nLower == 'regular' || nLower == 'active') {
+        _nicotineStatus = 'Regular';
+      } else if (nLower == 'quit' || nLower == 'former') {
+        _nicotineStatus = 'Former';
+      } else if (nLower == 'prefer not to say' ||
+          nLower == 'prefer not to answer' ||
+          nLower == 'prefer_not_to_say') {
+        _nicotineStatus = 'Prefer not to say';
+      } else {
+        _nicotineStatus = n;
+      }
     }
     if (_nicotineProducts.isEmpty && global['nicotine_products'] is List) {
-      _nicotineProducts.addAll((global['nicotine_products'] as List).map((e) => e.toString()));
+      _nicotineProducts.addAll((global['nicotine_products'] as List).map((e) {
+        final s = e.toString();
+        return _legacyNicotineProductMap[s] ?? s;
+      }));
     }
     if (_nicotineProductTenure.isEmpty && global['nicotine_product_tenure'] is Map) {
       (global['nicotine_product_tenure'] as Map).forEach((k, v) {
-        _nicotineProductTenure[k.toString()] = v.toString();
+        final ks = k.toString();
+        final vs = v.toString();
+        _nicotineProductTenure[_legacyNicotineProductMap[ks] ?? ks] =
+            _legacyNicotineTenureMap[vs] ?? vs;
       });
     }
     if (_nicotineCurrentFrequency == null && global['nicotine_current_frequency'] != null) {
-      _nicotineCurrentFrequency = global['nicotine_current_frequency'].toString();
+      final f = global['nicotine_current_frequency'].toString();
+      _nicotineCurrentFrequency = _legacyNicotineFreqMap[f] ?? f;
     }
     if (_nicotineQuantities.isEmpty && global['nicotine_quantities'] is Map) {
-      _nicotineQuantities.addAll(Map<String, dynamic>.from(global['nicotine_quantities'] as Map));
+      (global['nicotine_quantities'] as Map).forEach((k, v) {
+        final ks = k.toString();
+        final vs = v.toString();
+        _nicotineQuantities[ks] =
+            ks == 'vape_nicotine_type' ? (_legacyVapeTypeMap[vs] ?? vs) : v;
+      });
     }
     if (_nicotineQuitWhen == null && global['nicotine_quit_when'] != null) {
-      _nicotineQuitWhen = global['nicotine_quit_when'].toString();
+      final q = global['nicotine_quit_when'].toString();
+      _nicotineQuitWhen = _legacyNicotineQuitMap[q] ?? q;
     }
     if (_alcoholStatus == null && global['alcohol_status'] != null) {
-      _alcoholStatus = global['alcohol_status'].toString();
+      final a = global['alcohol_status'].toString().trim();
+      final aLower = a.toLowerCase();
+      if (aLower == 'prefer not to answer' || aLower == 'prefer_not_to_say') {
+        _alcoholStatus = 'Prefer not to say';
+      } else {
+        _alcoholStatus = a;
+      }
     }
     if (_alcoholTypes.isEmpty && global['alcohol_types'] is List) {
-      _alcoholTypes.addAll((global['alcohol_types'] as List).map((e) => e.toString()));
+      _alcoholTypes.addAll((global['alcohol_types'] as List).map((e) {
+        final s = e.toString();
+        return _legacyAlcoholTypeMap[s] ?? s;
+      }));
     }
     if (_alcoholVolumes.isEmpty && global['alcohol_volumes'] is Map) {
       (global['alcohol_volumes'] as Map).forEach((k, v) {
-        _alcoholVolumes[k.toString()] = v.toString();
+        final ks = k.toString();
+        final vs = v.toString();
+        _alcoholVolumes[_legacyAlcoholTypeMap[ks] ?? ks] =
+            _legacyAlcoholVolMap[vs] ?? vs;
       });
     }
     if (_alcoholCommentController.text.isEmpty && (global['alcohol_comment'] != null || global['text_alcohol'] != null)) {
       _alcoholCommentController.text = (global['alcohol_comment'] ?? global['text_alcohol']).toString();
     }
     if (_substanceTypes.isEmpty && global['substance_types'] is List) {
-      _substanceTypes.addAll((global['substance_types'] as List).map((e) => e.toString()));
+      _substanceTypes.addAll((global['substance_types'] as List).map((e) {
+        final s = e.toString();
+        return _legacySubstanceTypeMap[s] ?? s;
+      }));
     }
     if (_substanceLastUse == null && global['substance_last_use'] != null) {
-      _substanceLastUse = global['substance_last_use'].toString();
+      final lu = global['substance_last_use'].toString();
+      _substanceLastUse = _legacySubstanceLastUseMap[lu] ?? lu;
     }
-    if (_substanceNotesController.text.isEmpty && (global['substance_notes'] != null || global['text_spec_factors'] != null)) {
-      _substanceNotesController.text = (global['substance_notes'] ?? global['text_spec_factors']).toString();
+    if (_substanceNotesController.text.isEmpty &&
+        (global['substance_notes'] != null ||
+            global['user_text_spec_factors'] != null ||
+            global['text_spec_factors'] != null)) {
+      _substanceNotesController.text =
+          (global['substance_notes'] ?? global['user_text_spec_factors'] ?? global['text_spec_factors']).toString();
     }
 
     // Stage 2: Sleep
@@ -643,6 +816,20 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
   }
 
   void _previousPage() {
+    if (_currentPage == 3 && _nicotineSubStep > 0) {
+      setState(() {
+        _nicotineSubStep = 0;
+        _currentError = null;
+      });
+      return;
+    }
+    if (_currentPage == 4 && _alcoholSubStep > 0) {
+      setState(() {
+        _alcoholSubStep = 0;
+        _currentError = null;
+      });
+      return;
+    }
     if (_currentPage > 0) {
       setState(() {
         _currentError = null;
@@ -705,7 +892,7 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
   }
 
   Widget build(BuildContext context) {
-    double progress = (_currentPage) / (_totalPages - 1);
+    final double progress = ((_currentPage) / (_totalPages - 1)).clamp(0.0, 1.0);
 
     return Scaffold(
       backgroundColor: const Color(0xFF1A1A1A),
@@ -724,7 +911,7 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
                 child: IconButton(
                   icon: const Icon(Icons.arrow_back, color: Colors.white70),
                   onPressed: _previousPage,
-                  tooltip: 'Назад',
+                  tooltip: 'Back',
                 ),
               ),
             Expanded(
@@ -911,6 +1098,11 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
         controller: _customInputController,
         keyboardType: const TextInputType.numberWithOptions(decimal: true),
         style: const TextStyle(color: Colors.white),
+        onChanged: (_) {
+          if (_ageConfirmedUnusual) {
+            setState(() => _ageConfirmedUnusual = false);
+          }
+        },
         decoration: const InputDecoration(
           labelText: "Age (18-99)",
           labelStyle: TextStyle(color: Colors.white38),
@@ -930,7 +1122,7 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
           child: Column(
             children: [
               Text(
-                "Вы указали возраст: ${_customInputController.text.trim()}. Пожалуйста, проверьте правильность ввода.",
+                "You entered age: ${_customInputController.text.trim()}. Please verify this is accurate.",
                 textAlign: TextAlign.center,
                 style: const TextStyle(color: Colors.amberAccent, fontSize: 13),
               ),
@@ -943,7 +1135,7 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
                   _ageConfirmedUnusual = true;
                   _currentError = null;
                 }),
-                child: const Text("Подтвердить правильность ввода", style: TextStyle(color: Colors.amberAccent)),
+                child: const Text("Confirm age", style: TextStyle(color: Colors.amberAccent)),
               ),
             ],
           ),
@@ -952,45 +1144,45 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
 
       if (_selectedGender == 'f') ...[
         const SizedBox(height: 24),
-        const Text("Беременны ли вы сейчас?", style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 16)),
+        const Text("Are you currently pregnant?", style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 16)),
         const SizedBox(height: 8),
-        _buildSelectableOption("Да", _pregnancyStatus == 'Да', () {
-          setState(() => _pregnancyStatus = 'Да');
+        _buildSelectableOption("Yes", _pregnancyStatus == 'Yes', () {
+          setState(() => _pregnancyStatus = 'Yes');
         }),
-        _buildSelectableOption("Возможно, но не подтверждено", _pregnancyStatus == 'Возможно, но не подтверждено', () {
-          setState(() => _pregnancyStatus = 'Возможно, но не подтверждено');
+        _buildSelectableOption("Possibly, but not confirmed", _pregnancyStatus == 'possible', () {
+          setState(() => _pregnancyStatus = 'possible');
         }),
-        _buildSelectableOption("Нет", _pregnancyStatus == 'Нет', () {
+        _buildSelectableOption("No", _pregnancyStatus == 'No', () {
           setState(() {
-            _pregnancyStatus = 'Нет';
+            _pregnancyStatus = 'No';
             _pregnancyTrimester = null;
             _pregnancyWeeksController.clear();
           });
           vault.removeAnamnesisKeys(['pregnancy_trimester', 'pregnancy_weeks']);
         }),
-        _buildSelectableOption("Предпочитаю не отвечать", _pregnancyStatus == 'Предпочитаю не отвечать', () {
+        _buildSelectableOption("Prefer not to answer", _pregnancyStatus == 'prefer_not_to_say', () {
           setState(() {
-            _pregnancyStatus = 'Предпочитаю не отвечать';
+            _pregnancyStatus = 'prefer_not_to_say';
             _pregnancyTrimester = null;
             _pregnancyWeeksController.clear();
           });
           vault.removeAnamnesisKeys(['pregnancy_trimester', 'pregnancy_weeks']);
         }),
 
-        if (_pregnancyStatus == 'Да' || _pregnancyStatus == 'Возможно, но не подтверждено') ...[
+        if (_pregnancyStatus == 'Yes' || _pregnancyStatus == 'possible') ...[
           const SizedBox(height: 12),
-          const Text("Триместр беременности:", style: TextStyle(color: Colors.greenAccent, fontWeight: FontWeight.w600)),
+          const Text("Pregnancy trimester:", style: TextStyle(color: Colors.greenAccent, fontWeight: FontWeight.w600)),
           const SizedBox(height: 6),
-          _buildSelectableOption("1-й триместр (до 13 нед. 6 дн.)", _pregnancyTrimester == '1st trimester', () {
+          _buildSelectableOption("1st trimester (up to 13 weeks 6 days)", _pregnancyTrimester == '1st trimester', () {
             setState(() => _pregnancyTrimester = '1st trimester');
           }),
-          _buildSelectableOption("2-й триместр (14–27 нед. 6 дн.)", _pregnancyTrimester == '2nd trimester', () {
+          _buildSelectableOption("2nd trimester (14–27 weeks 6 days)", _pregnancyTrimester == '2nd trimester', () {
             setState(() => _pregnancyTrimester = '2nd trimester');
           }),
-          _buildSelectableOption("3-й триместр (28 нед. и более)", _pregnancyTrimester == '3rd trimester', () {
+          _buildSelectableOption("3rd trimester (28 weeks or more)", _pregnancyTrimester == '3rd trimester', () {
             setState(() => _pregnancyTrimester = '3rd trimester');
           }),
-          _buildSelectableOption("Не знаю / не уверена", _pregnancyTrimester == 'Unknown', () {
+          _buildSelectableOption("Not sure", _pregnancyTrimester == 'Unknown', () {
             setState(() => _pregnancyTrimester = 'Unknown');
           }),
           TextField(
@@ -998,7 +1190,7 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
             keyboardType: const TextInputType.numberWithOptions(decimal: true),
             style: const TextStyle(color: Colors.white),
             decoration: const InputDecoration(
-              labelText: "Срок беременности (в неделях, 1–45, необязательно)",
+              labelText: "Pregnancy duration (weeks, 1–45, optional)",
               labelStyle: TextStyle(color: Colors.white38),
               enabledBorder: UnderlineInputBorder(borderSide: BorderSide(color: Colors.white24)),
             ),
@@ -1006,22 +1198,22 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
         ],
 
         const SizedBox(height: 20),
-        const Text("Кормите ли вы грудью?", style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 16)),
+        const Text("Are you currently breastfeeding?", style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 16)),
         const SizedBox(height: 8),
-        _buildSelectableOption("Да", _breastfeedingStatus == 'Yes', () {
+        _buildSelectableOption("Yes", _breastfeedingStatus == 'Yes', () {
           setState(() => _breastfeedingStatus = 'Yes');
         }),
-        _buildSelectableOption("Нет", _breastfeedingStatus == 'No', () {
+        _buildSelectableOption("No", _breastfeedingStatus == 'No', () {
           setState(() => _breastfeedingStatus = 'No');
         }),
-        _buildSelectableOption("Предпочитаю не отвечать", _breastfeedingStatus == 'Prefer not to say', () {
+        _buildSelectableOption("Prefer not to answer", _breastfeedingStatus == 'Prefer not to say', () {
           setState(() => _breastfeedingStatus = 'Prefer not to say');
         }),
       ],
 
       const SizedBox(height: 20),
 
-      _buildSelectableOption("Next", false, () {
+      _buildSelectableOption("Next ➡️", false, () {
         FocusScope.of(context).unfocus();
         final String ageInput = _customInputController.text.trim();
         final String ageNorm = ageInput.replaceAll(',', '.');
@@ -1044,42 +1236,42 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
 
         final int age = ageNum.toInt();
         if (age >= 100 && age <= 120 && !_ageConfirmedUnusual) {
-          setState(() => _currentError = "Вы указали возраст: $age. Пожалуйста, проверьте правильность ввода.");
+          setState(() => _currentError = "You entered age: $age. Please verify this is accurate.");
           return;
         }
 
         if (_selectedGender == 'f') {
           if (_pregnancyStatus == null) {
-            setState(() => _currentError = "Пожалуйста, укажите статус беременности");
+            setState(() => _currentError = "Please select your pregnancy status");
             return;
           }
-          if (_pregnancyStatus == 'Да' || _pregnancyStatus == 'Возможно, но не подтверждено') {
+          if (_pregnancyStatus == 'Yes' || _pregnancyStatus == 'possible') {
             if (_pregnancyTrimester == null) {
-              setState(() => _currentError = "Пожалуйста, укажите триместр беременности");
+              setState(() => _currentError = "Please select your pregnancy trimester");
               return;
             }
             if (_pregnancyWeeksController.text.trim().isNotEmpty) {
               final w = num.tryParse(_pregnancyWeeksController.text.replaceAll(',', '.').trim());
               if (w == null || w < 1 || w > 45) {
-                setState(() => _currentError = "Срок беременности должен быть от 1 до 45 недель");
+                setState(() => _currentError = "Pregnancy duration must be between 1 and 45 weeks");
                 return;
               }
               if (_pregnancyTrimester == '1st trimester' && w > 13) {
-                setState(() => _currentError = "Указанный срок ($w нед.) не соответствует 1-му триместру (до 13 нед. 6 дн.)");
+                setState(() => _currentError = "Entered weeks ($w) do not match the 1st trimester (up to 13 weeks 6 days)");
                 return;
               }
               if (_pregnancyTrimester == '2nd trimester' && (w < 14 || w > 27)) {
-                setState(() => _currentError = "Указанный срок ($w нед.) не соответствует 2-му триместру (14–27 нед. 6 дн.)");
+                setState(() => _currentError = "Entered weeks ($w) do not match the 2nd trimester (14–27 weeks 6 days)");
                 return;
               }
               if (_pregnancyTrimester == '3rd trimester' && w < 28) {
-                setState(() => _currentError = "Указанный срок ($w нед.) не соответствует 3-му триместру (28 нед. и более)");
+                setState(() => _currentError = "Entered weeks ($w) do not match the 3rd trimester (28 weeks or more)");
                 return;
               }
             }
           }
           if (_breastfeedingStatus == null) {
-            setState(() => _currentError = "Пожалуйста, укажите статус грудного вскармливания");
+            setState(() => _currentError = "Please select your breastfeeding status");
             return;
           }
         }
@@ -1090,14 +1282,20 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
         vault.saveAnamnesis('age', age.toString());
         if (_ageConfirmedUnusual) {
           vault.saveAnamnesis('age_confirmed_unusual', true);
+        } else {
+          vault.removeAnamnesisKeys(['age_confirmed_unusual']);
         }
         if (_selectedGender == 'f') {
           vault.saveAnamnesis('pregnancy_status', _pregnancyStatus);
-          if (_pregnancyTrimester != null) {
+          if ((_pregnancyStatus == 'Yes' || _pregnancyStatus == 'possible') && _pregnancyTrimester != null) {
             vault.saveAnamnesis('pregnancy_trimester', _pregnancyTrimester);
+          } else {
+            vault.removeAnamnesisKeys(['pregnancy_trimester']);
           }
-          if (_pregnancyWeeksController.text.trim().isNotEmpty) {
+          if ((_pregnancyStatus == 'Yes' || _pregnancyStatus == 'possible') && _pregnancyWeeksController.text.trim().isNotEmpty) {
             vault.saveAnamnesis('pregnancy_weeks', num.parse(_pregnancyWeeksController.text.replaceAll(',', '.').trim()));
+          } else {
+            vault.removeAnamnesisKeys(['pregnancy_weeks']);
           }
           vault.saveAnamnesis('breastfeeding_status', _breastfeedingStatus);
         } else {
@@ -1130,6 +1328,11 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
         controller: hController,
         keyboardType: const TextInputType.numberWithOptions(decimal: true),
         style: const TextStyle(color: Colors.white),
+        onChanged: (_) {
+          if (_heightConfirmedUnusual) {
+            setState(() => _heightConfirmedUnusual = false);
+          }
+        },
         decoration: const InputDecoration(
           labelText: "Height (cm)",
           labelStyle: TextStyle(color: Colors.white38),
@@ -1149,7 +1352,7 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
           child: Column(
             children: [
               Text(
-                "Вы указали рост: ${hController.text.trim()} см. Пожалуйста, проверьте правильность ввода.",
+                "You entered height: ${hController.text.trim()} cm. Please verify this is accurate.",
                 textAlign: TextAlign.center,
                 style: const TextStyle(color: Colors.amberAccent, fontSize: 13),
               ),
@@ -1160,7 +1363,7 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
                   _heightConfirmedUnusual = true;
                   _currentError = null;
                 }),
-                child: const Text("Подтвердить рост", style: TextStyle(color: Colors.amberAccent)),
+                child: const Text("Confirm height", style: TextStyle(color: Colors.amberAccent)),
               ),
             ],
           ),
@@ -1171,6 +1374,11 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
         controller: wController,
         keyboardType: const TextInputType.numberWithOptions(decimal: true),
         style: const TextStyle(color: Colors.white),
+        onChanged: (_) {
+          if (_weightConfirmedUnusual) {
+            setState(() => _weightConfirmedUnusual = false);
+          }
+        },
         decoration: const InputDecoration(
           labelText: "Weight (kg)",
           labelStyle: TextStyle(color: Colors.white38),
@@ -1190,7 +1398,7 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
           child: Column(
             children: [
               Text(
-                "Вы указали вес: ${wController.text.trim()} кг. Пожалуйста, проверьте правильность ввода.",
+                "You entered weight: ${wController.text.trim()} kg. Please verify this is accurate.",
                 textAlign: TextAlign.center,
                 style: const TextStyle(color: Colors.amberAccent, fontSize: 13),
               ),
@@ -1201,7 +1409,7 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
                   _weightConfirmedUnusual = true;
                   _currentError = null;
                 }),
-                child: const Text("Подтвердить вес", style: TextStyle(color: Colors.amberAccent)),
+                child: const Text("Confirm weight", style: TextStyle(color: Colors.amberAccent)),
               ),
             ],
           ),
@@ -1209,10 +1417,10 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
       ],
 
       const SizedBox(height: 20),
-      const Text("Изменился ли ваш вес за последние 3–6 месяцев?", style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 16)),
+      const Text("Has your weight changed over the past 3–6 months?", style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 16)),
       const SizedBox(height: 8),
 
-      _buildSelectableOption("Вес примерно одинаковый", _weightChangeStatus == 'Stable', () {
+      _buildSelectableOption("Weight stayed roughly the same", _weightChangeStatus == 'Stable', () {
         setState(() {
           _weightChangeStatus = 'Stable';
           _weightChangeAmountController.clear();
@@ -1220,13 +1428,13 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
         });
         vault.removeAnamnesisKeys(['weight_change_amount', 'weight_change_intentional']);
       }),
-      _buildSelectableOption("Набрал(а) вес", _weightChangeStatus == 'Gained', () {
+      _buildSelectableOption("Gained weight", _weightChangeStatus == 'Gained', () {
         setState(() => _weightChangeStatus = 'Gained');
       }),
-      _buildSelectableOption("Потерял(а) вес", _weightChangeStatus == 'Lost', () {
+      _buildSelectableOption("Lost weight", _weightChangeStatus == 'Lost', () {
         setState(() => _weightChangeStatus = 'Lost');
       }),
-      _buildSelectableOption("Не знаю / не отслеживаю", _weightChangeStatus == 'Unknown', () {
+      _buildSelectableOption("Not sure / don't track", _weightChangeStatus == 'Unknown', () {
         setState(() {
           _weightChangeStatus = 'Unknown';
           _weightChangeAmountController.clear();
@@ -1241,28 +1449,28 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
           keyboardType: const TextInputType.numberWithOptions(decimal: true),
           style: const TextStyle(color: Colors.white),
           decoration: const InputDecoration(
-            labelText: "На сколько килограммов? (например, 5)",
+            labelText: "By how many kilograms? (e.g., 5)",
             labelStyle: TextStyle(color: Colors.white38),
             enabledBorder: UnderlineInputBorder(borderSide: BorderSide(color: Colors.white24)),
           ),
         ),
         const SizedBox(height: 12),
-        const Text("Это изменение было намеренным?", style: TextStyle(color: Colors.white70, fontSize: 14)),
+        const Text("Was this change intentional?", style: TextStyle(color: Colors.white70, fontSize: 14)),
         const SizedBox(height: 6),
         Row(
           children: [
-            Expanded(child: _buildSelectableOption("Да", _weightChangeIntentional == 'Yes', () => setState(() => _weightChangeIntentional = 'Yes'))),
+            Expanded(child: _buildSelectableOption("Yes", _weightChangeIntentional == 'Yes', () => setState(() => _weightChangeIntentional = 'Yes'))),
             const SizedBox(width: 6),
-            Expanded(child: _buildSelectableOption("Нет", _weightChangeIntentional == 'No', () => setState(() => _weightChangeIntentional = 'No'))),
+            Expanded(child: _buildSelectableOption("No", _weightChangeIntentional == 'No', () => setState(() => _weightChangeIntentional = 'No'))),
             const SizedBox(width: 6),
-            Expanded(child: _buildSelectableOption("Не уверен(а)", _weightChangeIntentional == 'Not sure', () => setState(() => _weightChangeIntentional = 'Not sure'))),
+            Expanded(child: _buildSelectableOption("Not sure", _weightChangeIntentional == 'Not sure', () => setState(() => _weightChangeIntentional = 'Not sure'))),
           ],
         ),
       ],
 
       const SizedBox(height: 20),
 
-      _buildSelectableOption("Next", false, () {
+      _buildSelectableOption("Next ➡️", false, () {
         FocusScope.of(context).unfocus();
 
         final String hInput = hController.text.trim();
@@ -1281,12 +1489,12 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
         }
 
         if (((height >= 50 && height < 100) || (height > 220 && height <= 260)) && !_heightConfirmedUnusual) {
-          setState(() => _currentError = "Вы указали рост: $height см. Пожалуйста, проверьте правильность ввода.");
+          setState(() => _currentError = "You entered height: $height cm. Please verify this is accurate.");
           return;
         }
 
         if (((weight >= 20 && weight < 30) || (weight > 250 && weight <= 500)) && !_weightConfirmedUnusual) {
-          setState(() => _currentError = "Вы указали вес: $weight кг. Пожалуйста, проверьте правильность ввода.");
+          setState(() => _currentError = "You entered weight: $weight kg. Please verify this is accurate.");
           return;
         }
 
@@ -1294,15 +1502,15 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
           final amtStr = _weightChangeAmountController.text.trim();
           final amt = num.tryParse(amtStr.replaceAll(',', '.'));
           if (amtStr.isEmpty || amt == null || amt <= 0) {
-            setState(() => _currentError = "Укажите положительное количество килограммов изменения веса");
+            setState(() => _currentError = "Please enter a positive number of kilograms for your weight change");
             return;
           }
           if (_weightChangeStatus == 'Lost' && amt >= weight) {
-            setState(() => _currentError = "Потеря веса ($amt кг) не может превышать текущий вес ($weight кг)");
+            setState(() => _currentError = "Weight loss ($amt kg) cannot exceed or equal your current weight ($weight kg)");
             return;
           }
           if (_weightChangeIntentional == null) {
-            setState(() => _currentError = "Пожалуйста, укажите, было ли изменение веса намеренным");
+            setState(() => _currentError = "Please indicate whether the weight change was intentional");
             return;
           }
         }
@@ -1311,8 +1519,16 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
 
         vault.saveAnamnesis('height', height.toString());
         vault.saveAnamnesis('weight', weight.toString());
-        if (_heightConfirmedUnusual) vault.saveAnamnesis('height_confirmed_unusual', true);
-        if (_weightConfirmedUnusual) vault.saveAnamnesis('weight_confirmed_unusual', true);
+        if (_heightConfirmedUnusual) {
+          vault.saveAnamnesis('height_confirmed_unusual', true);
+        } else {
+          vault.removeAnamnesisKeys(['height_confirmed_unusual']);
+        }
+        if (_weightConfirmedUnusual) {
+          vault.saveAnamnesis('weight_confirmed_unusual', true);
+        } else {
+          vault.removeAnamnesisKeys(['weight_confirmed_unusual']);
+        }
 
         if (_weightChangeStatus != null) {
           vault.saveAnamnesis('weight_change_status', _weightChangeStatus);
@@ -1334,35 +1550,35 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
     final vault = context.read<VaultService>();
 
     const productOptions = [
-      'Обычные сигареты',
-      'Вейп / электронные сигареты',
-      'Нагреваемый табак (IQOS и аналоги)',
-      'Кальян',
-      'Другие ингаляционные продукты',
+      'Conventional cigarettes',
+      'E-cigarettes / vape',
+      'Heated tobacco (IQOS, etc.)',
+      'Waterpipe / hookah',
+      'Other inhaled nicotine products',
     ];
 
     const tenureOptions = [
-      'Менее 1 года',
-      '1–3 года',
-      '3–5 лет',
-      '5–10 лет',
-      'Более 10 лет',
+      'Less than 1 year',
+      '1–3 years',
+      '3–5 years',
+      '5–10 years',
+      'More than 10 years',
     ];
 
     const freqOptions = [
-      'Реже 1 дня в месяц',
-      '1–3 дня в месяц',
-      '1–3 дня в неделю',
-      '4–6 дней в неделю',
-      'Ежедневно',
+      'Less than 1 day a month',
+      '1–3 days a month',
+      '1–3 days a week',
+      '4–6 days a week',
+      'Daily',
     ];
 
     const quitOptions = [
-      'Менее 1 месяца назад',
-      '1–6 месяцев назад',
-      '6–12 месяцев назад',
-      '1–5 лет назад',
-      'Более 5 лет назад',
+      'Less than 1 month ago',
+      '1–6 months ago',
+      '6–12 months ago',
+      '1–5 years ago',
+      'More than 5 years ago',
     ];
 
     return _wrapper(children: [
@@ -1370,7 +1586,7 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
       _buildSubtitle("«Nicotine interaction directly affects blood viscosity.»"),
 
       if (_nicotineSubStep == 0) ...[
-        _buildSelectableOption("1️⃣ Никогда не употреблял(а)", _nicotineStatus == 'Never', () {
+        _buildSelectableOption("1️⃣ Never used", _nicotineStatus == 'Never', () {
           setState(() {
             _nicotineStatus = 'Never';
             _nicotineProducts.clear();
@@ -1383,25 +1599,32 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
           vault.removeAnamnesisKeys(['nicotine_products', 'nicotine_product_tenure', 'nicotine_current_frequency', 'nicotine_quantities', 'nicotine_quit_when', 'nicotine_years', 'nicotine_freq']);
           _nextPage();
         }),
-        _buildSelectableOption("2️⃣ Иногда, от случая к случаю", _nicotineStatus == 'Occasional', () {
+        _buildSelectableOption("2️⃣ Occasionally", _nicotineStatus == 'Occasional', () {
           setState(() {
             _nicotineStatus = 'Occasional';
+            _nicotineQuitWhen = null;
+            _currentError = null;
             _nicotineSubStep = 1;
           });
         }),
-        _buildSelectableOption("3️⃣ Регулярно", _nicotineStatus == 'Regular', () {
+        _buildSelectableOption("3️⃣ Regularly", _nicotineStatus == 'Regular', () {
           setState(() {
             _nicotineStatus = 'Regular';
+            _nicotineQuitWhen = null;
+            _currentError = null;
             _nicotineSubStep = 1;
           });
         }),
-        _buildSelectableOption("4️⃣ Употреблял(а) раньше, сейчас нет", _nicotineStatus == 'Former', () {
+        _buildSelectableOption("4️⃣ Former smoker / user", _nicotineStatus == 'Former', () {
           setState(() {
             _nicotineStatus = 'Former';
+            _nicotineCurrentFrequency = null;
+            _nicotineQuantities.clear();
+            _currentError = null;
             _nicotineSubStep = 1;
           });
         }),
-        _buildSelectableOption("5️⃣ Предпочитаю не отвечать", _nicotineStatus == 'Prefer not to say', () {
+        _buildSelectableOption("5️⃣ Prefer not to answer", _nicotineStatus == 'Prefer not to say', () {
           setState(() {
             _nicotineStatus = 'Prefer not to say';
             _nicotineProducts.clear();
@@ -1415,7 +1638,7 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
           _nextPage();
         }),
       ] else ...[
-        const Text("Выберите продукты:", style: TextStyle(color: Colors.greenAccent, fontWeight: FontWeight.bold, fontSize: 16)),
+        const Text("Select products:", style: TextStyle(color: Colors.greenAccent, fontWeight: FontWeight.bold, fontSize: 16)),
         const SizedBox(height: 8),
         ...productOptions.map((prod) {
           final isSel = _nicotineProducts.contains(prod);
@@ -1424,7 +1647,13 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
               if (isSel) {
                 _nicotineProducts.remove(prod);
                 _nicotineProductTenure.remove(prod);
-                _nicotineQuantities.remove(prod);
+                if (prod == 'Conventional cigarettes') {
+                  _nicotineQuantities.remove('cigarettes_per_day');
+                } else if (prod == 'Heated tobacco (IQOS, etc.)') {
+                  _nicotineQuantities.remove('sticks_per_day');
+                } else if (prod == 'E-cigarettes / vape') {
+                  _nicotineQuantities.remove('vape_nicotine_type');
+                }
               } else {
                 _nicotineProducts.add(prod);
               }
@@ -1434,7 +1663,7 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
 
         if (_nicotineProducts.isNotEmpty) ...[
           const SizedBox(height: 16),
-          const Text("Стаж употребления для выбранных продуктов:", style: TextStyle(color: Colors.orangeAccent, fontWeight: FontWeight.bold)),
+          const Text("Duration of use for selected products:", style: TextStyle(color: Colors.orangeAccent, fontWeight: FontWeight.bold)),
           const SizedBox(height: 8),
           ..._nicotineProducts.map((prod) {
             return Column(
@@ -1464,15 +1693,15 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
 
         if (_nicotineStatus == 'Occasional' || _nicotineStatus == 'Regular') ...[
           const SizedBox(height: 12),
-          const Text("Частота употребления:", style: TextStyle(color: Colors.blueAccent, fontWeight: FontWeight.bold)),
+          const Text("Frequency of use:", style: TextStyle(color: Colors.blueAccent, fontWeight: FontWeight.bold)),
           const SizedBox(height: 6),
           ...freqOptions.map((f) => _buildSelectableOption(f, _nicotineCurrentFrequency == f, () {
             setState(() => _nicotineCurrentFrequency = f);
           })),
 
-          if (_nicotineProducts.contains('Обычные сигареты')) ...[
+          if (_nicotineProducts.contains('Conventional cigarettes')) ...[
             const SizedBox(height: 6),
-            const Text("Сигарет в день:", style: TextStyle(color: Colors.white70)),
+            const Text("Cigarettes per day:", style: TextStyle(color: Colors.white70)),
             Wrap(
               spacing: 6,
               children: ['1–5', '6–10', '11–20', '20+'].map((q) {
@@ -1487,9 +1716,9 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
               }).toList(),
             ),
           ],
-          if (_nicotineProducts.contains('Нагреваемый табак (IQOS и аналоги)')) ...[
+          if (_nicotineProducts.contains('Heated tobacco (IQOS, etc.)')) ...[
             const SizedBox(height: 6),
-            const Text("Стиков в день:", style: TextStyle(color: Colors.white70)),
+            const Text("Heated tobacco sticks per day:", style: TextStyle(color: Colors.white70)),
             Wrap(
               spacing: 6,
               children: ['1–5', '6–10', '11–20', '20+'].map((q) {
@@ -1504,12 +1733,12 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
               }).toList(),
             ),
           ],
-          if (_nicotineProducts.contains('Вейп / электронные сигареты')) ...[
+          if (_nicotineProducts.contains('E-cigarettes / vape')) ...[
             const SizedBox(height: 6),
-            const Text("Тип никотина в вейпе:", style: TextStyle(color: Colors.white70)),
+            const Text("Vape nicotine type:", style: TextStyle(color: Colors.white70)),
             Wrap(
               spacing: 6,
-              children: ['Солевой никотин', 'Щелочной никотин', 'Без никотина', 'Не знаю'].map((q) {
+              children: ['Salt nicotine', 'Freebase nicotine', 'Nicotine-free', 'Not sure'].map((q) {
                 final isQ = _nicotineQuantities['vape_nicotine_type'] == q;
                 return ChoiceChip(
                   label: Text(q, style: TextStyle(color: isQ ? Colors.black : Colors.white, fontSize: 12)),
@@ -1525,7 +1754,7 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
 
         if (_nicotineStatus == 'Former') ...[
           const SizedBox(height: 12),
-          const Text("Когда вы бросили?", style: TextStyle(color: Colors.orangeAccent, fontWeight: FontWeight.bold)),
+          const Text("When did you quit?", style: TextStyle(color: Colors.orangeAccent, fontWeight: FontWeight.bold)),
           const SizedBox(height: 6),
           ...quitOptions.map((q) => _buildSelectableOption(q, _nicotineQuitWhen == q, () {
             setState(() => _nicotineQuitWhen = q);
@@ -1534,44 +1763,66 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
 
         const SizedBox(height: 20),
 
-        _buildSelectableOption("Далее ➡️", false, () {
+        _buildSelectableOption("Next ➡️", false, () {
           if (_nicotineProducts.isEmpty) {
-            setState(() => _currentError = "Пожалуйста, выберите хотя бы один продукт");
+            setState(() => _currentError = "Please select at least one nicotine product");
             return;
           }
           for (final prod in _nicotineProducts) {
             if (_nicotineProductTenure[prod] == null) {
-              setState(() => _currentError = "Укажите стаж для «$prod»");
+              setState(() => _currentError = "Please select duration of use for «$prod»");
               return;
             }
           }
           if ((_nicotineStatus == 'Occasional' || _nicotineStatus == 'Regular') && _nicotineCurrentFrequency == null) {
-            setState(() => _currentError = "Пожалуйста, выберите частоту употребления");
+            setState(() => _currentError = "Please select frequency of use");
             return;
           }
           if (_nicotineStatus == 'Former' && _nicotineQuitWhen == null) {
-            setState(() => _currentError = "Пожалуйста, укажите, когда вы бросили");
+            setState(() => _currentError = "Please select when you quit");
             return;
           }
 
           setState(() => _currentError = null);
 
-          final legacyStatus = _nicotineStatus == 'Former' ? 'Quit' : 'Active';
-          vault.saveAnamnesis('nicotine_status', legacyStatus);
+          final String statusToSave = _nicotineStatus == 'Former'
+              ? 'Quit'
+              : (_nicotineStatus == 'Occasional' ? 'Occasional' : 'Regular');
+          vault.saveAnamnesis('nicotine_status', statusToSave);
           vault.saveAnamnesis('nicotine_products', _nicotineProducts.toList());
-          vault.saveAnamnesis('nicotine_product_tenure', _nicotineProductTenure);
-          if (_nicotineCurrentFrequency != null) {
-            vault.saveAnamnesis('nicotine_current_frequency', _nicotineCurrentFrequency);
-            vault.saveAnamnesis('nicotine_freq', _nicotineCurrentFrequency);
-          }
-          if (_nicotineQuantities.isNotEmpty) {
-            vault.saveAnamnesis('nicotine_quantities', _nicotineQuantities);
-          }
-          if (_nicotineQuitWhen != null) {
-            vault.saveAnamnesis('nicotine_quit_when', _nicotineQuitWhen);
-          }
+          vault.saveAnamnesis('nicotine_product_tenure', Map<String, dynamic>.from(_nicotineProductTenure));
           if (_nicotineProductTenure.isNotEmpty) {
             vault.saveAnamnesis('nicotine_years', _nicotineProductTenure.values.first);
+          }
+
+          if (statusToSave == 'Quit') {
+            _nicotineCurrentFrequency = null;
+            _nicotineQuantities.clear();
+            vault.removeAnamnesisKeys(['nicotine_current_frequency', 'nicotine_quantities', 'nicotine_freq']);
+            if (_nicotineQuitWhen != null) {
+              vault.saveAnamnesis('nicotine_quit_when', _nicotineQuitWhen);
+            }
+          } else {
+            _nicotineQuitWhen = null;
+            vault.removeAnamnesisKeys(['nicotine_quit_when']);
+            if (!_nicotineProducts.contains('Conventional cigarettes')) {
+              _nicotineQuantities.remove('cigarettes_per_day');
+            }
+            if (!_nicotineProducts.contains('Heated tobacco (IQOS, etc.)')) {
+              _nicotineQuantities.remove('sticks_per_day');
+            }
+            if (!_nicotineProducts.contains('E-cigarettes / vape')) {
+              _nicotineQuantities.remove('vape_nicotine_type');
+            }
+            if (_nicotineCurrentFrequency != null) {
+              vault.saveAnamnesis('nicotine_current_frequency', _nicotineCurrentFrequency);
+              vault.saveAnamnesis('nicotine_freq', _nicotineCurrentFrequency);
+            }
+            if (_nicotineQuantities.isNotEmpty) {
+              vault.saveAnamnesis('nicotine_quantities', Map<String, dynamic>.from(_nicotineQuantities));
+            } else {
+              vault.removeAnamnesisKeys(['nicotine_quantities']);
+            }
           }
 
           _nextPage();
@@ -1584,25 +1835,25 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
     final vault = context.read<VaultService>();
 
     const alcoholTypesList = [
-      'Пиво',
-      'Вино',
-      'Игристое вино / шампанское',
-      'Коктейли, сидр',
-      'Алкогольные энергетики',
-      'Крепкие напитки (40% и выше)',
-      'Крепкие напитки до 40%',
-      'Другое',
+      'Beer',
+      'Wine',
+      'Sparkling wine / Champagne',
+      'Cocktails / Cider',
+      'Alcoholic energy drinks',
+      'Strong spirits (40%+)',
+      'Spirits (<40%)',
+      'Other',
     ];
 
     final volumePresets = {
-      'Пиво': ['0.33 л', '0.5 л', '1 л', '1.5 л+'],
-      'Вино': ['150 мл (бокал)', '300 мл', '750 мл (бутылка)'],
-      'Игристое вино / шампанское': ['150 мл (бокал)', '300 мл', '750 мл (бутылка)'],
-      'Коктейли, сидр': ['200 мл', '400 мл', '600 мл+'],
-      'Алкогольные энергетики': ['250 мл', '500 мл', '1 л+'],
-      'Крепкие напитки (40% и выше)': ['50 мл (шот)', '100 мл', '200 мл', '500 мл+'],
-      'Крепкие напитки до 40%': ['50 мл (шот)', '100 мл', '200 мл', '500 мл+'],
-      'Другое': ['100 мл', '250 мл', '500 мл+'],
+      'Beer': ['0.33 L', '0.5 L', '1 L', '1.5 L+'],
+      'Wine': ['150 ml (glass)', '300 ml', '750 ml (bottle)'],
+      'Sparkling wine / Champagne': ['150 ml (glass)', '300 ml', '750 ml (bottle)'],
+      'Cocktails / Cider': ['200 ml', '400 ml', '600 ml+'],
+      'Alcoholic energy drinks': ['250 ml', '500 ml', '1 L+'],
+      'Strong spirits (40%+)': ['50 ml (shot)', '100 ml', '200 ml', '500 ml+'],
+      'Spirits (<40%)': ['50 ml (shot)', '100 ml', '200 ml', '500 ml+'],
+      'Other': ['100 ml', '250 ml', '500 ml+'],
     };
 
     return _wrapper(children: [
@@ -1610,7 +1861,7 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
       _buildSubtitle("«Frequency helps distinguish temporary noise from systemic issues.»"),
 
       if (_alcoholSubStep == 0) ...[
-        _buildSelectableOption("1️⃣ Не употребляю", _alcoholStatus == 'Non-drinker', () {
+        _buildSelectableOption("1️⃣ Non-drinker (I do not drink alcohol)", _alcoholStatus == 'Non-drinker', () {
           setState(() {
             _alcoholStatus = 'Non-drinker';
             _alcoholTypes.clear();
@@ -1621,31 +1872,35 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
           vault.removeAnamnesisKeys(['alcohol_types', 'alcohol_volumes', 'alcohol_comment', 'alcohol_type', 'user_text_alcohol']);
           _nextPage();
         }),
-        _buildSelectableOption("2️⃣ Реже одного раза в месяц", _alcoholStatus == 'Rarely', () {
+        _buildSelectableOption("2️⃣ Less than once a month", _alcoholStatus == 'Rarely', () {
           setState(() {
             _alcoholStatus = 'Rarely';
+            _currentError = null;
             _alcoholSubStep = 1;
           });
         }),
-        _buildSelectableOption("3️⃣ 1–3 раза в месяц", _alcoholStatus == '1-3/month', () {
+        _buildSelectableOption("3️⃣ 1–3 times a month", _alcoholStatus == '1-3/month', () {
           setState(() {
             _alcoholStatus = '1-3/month';
+            _currentError = null;
             _alcoholSubStep = 1;
           });
         }),
-        _buildSelectableOption("4️⃣ 1–2 раза в неделю", _alcoholStatus == '1-2/week', () {
+        _buildSelectableOption("4️⃣ 1–2 times a week", _alcoholStatus == '1-2/week', () {
           setState(() {
             _alcoholStatus = '1-2/week';
+            _currentError = null;
             _alcoholSubStep = 1;
           });
         }),
-        _buildSelectableOption("5️⃣ 3 раза в неделю или чаще", _alcoholStatus == '>=3/week', () {
+        _buildSelectableOption("5️⃣ 3 or more times a week", _alcoholStatus == '>=3/week', () {
           setState(() {
             _alcoholStatus = '>=3/week';
+            _currentError = null;
             _alcoholSubStep = 1;
           });
         }),
-        _buildSelectableOption("6️⃣ Предпочитаю не отвечать", _alcoholStatus == 'Prefer not to say', () {
+        _buildSelectableOption("6️⃣ Prefer not to answer", _alcoholStatus == 'Prefer not to say', () {
           setState(() {
             _alcoholStatus = 'Prefer not to say';
             _alcoholTypes.clear();
@@ -1657,7 +1912,7 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
           _nextPage();
         }),
       ] else ...[
-        const Text("Что вы обычно употребляете?", style: TextStyle(color: Colors.orangeAccent, fontWeight: FontWeight.bold, fontSize: 16)),
+        const Text("What do you usually drink?", style: TextStyle(color: Colors.orangeAccent, fontWeight: FontWeight.bold, fontSize: 16)),
         const SizedBox(height: 8),
 
         ...alcoholTypesList.map((type) {
@@ -1681,7 +1936,7 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
                   child: Wrap(
                     spacing: 6,
                     runSpacing: 4,
-                    children: (volumePresets[type] ?? ['100 мл', '250 мл', '500 мл']).map((vol) {
+                    children: (volumePresets[type] ?? ['100 ml', '250 ml', '500 ml']).map((vol) {
                       final isVol = _alcoholVolumes[type] == vol;
                       return ChoiceChip(
                         label: Text(vol, style: TextStyle(color: isVol ? Colors.black : Colors.white, fontSize: 12)),
@@ -1703,7 +1958,7 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
           controller: _alcoholCommentController,
           style: const TextStyle(color: Colors.white),
           decoration: const InputDecoration(
-            labelText: "Пояснение или комментарий (по желанию)",
+            labelText: "Notes or comments (optional)",
             labelStyle: TextStyle(color: Colors.white38),
             enabledBorder: UnderlineInputBorder(borderSide: BorderSide(color: Colors.white24)),
           ),
@@ -1711,18 +1966,21 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
 
         const SizedBox(height: 20),
 
-        _buildSelectableOption("Далее ➡️", false, () {
+        _buildSelectableOption("Next ➡️", false, () {
           if (_alcoholTypes.isEmpty) {
-            setState(() => _currentError = "Пожалуйста, выберите хотя бы один тип напитка");
+            setState(() => _currentError = "Please select at least one beverage type");
             return;
           }
 
           setState(() => _currentError = null);
 
-          final legacyStatus = (_alcoholStatus == 'Rarely') ? 'Rarely' : 'Frequently';
-          vault.saveAnamnesis('alcohol_status', legacyStatus);
+          vault.saveAnamnesis('alcohol_status', _alcoholStatus ?? 'Rarely');
           vault.saveAnamnesis('alcohol_types', _alcoholTypes.toList());
-          vault.saveAnamnesis('alcohol_volumes', _alcoholVolumes);
+          if (_alcoholVolumes.isNotEmpty) {
+            vault.saveAnamnesis('alcohol_volumes', Map<String, dynamic>.from(_alcoholVolumes));
+          } else {
+            vault.removeAnamnesisKeys(['alcohol_volumes']);
+          }
           vault.saveAnamnesis('alcohol_type', _alcoholTypes.first);
 
           final comment = _alcoholCommentController.text.trim();
@@ -1743,31 +2001,33 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
     final vault = context.read<VaultService>();
 
     const substanceOptions = [
-      'Каннабис / марихуана',
-      'Стимулирующие вещества',
-      'Седативные вещества без назначения врача',
-      'Опиоиды без назначения врача',
-      'Другие психоактивные вещества',
-      'Употреблял(а) ранее, сейчас нет',
+      'Cannabis / Marijuana',
+      'Stimulants',
+      'Non-prescribed sedatives',
+      'Non-prescribed opioids',
+      'Other psychoactive substances',
+      'Used in the past, not currently',
     ];
 
     const lastUseOptions = [
-      'Менее 7 дней назад',
-      'От 7 дней до 1 месяца назад',
-      'Более 1 месяца назад',
-      'Не хочу уточнять',
+      'Less than 7 days ago',
+      '7 days to 1 month ago',
+      'More than 1 month ago',
+      'Prefer not to say',
     ];
 
     final hasSubstanceSelected = _substanceTypes.any((s) => substanceOptions.contains(s));
 
     return _wrapper(children: [
-      _buildTitle("Дополнительные факторы здоровья 🛡️"),
-      _buildSubtitle("«Некоторые вещества могут влиять на сон, пульс, давление и результаты анализов. Вы можете пропустить этот вопрос»"),
+      _buildTitle("Additional Health Factors 🛡️"),
+      _buildSubtitle("«Certain substances can affect sleep, heart rate, blood pressure, and lab results. You may choose Prefer not to answer.»"),
 
       ...substanceOptions.map((sub) {
         final isSel = _substanceTypes.contains(sub);
         return _buildSelectableOption(sub, isSel, () {
           setState(() {
+            _substanceTypes.remove('None');
+            _substanceTypes.remove('Prefer not to say');
             _substanceTypes.remove('Не употребляю');
             _substanceTypes.remove('Предпочитаю не отвечать');
             if (isSel) {
@@ -1779,29 +2039,31 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
         });
       }),
 
-      _buildSelectableOption("🚫 Не употребляю", _substanceTypes.contains('Не употребляю'), () {
+      _buildSelectableOption("🚫 None (I do not use any)", _substanceTypes.contains('None'), () {
         setState(() {
           _substanceTypes.clear();
-          _substanceTypes.add('Не употребляю');
+          _substanceTypes.add('None');
           _substanceLastUse = null;
           _substanceNotesController.clear();
+          _currentError = null;
         });
-        vault.removeAnamnesisKeys(['substance_last_use', 'substance_notes']);
+        vault.removeAnamnesisKeys(['substance_last_use', 'substance_notes', 'user_text_spec_factors', 'text_spec_factors']);
       }),
 
-      _buildSelectableOption("🤐 Предпочитаю не отвечать", _substanceTypes.contains('Предпочитаю не отвечать'), () {
+      _buildSelectableOption("🤐 Prefer not to answer", _substanceTypes.contains('Prefer not to say'), () {
         setState(() {
           _substanceTypes.clear();
-          _substanceTypes.add('Предпочитаю не отвечать');
+          _substanceTypes.add('Prefer not to say');
           _substanceLastUse = null;
           _substanceNotesController.clear();
+          _currentError = null;
         });
-        vault.removeAnamnesisKeys(['substance_last_use', 'substance_notes']);
+        vault.removeAnamnesisKeys(['substance_last_use', 'substance_notes', 'user_text_spec_factors', 'text_spec_factors']);
       }),
 
       if (hasSubstanceSelected) ...[
         const SizedBox(height: 16),
-        const Text("Когда это было в последний раз?", style: TextStyle(color: Colors.orangeAccent, fontWeight: FontWeight.bold)),
+        const Text("When was the last time?", style: TextStyle(color: Colors.orangeAccent, fontWeight: FontWeight.bold)),
         const SizedBox(height: 8),
         ...lastUseOptions.map((opt) => _buildSelectableOption(opt, _substanceLastUse == opt, () {
           setState(() => _substanceLastUse = opt);
@@ -1812,7 +2074,7 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
           controller: _substanceNotesController,
           style: const TextStyle(color: Colors.white),
           decoration: const InputDecoration(
-            labelText: "Заметка или комментарий (по желанию)",
+            labelText: "Notes or comments (optional)",
             labelStyle: TextStyle(color: Colors.white38),
             enabledBorder: UnderlineInputBorder(borderSide: BorderSide(color: Colors.white24)),
           ),
@@ -1821,9 +2083,13 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
 
       const SizedBox(height: 20),
 
-      _buildSelectableOption("Continue ➡️", false, () {
+      _buildSelectableOption("Next ➡️", false, () {
         if (_substanceTypes.isEmpty) {
-          setState(() => _currentError = "Пожалуйста, выберите вариант или нажмите «Не употребляю» / «Предпочитаю не отвечать»");
+          setState(() => _currentError = "Please select an option, or choose «None» / «Prefer not to answer»");
+          return;
+        }
+        if (hasSubstanceSelected && _substanceLastUse == null) {
+          setState(() => _currentError = "Please specify when the last use occurred");
           return;
         }
 
@@ -1833,17 +2099,16 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
         vault.saveAnamnesis('spec_factors', _substanceTypes.join(', '));
 
         if (hasSubstanceSelected) {
-          if (_substanceLastUse != null) {
-            vault.saveAnamnesis('substance_last_use', _substanceLastUse);
-          }
+          vault.saveAnamnesis('substance_last_use', _substanceLastUse);
           final note = _substanceNotesController.text.trim();
           if (note.isNotEmpty) {
             vault.saveAnamnesis('substance_notes', note, userText: note);
+            vault.saveAnamnesis('user_text_spec_factors', note);
           } else {
-            vault.removeAnamnesisKeys(['substance_notes']);
+            vault.removeAnamnesisKeys(['substance_notes', 'user_text_spec_factors', 'text_spec_factors']);
           }
         } else {
-          vault.removeAnamnesisKeys(['substance_last_use', 'substance_notes']);
+          vault.removeAnamnesisKeys(['substance_last_use', 'substance_notes', 'user_text_spec_factors', 'text_spec_factors']);
         }
 
         _nextPage();
@@ -2126,7 +2391,14 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
                   child: ElevatedButton(
                     style: ElevatedButton.styleFrom(backgroundColor: Colors.orangeAccent),
                     onPressed: () {
-                      setState(() => _excludedFoodsCollapsed = true);
+                      if (_excludedFoodsController.text.trim().isEmpty) {
+                        setState(() => _currentError = "Please list the foods you avoid or uncheck the option");
+                        return;
+                      }
+                      setState(() {
+                        _currentError = null;
+                        _excludedFoodsCollapsed = true;
+                      });
                     },
                     child: const Text("Save and collapse", style: TextStyle(color: Colors.black, fontWeight: FontWeight.bold)),
                   ),
@@ -2256,12 +2528,14 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
         return Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            _buildSelectableOption(
-              selectedFreq != null ? "$prod [$selectedFreq]" : prod,
-              isSel,
-              () {
+            _buildMatryoshkaCardHeader(
+              checkboxKey: ValueKey('occasional_checkbox_$prod'),
+              label: prod,
+              isSelected: isSel,
+              onToggleCheckbox: () {
                 setState(() {
                   _dietOccasionalFoods.remove('None of the above');
+                  _currentError = null;
                   if (isSel) {
                     _dietOccasionalFoods.remove(prod);
                     _dietFoodFrequencies.remove(prod);
@@ -2269,6 +2543,18 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
                   } else {
                     _dietOccasionalFoods.add(prod);
                     _activeOccasionalFood = prod;
+                  }
+                });
+              },
+              onTapTitle: () {
+                setState(() {
+                  _dietOccasionalFoods.remove('None of the above');
+                  _currentError = null;
+                  if (!isSel) {
+                    _dietOccasionalFoods.add(prod);
+                    _activeOccasionalFood = prod;
+                  } else {
+                    _activeOccasionalFood = isActive ? null : prod;
                   }
                 });
               },
@@ -2312,7 +2598,7 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
                     const SizedBox(width: 8),
                     InkWell(
                       onTap: () => setState(() => _activeOccasionalFood = prod),
-                      child: const Text("[Change ✏️]", style: TextStyle(color: Colors.greenAccent, fontSize: 12)),
+                      child: const Text("[Edit ✏️]", style: TextStyle(color: Colors.greenAccent, fontSize: 12)),
                     ),
                   ],
                 ),
@@ -2374,6 +2660,11 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
             setState(() => _currentError = "Pescatarian diet cannot include meat and poultry");
             return;
           }
+        }
+
+        if (_hasExcludedFoods && _excludedFoodsController.text.trim().isEmpty) {
+          setState(() => _currentError = "Please specify the foods you avoid or uncheck the excluded foods option");
+          return;
         }
 
         if (_dietOccasionalFoods.isEmpty) {
@@ -2513,6 +2804,10 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
                 _drinksCoffeeTypes.clear();
                 _drinksCoffeeFrequency = null;
                 _drinksCoffeeCollapsed = false;
+              }
+              if (!_drinksTypes.contains('Black / Green tea') &&
+                  !_drinksTypes.contains('Energy drinks')) {
+                _drinksCaffeineFrequency = null;
               }
             } else {
               _drinksTypes.add(drink);
@@ -2693,9 +2988,10 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
           vault.removeAnamnesisKeys(['drinks_coffee_types', 'drinks_coffee_frequency']);
         }
 
-        if (_drinksCaffeineFrequency != null) {
+        if (hasCaffeinatedTeaOrEnergy && _drinksCaffeineFrequency != null) {
           vault.saveAnamnesis('drinks_caffeine_frequency', _drinksCaffeineFrequency);
         } else {
+          _drinksCaffeineFrequency = null;
           vault.removeAnamnesisKeys(['drinks_caffeine_frequency']);
         }
 
@@ -2774,30 +3070,41 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
         final chosenDur = _giSymptomDurations[sym];
         final isComplete = chosenFreq != null && chosenDur != null;
 
-        String label = sym;
-        if (isSel && isComplete && !isActive) {
-          label = "$sym [$chosenFreq, $chosenDur]";
-        }
-
         return Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            _buildSelectableOption(label, isSel, () {
-              setState(() {
-                _giSymptoms.remove('None of the above');
-                if (isSel) {
-                  _giSymptoms.remove(sym);
-                  _giSymptomFrequencies.remove(sym);
-                  _giSymptomDurations.remove(sym);
-                  if (_activeGiSymptom == sym) _activeGiSymptom = null;
-                } else {
-                  _giSymptoms.add(sym);
-                  _giSymptomFrequencies.remove(sym);
-                  _giSymptomDurations.remove(sym);
-                  _activeGiSymptom = sym;
-                }
-              });
-            }),
+            _buildMatryoshkaCardHeader(
+              checkboxKey: ValueKey('gi_checkbox_$sym'),
+              label: sym,
+              isSelected: isSel,
+              onToggleCheckbox: () {
+                setState(() {
+                  _giSymptoms.remove('None of the above');
+                  _currentError = null;
+                  if (isSel) {
+                    _giSymptoms.remove(sym);
+                    _giSymptomFrequencies.remove(sym);
+                    _giSymptomDurations.remove(sym);
+                    if (_activeGiSymptom == sym) _activeGiSymptom = null;
+                  } else {
+                    _giSymptoms.add(sym);
+                    _activeGiSymptom = sym;
+                  }
+                });
+              },
+              onTapTitle: () {
+                setState(() {
+                  _giSymptoms.remove('None of the above');
+                  _currentError = null;
+                  if (!isSel) {
+                    _giSymptoms.add(sym);
+                    _activeGiSymptom = sym;
+                  } else {
+                    _activeGiSymptom = isActive ? null : sym;
+                  }
+                });
+              },
+            ),
 
             if (isSel && isActive) ...[
               Container(
@@ -3434,11 +3741,6 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
         final diagName = (detail['diagnosis'] ?? '').trim();
         final curStatus = (detail['current_status'] ?? '').trim();
 
-        String optionLabel = cat;
-        if (isSel && isComplete && !isActive) {
-          optionLabel = "$cat [$diagName • $curStatus]";
-        }
-
         final diagCtrl = _getMapController(_chronicDiagnosisControllers, cat);
         final whenCtrl = _getMapController(_chronicWhenControllers, cat);
         final symCtrl = _getMapController(_chronicSymptomsControllers, cat);
@@ -3449,26 +3751,44 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
         return Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            _buildSelectableOption(optionLabel, isSel, () {
-              setState(() {
-                _chronicCategories.remove('No diagnosed chronic conditions');
-                _chronicCategories.remove("Not sure / Haven't been evaluated");
-                _currentError = null;
-                if (isSel) {
-                  _chronicCategories.remove(cat);
-                  _chronicConditionDetails.remove(cat);
-                  _clearChronicCategoryControllers(cat);
-                  if (_activeChronicCategory == cat) {
-                    _activeChronicCategory = null;
+            _buildMatryoshkaCardHeader(
+              checkboxKey: ValueKey('chronic_checkbox_$cat'),
+              label: cat,
+              isSelected: isSel,
+              onToggleCheckbox: () {
+                setState(() {
+                  _chronicCategories.remove('No diagnosed chronic conditions');
+                  _chronicCategories.remove("Not sure / Haven't been evaluated");
+                  _currentError = null;
+                  if (isSel) {
+                    _chronicCategories.remove(cat);
+                    _chronicConditionDetails.remove(cat);
+                    _clearChronicCategoryControllers(cat);
+                    if (_activeChronicCategory == cat) {
+                      _activeChronicCategory = null;
+                    }
+                  } else {
+                    _chronicCategories.add(cat);
+                    _chronicConditionDetails[cat] ??= {};
+                    _activeChronicCategory = cat;
                   }
-                } else {
-                  _chronicCategories.add(cat);
-                  _chronicConditionDetails[cat] = {};
-                  _clearChronicCategoryControllers(cat);
-                  _activeChronicCategory = cat;
-                }
-              });
-            }),
+                });
+              },
+              onTapTitle: () {
+                setState(() {
+                  _chronicCategories.remove('No diagnosed chronic conditions');
+                  _chronicCategories.remove("Not sure / Haven't been evaluated");
+                  _currentError = null;
+                  if (!isSel) {
+                    _chronicCategories.add(cat);
+                    _chronicConditionDetails[cat] ??= {};
+                    _activeChronicCategory = cat;
+                  } else {
+                    _activeChronicCategory = isActive ? null : cat;
+                  }
+                });
+              },
+            ),
 
             if (isSel && isActive) ...[
               Container(
@@ -3785,7 +4105,7 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
           setState(() => _currentError = null);
           vault.saveAnamnesis('chronic_categories', _chronicCategories.toList());
           vault.saveAnamnesis('chronic_condition_details', cleanDetails);
-          vault.saveAnamnesis('chronic_diseases', summaryParts.join(', '));
+          vault.saveAnamnesis('chronic_diseases', _clampSummary(summaryParts.join(', '), maxLen: 1024));
           if (resolvedOncoStatus != null) {
             vault.saveAnamnesis('onco_status', resolvedOncoStatus);
           } else {
@@ -3870,35 +4190,47 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
         final chosenTfLabel = detail['timeframe'] ?? '';
         final chosenRecovery = detail['recovery_status'] ?? '';
 
-        String optionLabel = ev;
-        if (isSel && isComplete && !isActive) {
-          optionLabel = "$ev [$chosenTfLabel, $chosenRecovery]";
-        }
-
         final detailsCtrl = _getMapController(_recentDetailsControllers, ev);
 
         return Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            _buildSelectableOption(optionLabel, isSel, () {
-              setState(() {
-                _recentEvents.remove('None of the above');
-                _currentError = null;
-                if (isSel) {
-                  _recentEvents.remove(ev);
-                  _recentEventDetails.remove(ev);
-                  _recentDetailsControllers[ev]?.clear();
-                  if (_activeRecentEvent == ev) {
-                    _activeRecentEvent = null;
+            _buildMatryoshkaCardHeader(
+              checkboxKey: ValueKey('recent_checkbox_$ev'),
+              label: ev,
+              isSelected: isSel,
+              onToggleCheckbox: () {
+                setState(() {
+                  _recentEvents.remove('None of the above');
+                  _currentError = null;
+                  if (isSel) {
+                    _recentEvents.remove(ev);
+                    _recentEventDetails.remove(ev);
+                    _recentDetailsControllers[ev]?.clear();
+                    if (_activeRecentEvent == ev) {
+                      _activeRecentEvent = null;
+                    }
+                  } else {
+                    _recentEvents.add(ev);
+                    _recentEventDetails[ev] ??= {};
+                    _activeRecentEvent = ev;
                   }
-                } else {
-                  _recentEvents.add(ev);
-                  _recentEventDetails[ev] = {};
-                  _recentDetailsControllers[ev]?.clear();
-                  _activeRecentEvent = ev;
-                }
-              });
-            }),
+                });
+              },
+              onTapTitle: () {
+                setState(() {
+                  _recentEvents.remove('None of the above');
+                  _currentError = null;
+                  if (!isSel) {
+                    _recentEvents.add(ev);
+                    _recentEventDetails[ev] ??= {};
+                    _activeRecentEvent = ev;
+                  } else {
+                    _activeRecentEvent = isActive ? null : ev;
+                  }
+                });
+              },
+            ),
 
             if (isSel && isActive) ...[
               Container(
@@ -4098,7 +4430,7 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
           setState(() => _currentError = null);
           vault.saveAnamnesis('recent_events', _recentEvents.toList());
           vault.saveAnamnesis('recent_event_details', cleanDetails);
-          vault.saveAnamnesis('recent_illness', summaryParts.join(', '));
+          vault.saveAnamnesis('recent_illness', _clampSummary(summaryParts.join(', '), maxLen: 512));
         }
 
         final notes = _recentNotesController.text.trim();
@@ -5223,15 +5555,13 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
       _isSmokingBranch = false;
       _isSmokingFrequencyBranch = false;
       _isAlcoholBranch = false;
+      _nicotineSubStep = 0;
+      _alcoholSubStep = 0;
       _activeChronicCategory = null;
       _activeRecentEvent = null;
       _activeFamilyRelative = null;
       _activeMedicationCategory = null;
     });
-
-    _customInputController.clear();
-    hController.clear();
-    wController.clear();
 
     _controller.nextPage(
         duration: const Duration(milliseconds: 400),
