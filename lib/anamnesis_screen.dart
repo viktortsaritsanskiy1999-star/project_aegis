@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 import 'services/api/aegis_api_client.dart';
@@ -5,6 +6,7 @@ import 'services/auth/auth_session_manager.dart';
 import 'services/vault_service.dart';
 import 'services/brain_service.dart';
 import 'widgets/aegis_device_pairing_modal.dart';
+import 'widgets/anamnesis_error_banner.dart';
 import 'package:aegis_health/screens/smart_watch_import_screen.dart';
 
 class AnamnesisScreen extends StatefulWidget {
@@ -12,13 +14,19 @@ class AnamnesisScreen extends StatefulWidget {
   _AnamnesisScreenState createState() => _AnamnesisScreenState();
 }
 
-class _AnamnesisScreenState extends State<AnamnesisScreen> {
+class _AnamnesisScreenState extends State<AnamnesisScreen>
+    with SingleTickerProviderStateMixin {
   final PageController _controller = PageController();
   int _currentPage = 0;
   final int _totalPages = 17;
 
   // --- SELECTION STATES ---
   String? _currentError; // Universal error indicator for the current screen
+  int _errorSequence = 0;
+  Timer? _errorDismissTimer;
+  late final AnimationController _errorAnimationController;
+  late final Animation<double> _errorOpacity;
+  late final Animation<Offset> _errorSlide;
   String? _selectedGender;
   bool _isSmokingBranch = false;
   bool _isSmokingFrequencyBranch = false;
@@ -808,31 +816,166 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
     _isSmokingBranch = false;
     _isSmokingFrequencyBranch = false;
     _isAlcoholBranch = false;
-    _currentError = null;
+    _clearError(immediate: true);
     _currentPage = 0;
     if (_controller.hasClients) {
       _controller.jumpToPage(0);
     }
   }
 
+  void _showError(String message) {
+    _errorDismissTimer?.cancel();
+    final int seq = ++_errorSequence;
+    if (mounted) {
+      setState(() {
+        _currentError = message;
+      });
+    } else {
+      _currentError = message;
+    }
+    _errorAnimationController.forward(from: 0.0);
+    _errorDismissTimer = Timer(const Duration(seconds: 3), () {
+      if (!mounted || seq != _errorSequence) return;
+      _errorAnimationController.reverse().then((_) {
+        if (!mounted || seq != _errorSequence) return;
+        setState(() {
+          _currentError = null;
+        });
+      });
+    });
+  }
+
+  void _clearError({bool immediate = false}) {
+    _errorDismissTimer?.cancel();
+    _errorSequence++;
+    if (_currentError == null && _errorAnimationController.value == 0) {
+      return;
+    }
+    if (immediate) {
+      _errorAnimationController.reset();
+      if (mounted) {
+        setState(() {
+          _currentError = null;
+        });
+      } else {
+        _currentError = null;
+      }
+      return;
+    }
+    final int seq = _errorSequence;
+    _errorAnimationController.reverse().then((_) {
+      if (!mounted || seq != _errorSequence) return;
+      setState(() {
+        _currentError = null;
+      });
+    });
+  }
+
+  void _clearVaultTextKeysIfPresent(VaultService vault, List<String> keys) {
+    final global = vault.getSystemContext('global');
+    final keysToRemove = keys
+        .where((k) => global.containsKey(k) || global.containsKey('text_$k'))
+        .toList();
+    if (keysToRemove.isNotEmpty) {
+      vault.removeAnamnesisKeys(keysToRemove);
+    }
+  }
+
+  void _clearVaultNestedMapField(
+    VaultService vault,
+    String vaultMapKey,
+    String entryKey,
+    String fieldKey,
+  ) {
+    final global = vault.getSystemContext('global');
+    final rawMap = global[vaultMapKey];
+    if (rawMap is! Map || rawMap[entryKey] is! Map) return;
+    final entry = rawMap[entryKey] as Map;
+    if (!entry.containsKey(fieldKey)) return;
+
+    final updatedOuter = <String, dynamic>{};
+    rawMap.forEach((k, v) {
+      if (v is Map) {
+        updatedOuter[k.toString()] = Map<String, dynamic>.from(
+          v.map((ik, iv) => MapEntry(ik.toString(), iv)),
+        );
+      } else {
+        updatedOuter[k.toString()] = v;
+      }
+    });
+    (updatedOuter[entryKey] as Map<String, dynamic>).remove(fieldKey);
+    vault.saveAnamnesis(vaultMapKey, updatedOuter);
+  }
+
+  Widget _buildClearableTextField({
+    required TextEditingController controller,
+    required InputDecoration decoration,
+    ValueChanged<String>? onChanged,
+    int? maxLines = 1,
+    TextInputType? keyboardType,
+    VoidCallback? onClear,
+  }) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        TextField(
+          controller: controller,
+          style: const TextStyle(color: Colors.white),
+          maxLines: maxLines,
+          keyboardType: keyboardType,
+          onChanged: onChanged,
+          decoration: decoration,
+        ),
+        ValueListenableBuilder<TextEditingValue>(
+          valueListenable: controller,
+          builder: (context, value, _) {
+            if (value.text.isEmpty) {
+              return const SizedBox.shrink();
+            }
+            return Align(
+              alignment: Alignment.centerRight,
+              child: TextButton.icon(
+                onPressed: () {
+                  controller.clear();
+                  onClear?.call();
+                },
+                style: TextButton.styleFrom(
+                  foregroundColor: Colors.redAccent,
+                  padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                  minimumSize: const Size(0, 32),
+                  tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                ),
+                icon: const Icon(Icons.close_rounded, size: 15),
+                label: const Text(
+                  "Clear text",
+                  style: TextStyle(fontSize: 12.5, fontWeight: FontWeight.w500),
+                ),
+              ),
+            );
+          },
+        ),
+      ],
+    );
+  }
+
   void _previousPage() {
     if (_currentPage == 3 && _nicotineSubStep > 0) {
+      _clearError(immediate: true);
       setState(() {
         _nicotineSubStep = 0;
-        _currentError = null;
       });
       return;
     }
     if (_currentPage == 4 && _alcoholSubStep > 0) {
+      _clearError(immediate: true);
       setState(() {
         _alcoholSubStep = 0;
-        _currentError = null;
       });
       return;
     }
     if (_currentPage > 0) {
+      _clearError(immediate: true);
       setState(() {
-        _currentError = null;
         _nicotineSubStep = 0;
         _alcoholSubStep = 0;
         _activeOccasionalFood = null;
@@ -857,7 +1000,32 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
   final TextEditingController wController = TextEditingController(); // Weight
 
   @override
+  void initState() {
+    super.initState();
+    _errorAnimationController = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 220),
+      reverseDuration: const Duration(milliseconds: 220),
+    );
+    _errorOpacity = CurvedAnimation(
+      parent: _errorAnimationController,
+      curve: Curves.easeOutCubic,
+      reverseCurve: Curves.easeInCubic,
+    );
+    _errorSlide = Tween<Offset>(
+      begin: const Offset(0, 0.25),
+      end: Offset.zero,
+    ).animate(CurvedAnimation(
+      parent: _errorAnimationController,
+      curve: Curves.easeOutCubic,
+      reverseCurve: Curves.easeInCubic,
+    ));
+  }
+
+  @override
   void dispose() {
+    _errorDismissTimer?.cancel();
+    _errorAnimationController.dispose();
     _controller.dispose();
     _customInputController.dispose();
     hController.dispose();
@@ -897,50 +1065,77 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
     return Scaffold(
       backgroundColor: const Color(0xFF1A1A1A),
       body: SafeArea(
-        child: Column(
+        child: Stack(
           children: [
-            LinearProgressIndicator(
-              value: progress,
-              backgroundColor: Colors.white10,
-              valueColor: const AlwaysStoppedAnimation<Color>(Colors.greenAccent),
-              minHeight: 4,
+            Column(
+              children: [
+                LinearProgressIndicator(
+                  value: progress,
+                  backgroundColor: Colors.white10,
+                  valueColor: const AlwaysStoppedAnimation<Color>(Colors.greenAccent),
+                  minHeight: 4,
+                ),
+                if (_currentPage > 0)
+                  Align(
+                    alignment: Alignment.centerLeft,
+                    child: IconButton(
+                      icon: const Icon(Icons.arrow_back, color: Colors.white70),
+                      onPressed: _previousPage,
+                      tooltip: 'Back',
+                    ),
+                  ),
+                Expanded(
+                  child: PageView(
+                    controller: _controller,
+                    physics: const NeverScrollableScrollPhysics(),
+                    onPageChanged: (page) {
+                      _clearError(immediate: true);
+                      setState(() => _currentPage = page);
+                    },
+                    children: [
+                      _stepAgeGate(), // 0
+                      _stepBioProfile(), // 1
+                      _stepDimensions(), // 2
+                      _stepNicotine(), // 3
+                      _stepAlcohol(), // 4
+                      _stepSpecFactors(), // 5
+                      _stepSleep(), // 6
+                      _stepDiet(), // 7
+                      _stepDrinks(), // 8
+                      _stepGISignals(), // 9
+                      _stepWorkMode(), // 10
+                      _stepSport(), // 10.1
+                      _stepChronic(), // 11
+                      _stepRecentEvents(), // 12
+                      _stepSafeSpace(), // 13
+                      _stepHeredity(), // 14
+                      _stepMeds(), // 15
+                      _stepFinal(), // Finish
+                    ],
+                  ),
+                ),
+              ],
             ),
-            if (_currentPage > 0)
-              Align(
-                alignment: Alignment.centerLeft,
-                child: IconButton(
-                  icon: const Icon(Icons.arrow_back, color: Colors.white70),
-                  onPressed: _previousPage,
-                  tooltip: 'Back',
+            if (_currentError != null)
+              Positioned(
+                left: 16,
+                right: 16,
+                bottom: 12,
+                child: SlideTransition(
+                  position: _errorSlide,
+                  child: FadeTransition(
+                    opacity: _errorOpacity,
+                    child: Material(
+                      color: Colors.transparent,
+                      child: AnamnesisErrorBanner(
+                        key: const Key('anamnesis_error_banner'),
+                        message: _currentError!,
+                        onDismiss: () => _clearError(),
+                      ),
+                    ),
+                  ),
                 ),
               ),
-            Expanded(
-              child: PageView(
-                controller: _controller,
-                physics: const NeverScrollableScrollPhysics(),
-                onPageChanged: (page) => setState(() => _currentPage = page),
-                children: [
-                  _stepAgeGate(), // 0
-                  _stepBioProfile(), // 1
-                  _stepDimensions(), // 2
-                  _stepNicotine(), // 3
-                  _stepAlcohol(), // 4
-                  _stepSpecFactors(), // 5
-                  _stepSleep(), // 6
-                  _stepDiet(), // 7
-                  _stepDrinks(), // 8
-                  _stepGISignals(), // 9
-                  _stepWorkMode(), // 10
-                  _stepSport(), // 10.1
-                  _stepChronic(), // 11
-                  _stepRecentEvents(), // 12
-                  _stepSafeSpace(), // 13
-                  _stepHeredity(), // 14
-                  _stepMeds(), // 15
-                  _stepFinal(), // Finish
-                ],
-              ),
-            ),
           ],
         ),
       ),
@@ -962,14 +1157,6 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
         mainAxisAlignment: MainAxisAlignment.center,
         children: [
           ...children,
-          if (_currentError != null) ...[
-            const SizedBox(height: 20),
-            Text(
-              _currentError!,
-              textAlign: TextAlign.center,
-              style: const TextStyle(color: Colors.redAccent, fontWeight: FontWeight.bold, fontSize: 14),
-            ),
-          ],
         ],
       ),
     );
@@ -1131,10 +1318,12 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
                 style: OutlinedButton.styleFrom(
                   side: const BorderSide(color: Colors.amberAccent),
                 ),
-                onPressed: () => setState(() {
-                  _ageConfirmedUnusual = true;
-                  _currentError = null;
-                }),
+                onPressed: () {
+                  setState(() {
+                    _ageConfirmedUnusual = true;
+                  });
+                  _clearError();
+                },
                 child: const Text("Confirm age", style: TextStyle(color: Colors.amberAccent)),
               ),
             ],
@@ -1220,63 +1409,63 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
         final num? ageNum = num.tryParse(ageNorm);
 
         if (_selectedGender == null) {
-          setState(() => _currentError = "Please select your gender");
+          _showError("Please select your gender");
           return;
         }
 
         if (ageInput.isEmpty) {
-          setState(() => _currentError = "Please enter your age");
+          _showError("Please enter your age");
           return;
         }
 
         if (ageNum == null || ageNum != ageNum.toInt() || ageNum < 18 || ageNum > 120) {
-          setState(() => _currentError = "Age must be an integer between 18 and 120 years");
+          _showError("Age must be an integer between 18 and 120 years");
           return;
         }
 
         final int age = ageNum.toInt();
         if (age >= 100 && age <= 120 && !_ageConfirmedUnusual) {
-          setState(() => _currentError = "You entered age: $age. Please verify this is accurate.");
+          _showError("You entered age: $age. Please verify this is accurate.");
           return;
         }
 
         if (_selectedGender == 'f') {
           if (_pregnancyStatus == null) {
-            setState(() => _currentError = "Please select your pregnancy status");
+            _showError("Please select your pregnancy status");
             return;
           }
           if (_pregnancyStatus == 'Yes' || _pregnancyStatus == 'possible') {
             if (_pregnancyTrimester == null) {
-              setState(() => _currentError = "Please select your pregnancy trimester");
+              _showError("Please select your pregnancy trimester");
               return;
             }
             if (_pregnancyWeeksController.text.trim().isNotEmpty) {
               final w = num.tryParse(_pregnancyWeeksController.text.replaceAll(',', '.').trim());
               if (w == null || w < 1 || w > 45) {
-                setState(() => _currentError = "Pregnancy duration must be between 1 and 45 weeks");
+                _showError("Pregnancy duration must be between 1 and 45 weeks");
                 return;
               }
               if (_pregnancyTrimester == '1st trimester' && w > 13) {
-                setState(() => _currentError = "Entered weeks ($w) do not match the 1st trimester (up to 13 weeks 6 days)");
+                _showError("Entered weeks ($w) do not match the 1st trimester (up to 13 weeks 6 days)");
                 return;
               }
               if (_pregnancyTrimester == '2nd trimester' && (w < 14 || w > 27)) {
-                setState(() => _currentError = "Entered weeks ($w) do not match the 2nd trimester (14–27 weeks 6 days)");
+                _showError("Entered weeks ($w) do not match the 2nd trimester (14–27 weeks 6 days)");
                 return;
               }
               if (_pregnancyTrimester == '3rd trimester' && w < 28) {
-                setState(() => _currentError = "Entered weeks ($w) do not match the 3rd trimester (28 weeks or more)");
+                _showError("Entered weeks ($w) do not match the 3rd trimester (28 weeks or more)");
                 return;
               }
             }
           }
           if (_breastfeedingStatus == null) {
-            setState(() => _currentError = "Please select your breastfeeding status");
+            _showError("Please select your breastfeeding status");
             return;
           }
         }
 
-        setState(() => _currentError = null);
+        _clearError();
 
         vault.saveAnamnesis('gender', _selectedGender == 'm' ? 'Male' : 'Female');
         vault.saveAnamnesis('age', age.toString());
@@ -1359,10 +1548,12 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
               const SizedBox(height: 6),
               OutlinedButton(
                 style: OutlinedButton.styleFrom(side: const BorderSide(color: Colors.amberAccent)),
-                onPressed: () => setState(() {
-                  _heightConfirmedUnusual = true;
-                  _currentError = null;
-                }),
+                onPressed: () {
+                  setState(() {
+                    _heightConfirmedUnusual = true;
+                  });
+                  _clearError();
+                },
                 child: const Text("Confirm height", style: TextStyle(color: Colors.amberAccent)),
               ),
             ],
@@ -1405,10 +1596,12 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
               const SizedBox(height: 6),
               OutlinedButton(
                 style: OutlinedButton.styleFrom(side: const BorderSide(color: Colors.amberAccent)),
-                onPressed: () => setState(() {
-                  _weightConfirmedUnusual = true;
-                  _currentError = null;
-                }),
+                onPressed: () {
+                  setState(() {
+                    _weightConfirmedUnusual = true;
+                  });
+                  _clearError();
+                },
                 child: const Text("Confirm weight", style: TextStyle(color: Colors.amberAccent)),
               ),
             ],
@@ -1479,22 +1672,22 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
         final num? weight = num.tryParse(wInput.replaceAll(',', '.'));
 
         if (hInput.isEmpty || height == null || height < 50 || height > 260) {
-          setState(() => _currentError = "Please enter a valid height (50-260 cm)");
+          _showError("Please enter a valid height (50-260 cm)");
           return;
         }
 
         if (wInput.isEmpty || weight == null || weight < 20 || weight > 500) {
-          setState(() => _currentError = "Please enter a valid weight (20-500 kg)");
+          _showError("Please enter a valid weight (20-500 kg)");
           return;
         }
 
         if (((height >= 50 && height < 100) || (height > 220 && height <= 260)) && !_heightConfirmedUnusual) {
-          setState(() => _currentError = "You entered height: $height cm. Please verify this is accurate.");
+          _showError("You entered height: $height cm. Please verify this is accurate.");
           return;
         }
 
         if (((weight >= 20 && weight < 30) || (weight > 250 && weight <= 500)) && !_weightConfirmedUnusual) {
-          setState(() => _currentError = "You entered weight: $weight kg. Please verify this is accurate.");
+          _showError("You entered weight: $weight kg. Please verify this is accurate.");
           return;
         }
 
@@ -1502,20 +1695,20 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
           final amtStr = _weightChangeAmountController.text.trim();
           final amt = num.tryParse(amtStr.replaceAll(',', '.'));
           if (amtStr.isEmpty || amt == null || amt <= 0) {
-            setState(() => _currentError = "Please enter a positive number of kilograms for your weight change");
+            _showError("Please enter a positive number of kilograms for your weight change");
             return;
           }
           if (_weightChangeStatus == 'Lost' && amt >= weight) {
-            setState(() => _currentError = "Weight loss ($amt kg) cannot exceed or equal your current weight ($weight kg)");
+            _showError("Weight loss ($amt kg) cannot exceed or equal your current weight ($weight kg)");
             return;
           }
           if (_weightChangeIntentional == null) {
-            setState(() => _currentError = "Please indicate whether the weight change was intentional");
+            _showError("Please indicate whether the weight change was intentional");
             return;
           }
         }
 
-        setState(() => _currentError = null);
+        _clearError();
 
         vault.saveAnamnesis('height', height.toString());
         vault.saveAnamnesis('weight', weight.toString());
@@ -1600,27 +1793,27 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
           _nextPage();
         }),
         _buildSelectableOption("2️⃣ Occasionally", _nicotineStatus == 'Occasional', () {
+          _clearError();
           setState(() {
             _nicotineStatus = 'Occasional';
             _nicotineQuitWhen = null;
-            _currentError = null;
             _nicotineSubStep = 1;
           });
         }),
         _buildSelectableOption("3️⃣ Regularly", _nicotineStatus == 'Regular', () {
+          _clearError();
           setState(() {
             _nicotineStatus = 'Regular';
             _nicotineQuitWhen = null;
-            _currentError = null;
             _nicotineSubStep = 1;
           });
         }),
         _buildSelectableOption("4️⃣ Former smoker / user", _nicotineStatus == 'Former', () {
+          _clearError();
           setState(() {
             _nicotineStatus = 'Former';
             _nicotineCurrentFrequency = null;
             _nicotineQuantities.clear();
-            _currentError = null;
             _nicotineSubStep = 1;
           });
         }),
@@ -1765,25 +1958,25 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
 
         _buildSelectableOption("Next ➡️", false, () {
           if (_nicotineProducts.isEmpty) {
-            setState(() => _currentError = "Please select at least one nicotine product");
+            _showError("Please select at least one nicotine product");
             return;
           }
           for (final prod in _nicotineProducts) {
             if (_nicotineProductTenure[prod] == null) {
-              setState(() => _currentError = "Please select duration of use for «$prod»");
+              _showError("Please select duration of use for «$prod»");
               return;
             }
           }
           if ((_nicotineStatus == 'Occasional' || _nicotineStatus == 'Regular') && _nicotineCurrentFrequency == null) {
-            setState(() => _currentError = "Please select frequency of use");
+            _showError("Please select frequency of use");
             return;
           }
           if (_nicotineStatus == 'Former' && _nicotineQuitWhen == null) {
-            setState(() => _currentError = "Please select when you quit");
+            _showError("Please select when you quit");
             return;
           }
 
-          setState(() => _currentError = null);
+          _clearError();
 
           final String statusToSave = _nicotineStatus == 'Former'
               ? 'Quit'
@@ -1873,34 +2066,35 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
           _nextPage();
         }),
         _buildSelectableOption("2️⃣ Less than once a month", _alcoholStatus == 'Rarely', () {
+          _clearError();
           setState(() {
             _alcoholStatus = 'Rarely';
-            _currentError = null;
             _alcoholSubStep = 1;
           });
         }),
         _buildSelectableOption("3️⃣ 1–3 times a month", _alcoholStatus == '1-3/month', () {
+          _clearError();
           setState(() {
             _alcoholStatus = '1-3/month';
-            _currentError = null;
             _alcoholSubStep = 1;
           });
         }),
         _buildSelectableOption("4️⃣ 1–2 times a week", _alcoholStatus == '1-2/week', () {
+          _clearError();
           setState(() {
             _alcoholStatus = '1-2/week';
-            _currentError = null;
             _alcoholSubStep = 1;
           });
         }),
         _buildSelectableOption("5️⃣ 3 or more times a week", _alcoholStatus == '>=3/week', () {
+          _clearError();
           setState(() {
             _alcoholStatus = '>=3/week';
-            _currentError = null;
             _alcoholSubStep = 1;
           });
         }),
         _buildSelectableOption("6️⃣ Prefer not to answer", _alcoholStatus == 'Prefer not to say', () {
+          _clearError();
           setState(() {
             _alcoholStatus = 'Prefer not to say';
             _alcoholTypes.clear();
@@ -1908,7 +2102,7 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
             _alcoholCommentController.clear();
           });
           vault.saveAnamnesis('alcohol_status', 'Prefer not to say');
-          vault.removeAnamnesisKeys(['alcohol_types', 'alcohol_volumes', 'alcohol_comment', 'alcohol_type', 'user_text_alcohol']);
+          vault.removeAnamnesisKeys(['alcohol_types', 'alcohol_volumes', 'alcohol_comment', 'alcohol_type', 'user_text_alcohol', 'text_alcohol']);
           _nextPage();
         }),
       ] else ...[
@@ -1921,6 +2115,7 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
               _buildSelectableOption(type, isSel, () {
+                _clearError();
                 setState(() {
                   if (isSel) {
                     _alcoholTypes.remove(type);
@@ -1943,7 +2138,16 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
                         selected: isVol,
                         selectedColor: Colors.orangeAccent,
                         backgroundColor: Colors.white12,
-                        onSelected: (val) => setState(() => _alcoholVolumes[type] = vol),
+                        onSelected: (val) {
+                          _clearError();
+                          setState(() {
+                            if (val) {
+                              _alcoholVolumes[type] = vol;
+                            } else {
+                              _alcoholVolumes.remove(type);
+                            }
+                          });
+                        },
                       );
                     }).toList(),
                   ),
@@ -1954,41 +2158,53 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
         }),
 
         const SizedBox(height: 12),
-        TextField(
+        _buildClearableTextField(
           controller: _alcoholCommentController,
-          style: const TextStyle(color: Colors.white),
           decoration: const InputDecoration(
             labelText: "Notes or comments (optional)",
             labelStyle: TextStyle(color: Colors.white38),
             enabledBorder: UnderlineInputBorder(borderSide: BorderSide(color: Colors.white24)),
           ),
+          onClear: () => _clearVaultTextKeysIfPresent(vault, ['alcohol_comment', 'user_text_alcohol', 'text_alcohol']),
         ),
 
         const SizedBox(height: 20),
 
         _buildSelectableOption("Next ➡️", false, () {
           if (_alcoholTypes.isEmpty) {
-            setState(() => _currentError = "Please select at least one beverage type");
+            _showError("Please select at least one beverage type");
             return;
           }
 
-          setState(() => _currentError = null);
+          final orderedTypes = alcoholTypesList.where((t) => _alcoholTypes.contains(t)).toList();
+          final missingVolumeTypes = orderedTypes
+              .where((t) => (_alcoholVolumes[t] ?? '').trim().isEmpty)
+              .toList();
+          if (missingVolumeTypes.isNotEmpty) {
+            final drinkLabel = missingVolumeTypes.length == 1
+                ? "«${missingVolumeTypes.first}»"
+                : missingVolumeTypes.map((t) => "«$t»").join(', ');
+            _showError("Please select the average serving volume for $drinkLabel");
+            return;
+          }
+
+          _clearError();
+          _alcoholVolumes.removeWhere((k, _) => !_alcoholTypes.contains(k));
+          final activeVolumes = <String, dynamic>{
+            for (final t in orderedTypes) t: _alcoholVolumes[t]!,
+          };
 
           vault.saveAnamnesis('alcohol_status', _alcoholStatus ?? 'Rarely');
-          vault.saveAnamnesis('alcohol_types', _alcoholTypes.toList());
-          if (_alcoholVolumes.isNotEmpty) {
-            vault.saveAnamnesis('alcohol_volumes', Map<String, dynamic>.from(_alcoholVolumes));
-          } else {
-            vault.removeAnamnesisKeys(['alcohol_volumes']);
-          }
-          vault.saveAnamnesis('alcohol_type', _alcoholTypes.first);
+          vault.saveAnamnesis('alcohol_types', orderedTypes);
+          vault.saveAnamnesis('alcohol_volumes', activeVolumes);
+          vault.saveAnamnesis('alcohol_type', orderedTypes.first);
 
           final comment = _alcoholCommentController.text.trim();
           if (comment.isNotEmpty) {
             vault.saveAnamnesis('alcohol_comment', comment, userText: comment);
             vault.saveAnamnesis('user_text_alcohol', comment);
           } else {
-            vault.removeAnamnesisKeys(['alcohol_comment', 'user_text_alcohol']);
+            vault.removeAnamnesisKeys(['alcohol_comment', 'user_text_alcohol', 'text_alcohol']);
           }
 
           _nextPage();
@@ -2040,23 +2256,23 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
       }),
 
       _buildSelectableOption("🚫 None (I do not use any)", _substanceTypes.contains('None'), () {
+        _clearError();
         setState(() {
           _substanceTypes.clear();
           _substanceTypes.add('None');
           _substanceLastUse = null;
           _substanceNotesController.clear();
-          _currentError = null;
         });
         vault.removeAnamnesisKeys(['substance_last_use', 'substance_notes', 'user_text_spec_factors', 'text_spec_factors']);
       }),
 
       _buildSelectableOption("🤐 Prefer not to answer", _substanceTypes.contains('Prefer not to say'), () {
+        _clearError();
         setState(() {
           _substanceTypes.clear();
           _substanceTypes.add('Prefer not to say');
           _substanceLastUse = null;
           _substanceNotesController.clear();
-          _currentError = null;
         });
         vault.removeAnamnesisKeys(['substance_last_use', 'substance_notes', 'user_text_spec_factors', 'text_spec_factors']);
       }),
@@ -2070,13 +2286,16 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
         })),
 
         const SizedBox(height: 10),
-        TextField(
+        _buildClearableTextField(
           controller: _substanceNotesController,
-          style: const TextStyle(color: Colors.white),
           decoration: const InputDecoration(
             labelText: "Notes or comments (optional)",
             labelStyle: TextStyle(color: Colors.white38),
             enabledBorder: UnderlineInputBorder(borderSide: BorderSide(color: Colors.white24)),
+          ),
+          onClear: () => _clearVaultTextKeysIfPresent(
+            vault,
+            ['substance_notes', 'user_text_spec_factors', 'text_spec_factors'],
           ),
         ),
       ],
@@ -2085,15 +2304,15 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
 
       _buildSelectableOption("Next ➡️", false, () {
         if (_substanceTypes.isEmpty) {
-          setState(() => _currentError = "Please select an option, or choose «None» / «Prefer not to answer»");
+          _showError("Please select an option, or choose «None» / «Prefer not to answer»");
           return;
         }
         if (hasSubstanceSelected && _substanceLastUse == null) {
-          setState(() => _currentError = "Please specify when the last use occurred");
+          _showError("Please specify when the last use occurred");
           return;
         }
 
-        setState(() => _currentError = null);
+        _clearError();
 
         vault.saveAnamnesis('substance_types', _substanceTypes.toList());
         vault.saveAnamnesis('spec_factors', _substanceTypes.join(', '));
@@ -2218,36 +2437,39 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
       })),
 
       const SizedBox(height: 12),
-      TextField(
+      _buildClearableTextField(
         controller: _sleepNotesController,
-        style: const TextStyle(color: Colors.white),
         decoration: const InputDecoration(
           labelText: "Sleep notes or comments (optional)",
           labelStyle: TextStyle(color: Colors.white38),
           enabledBorder: UnderlineInputBorder(borderSide: BorderSide(color: Colors.white24)),
+        ),
+        onClear: () => _clearVaultTextKeysIfPresent(
+          vault,
+          ['sleep_schedule_notes', 'user_text_sleep', 'text_sleep'],
         ),
       ),
 
       const SizedBox(height: 24),
       _buildSelectableOption("Next ➡️", false, () {
         if (_sleepDuration == null) {
-          setState(() => _currentError = "Please select your average sleep duration");
+          _showError("Please select your average sleep duration");
           return;
         }
         if (_sleepQuality == null) {
-          setState(() => _currentError = "Please select your sleep quality");
+          _showError("Please select your sleep quality");
           return;
         }
         if (_selectedSleepSymptoms.isEmpty) {
-          setState(() => _currentError = "Please select sleep symptoms or «None of the above»");
+          _showError("Please select sleep symptoms or «None of the above»");
           return;
         }
         if (_sleepSchedule == null) {
-          setState(() => _currentError = "Please select your sleep schedule");
+          _showError("Please select your sleep schedule");
           return;
         }
 
-        setState(() => _currentError = null);
+        _clearError();
 
         vault.saveAnamnesis('sleep_duration', _sleepDuration);
         vault.saveAnamnesis('sleep_quality', _sleepQuality);
@@ -2259,7 +2481,7 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
           vault.saveAnamnesis('sleep_schedule_notes', note, userText: note);
           vault.saveAnamnesis('user_text_sleep', note);
         } else {
-          vault.removeAnamnesisKeys(['sleep_schedule_notes', 'user_text_sleep']);
+          vault.removeAnamnesisKeys(['sleep_schedule_notes', 'user_text_sleep', 'text_sleep']);
         }
 
         _nextPage();
@@ -2335,14 +2557,14 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
 
       if (_dietType == 'Special diet / Other') ...[
         const SizedBox(height: 8),
-        TextField(
+        _buildClearableTextField(
           controller: _dietCustomDetailsController,
-          style: const TextStyle(color: Colors.white),
           decoration: const InputDecoration(
             labelText: "Please specify your diet details (required)",
             labelStyle: TextStyle(color: Colors.orangeAccent),
             enabledBorder: UnderlineInputBorder(borderSide: BorderSide(color: Colors.orangeAccent)),
           ),
+          onClear: () => _clearVaultTextKeysIfPresent(vault, ['diet_custom_details']),
         ),
       ],
 
@@ -2376,14 +2598,14 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
             ),
             if (_hasExcludedFoods) ...[
               if (!_excludedFoodsCollapsed) ...[
-                TextField(
+                _buildClearableTextField(
                   controller: _excludedFoodsController,
-                  style: const TextStyle(color: Colors.white),
                   decoration: const InputDecoration(
                     hintText: "E.g., gluten, lactose, peanuts, shellfish",
                     hintStyle: TextStyle(color: Colors.white38),
                     enabledBorder: UnderlineInputBorder(borderSide: BorderSide(color: Colors.white24)),
                   ),
+                  onClear: () => _clearVaultTextKeysIfPresent(vault, ['diet_excluded_foods_text']),
                 ),
                 const SizedBox(height: 10),
                 Align(
@@ -2392,11 +2614,11 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
                     style: ElevatedButton.styleFrom(backgroundColor: Colors.orangeAccent),
                     onPressed: () {
                       if (_excludedFoodsController.text.trim().isEmpty) {
-                        setState(() => _currentError = "Please list the foods you avoid or uncheck the option");
+                        _showError("Please list the foods you avoid or uncheck the option");
                         return;
                       }
+                      _clearError();
                       setState(() {
-                        _currentError = null;
                         _excludedFoodsCollapsed = true;
                       });
                     },
@@ -2477,20 +2699,20 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
         return _buildSelectableOption(staple, isSel, () {
           if (!isSel) {
             if (_dietType == 'Vegan' && ['Meat and poultry', 'Fish and seafood', 'Dairy products', 'Eggs'].contains(staple)) {
-              setState(() => _currentError = "Vegan diet is incompatible with animal products ($staple)");
+              _showError("Vegan diet is incompatible with animal products ($staple)");
               return;
             }
             if (_dietType == 'Vegetarian' && ['Meat and poultry', 'Fish and seafood'].contains(staple)) {
-              setState(() => _currentError = "Vegetarian diet is incompatible with $staple");
+              _showError("Vegetarian diet is incompatible with $staple");
               return;
             }
             if (_dietType == 'Pescatarian' && staple == 'Meat and poultry') {
-              setState(() => _currentError = "Pescatarian diet is incompatible with meat and poultry");
+              _showError("Pescatarian diet is incompatible with meat and poultry");
               return;
             }
           }
+          _clearError();
           setState(() {
-            _currentError = null;
             if (isSel) {
               _dietStaples.remove(staple);
             } else {
@@ -2533,9 +2755,9 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
               label: prod,
               isSelected: isSel,
               onToggleCheckbox: () {
+                _clearError();
                 setState(() {
                   _dietOccasionalFoods.remove('None of the above');
-                  _currentError = null;
                   if (isSel) {
                     _dietOccasionalFoods.remove(prod);
                     _dietFoodFrequencies.remove(prod);
@@ -2547,9 +2769,9 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
                 });
               },
               onTapTitle: () {
+                _clearError();
                 setState(() {
                   _dietOccasionalFoods.remove('None of the above');
-                  _currentError = null;
                   if (!isSel) {
                     _dietOccasionalFoods.add(prod);
                     _activeOccasionalFood = prod;
@@ -2609,36 +2831,39 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
       }),
 
       const SizedBox(height: 12),
-      TextField(
+      _buildClearableTextField(
         controller: _dietDayDescriptionController,
-        style: const TextStyle(color: Colors.white),
         decoration: const InputDecoration(
           labelText: "Describe a typical day of eating (optional)",
           labelStyle: TextStyle(color: Colors.white38),
           enabledBorder: UnderlineInputBorder(borderSide: BorderSide(color: Colors.white24)),
+        ),
+        onClear: () => _clearVaultTextKeysIfPresent(
+          vault,
+          ['diet_day_description', 'text_diet_day'],
         ),
       ),
 
       const SizedBox(height: 24),
       _buildSelectableOption("Next ➡️", false, () {
         if (_dietType == null) {
-          setState(() => _currentError = "Please select your primary diet pattern");
+          _showError("Please select your primary diet pattern");
           return;
         }
         if (_dietType == 'Special diet / Other' && _dietCustomDetailsController.text.trim().isEmpty) {
-          setState(() => _currentError = "Please specify your diet details");
+          _showError("Please specify your diet details");
           return;
         }
         if (_dietMealsPerDay == null) {
-          setState(() => _currentError = "Please select your daily meal frequency");
+          _showError("Please select your daily meal frequency");
           return;
         }
         if (_dietSnacksPerDay == null) {
-          setState(() => _currentError = "Please select your snack frequency");
+          _showError("Please select your snack frequency");
           return;
         }
         if (_dietStaples.isEmpty) {
-          setState(() => _currentError = "Please select at least one core staple");
+          _showError("Please select at least one core staple");
           return;
         }
 
@@ -2646,42 +2871,42 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
         if (_dietType == 'Vegan') {
           final invalid = _dietStaples.where((s) => ['Meat and poultry', 'Fish and seafood', 'Dairy products', 'Eggs'].contains(s)).toList();
           if (invalid.isNotEmpty) {
-            setState(() => _currentError = "Vegan diet cannot include animal products: ${invalid.join(', ')}");
+            _showError("Vegan diet cannot include animal products: ${invalid.join(', ')}");
             return;
           }
         } else if (_dietType == 'Vegetarian') {
           final invalid = _dietStaples.where((s) => ['Meat and poultry', 'Fish and seafood'].contains(s)).toList();
           if (invalid.isNotEmpty) {
-            setState(() => _currentError = "Vegetarian diet cannot include: ${invalid.join(', ')}");
+            _showError("Vegetarian diet cannot include: ${invalid.join(', ')}");
             return;
           }
         } else if (_dietType == 'Pescatarian') {
           if (_dietStaples.contains('Meat and poultry')) {
-            setState(() => _currentError = "Pescatarian diet cannot include meat and poultry");
+            _showError("Pescatarian diet cannot include meat and poultry");
             return;
           }
         }
 
         if (_hasExcludedFoods && _excludedFoodsController.text.trim().isEmpty) {
-          setState(() => _currentError = "Please specify the foods you avoid or uncheck the excluded foods option");
+          _showError("Please specify the foods you avoid or uncheck the excluded foods option");
           return;
         }
 
         if (_dietOccasionalFoods.isEmpty) {
-          setState(() => _currentError = "Please select occasional foods or «None of the above»");
+          _showError("Please select occasional foods or «None of the above»");
           return;
         }
 
         if (!_dietOccasionalFoods.contains('None of the above')) {
           for (final prod in _dietOccasionalFoods) {
             if (_dietFoodFrequencies[prod] == null || _dietFoodFrequencies[prod]!.isEmpty) {
-              setState(() => _currentError = "Please select consumption frequency for «$prod»");
+              _showError("Please select consumption frequency for «$prod»");
               return;
             }
           }
         }
 
-        setState(() => _currentError = null);
+        _clearError();
 
         vault.saveAnamnesis('diet_types', _dietType);
         if (_dietType == 'Special diet / Other') {
@@ -2707,7 +2932,7 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
         if (dayDesc.isNotEmpty) {
           vault.saveAnamnesis('diet_day_description', dayDesc, userText: dayDesc);
         } else {
-          vault.removeAnamnesisKeys(['diet_day_description']);
+          vault.removeAnamnesisKeys(['diet_day_description', 'text_diet_day']);
         }
 
         vault.saveAnamnesis('diet_habits', '$_dietMealsPerDay meals, $_dietSnacksPerDay snacks/day; ${_dietStaples.join(", ")}');
@@ -2884,15 +3109,15 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
                     style: ElevatedButton.styleFrom(backgroundColor: Colors.orangeAccent),
                     onPressed: () {
                       if (_drinksCoffeeTypes.isEmpty) {
-                        setState(() => _currentError = "Please select at least one coffee type");
+                        _showError("Please select at least one coffee type");
                         return;
                       }
                       if (_drinksCoffeeFrequency == null) {
-                        setState(() => _currentError = "Please select your coffee frequency");
+                        _showError("Please select your coffee frequency");
                         return;
                       }
+                      _clearError();
                       setState(() {
-                        _currentError = null;
                         _drinksCoffeeCollapsed = true;
                       });
                     },
@@ -2944,39 +3169,42 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
       ],
 
       const SizedBox(height: 12),
-      TextField(
+      _buildClearableTextField(
         controller: _drinksDayDescriptionController,
-        style: const TextStyle(color: Colors.white),
         decoration: const InputDecoration(
           labelText: "Hydration notes or routine (optional)",
           labelStyle: TextStyle(color: Colors.white38),
           enabledBorder: UnderlineInputBorder(borderSide: BorderSide(color: Colors.white24)),
+        ),
+        onClear: () => _clearVaultTextKeysIfPresent(
+          vault,
+          ['drinks_day_description', 'user_text_drinks', 'text_drinks'],
         ),
       ),
 
       const SizedBox(height: 24),
       _buildSelectableOption("Next ➡️", false, () {
         if (_drinksTotalVolume == null) {
-          setState(() => _currentError = "Please select your total daily fluid intake");
+          _showError("Please select your total daily fluid intake");
           return;
         }
         if (_drinksTypes.isEmpty) {
-          setState(() => _currentError = "Please select at least one beverage type");
+          _showError("Please select at least one beverage type");
           return;
         }
 
         if (hasCoffee) {
           if (_drinksCoffeeTypes.isEmpty) {
-            setState(() => _currentError = "Please select at least one coffee type");
+            _showError("Please select at least one coffee type");
             return;
           }
           if (_drinksCoffeeFrequency == null) {
-            setState(() => _currentError = "Please select your coffee frequency");
+            _showError("Please select your coffee frequency");
             return;
           }
         }
 
-        setState(() => _currentError = null);
+        _clearError();
 
         vault.saveAnamnesis('drinks_total_volume', _drinksTotalVolume);
         vault.saveAnamnesis('drinks_types', _drinksTypes.toList());
@@ -3000,7 +3228,7 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
           vault.saveAnamnesis('drinks_day_description', desc, userText: desc);
           vault.saveAnamnesis('user_text_drinks', desc);
         } else {
-          vault.removeAnamnesisKeys(['drinks_day_description', 'user_text_drinks']);
+          vault.removeAnamnesisKeys(['drinks_day_description', 'user_text_drinks', 'text_drinks']);
         }
 
         _nextPage();
@@ -3078,9 +3306,9 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
               label: sym,
               isSelected: isSel,
               onToggleCheckbox: () {
+                _clearError();
                 setState(() {
                   _giSymptoms.remove('None of the above');
-                  _currentError = null;
                   if (isSel) {
                     _giSymptoms.remove(sym);
                     _giSymptomFrequencies.remove(sym);
@@ -3093,9 +3321,9 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
                 });
               },
               onTapTitle: () {
+                _clearError();
                 setState(() {
                   _giSymptoms.remove('None of the above');
-                  _currentError = null;
                   if (!isSel) {
                     _giSymptoms.add(sym);
                     _activeGiSymptom = sym;
@@ -3166,15 +3394,15 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
                         style: ElevatedButton.styleFrom(backgroundColor: Colors.orangeAccent),
                         onPressed: () {
                           if (_giSymptomFrequencies[sym] == null) {
-                            setState(() => _currentError = "Please select frequency for «$sym»");
+                            _showError("Please select frequency for «$sym»");
                             return;
                           }
                           if (_giSymptomDurations[sym] == null) {
-                            setState(() => _currentError = "Please select duration for «$sym»");
+                            _showError("Please select duration for «$sym»");
                             return;
                           }
+                          _clearError();
                           setState(() {
-                            _currentError = null;
                             _activeGiSymptom = null;
                           });
                         },
@@ -3216,9 +3444,8 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
       }),
 
       const SizedBox(height: 16),
-      TextField(
+      _buildClearableTextField(
         controller: _giDetailsController,
-        style: const TextStyle(color: Colors.white),
         decoration: const InputDecoration(
           labelText: "Additional details (optional)",
           labelStyle: TextStyle(color: Colors.white38),
@@ -3226,12 +3453,16 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
           hintStyle: TextStyle(color: Colors.white24, fontSize: 12),
           enabledBorder: UnderlineInputBorder(borderSide: BorderSide(color: Colors.white24)),
         ),
+        onClear: () => _clearVaultTextKeysIfPresent(
+          vault,
+          ['user_text_gi_signals', 'text_gi_signals'],
+        ),
       ),
 
       const SizedBox(height: 24),
       _buildSelectableOption("Next ➡️", false, () async {
         if (_giSymptoms.isEmpty) {
-          setState(() => _currentError = "Please select your digestive symptoms or «None of the above»");
+          _showError("Please select your digestive symptoms or «None of the above»");
           return;
         }
 
@@ -3240,14 +3471,14 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
             if (_giSymptomFrequencies[sym] == null || _giSymptomDurations[sym] == null) {
               setState(() {
                 _activeGiSymptom = sym;
-                _currentError = "Please complete frequency and duration for «$sym»";
               });
+              _showError("Please complete frequency and duration for «$sym»");
               return;
             }
           }
         }
 
-        setState(() => _currentError = null);
+        _clearError();
 
         final detailsText = _giDetailsController.text.trim();
         if (detailsText.isNotEmpty && brain != null) {
@@ -3317,9 +3548,8 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
       _buildTitle("Work & Daily Routine 💼"),
       _buildSubtitle("«Your daily environment and occupational stress significantly affect muscular load and circadian rhythm.»"),
 
-      TextField(
+      _buildClearableTextField(
         controller: _workOccupationController,
-        style: const TextStyle(color: Colors.white),
         decoration: const InputDecoration(
           labelText: "What is your occupation or profession? (optional)",
           labelStyle: TextStyle(color: Colors.white70),
@@ -3327,6 +3557,7 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
           hintStyle: TextStyle(color: Colors.white24, fontSize: 13),
           enabledBorder: UnderlineInputBorder(borderSide: BorderSide(color: Colors.white24)),
         ),
+        onClear: () => _clearVaultTextKeysIfPresent(vault, ['work_occupation']),
       ),
 
       const SizedBox(height: 20),
@@ -3360,9 +3591,8 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
       })),
 
       const SizedBox(height: 16),
-      TextField(
+      _buildClearableTextField(
         controller: _workNotesController,
-        style: const TextStyle(color: Colors.white),
         decoration: const InputDecoration(
           labelText: "Additional details (optional)",
           labelStyle: TextStyle(color: Colors.white38),
@@ -3370,24 +3600,25 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
           hintStyle: TextStyle(color: Colors.white24, fontSize: 12),
           enabledBorder: UnderlineInputBorder(borderSide: BorderSide(color: Colors.white24)),
         ),
+        onClear: () => _clearVaultTextKeysIfPresent(vault, ['user_text_work', 'text_work']),
       ),
 
       const SizedBox(height: 24),
       _buildSelectableOption("Next ➡️", false, () {
         if (_workActivity == null) {
-          setState(() => _currentError = "Please select how you spend most of your day");
+          _showError("Please select how you spend most of your day");
           return;
         }
         if (_workSchedule == null) {
-          setState(() => _currentError = "Please select your usual schedule");
+          _showError("Please select your usual schedule");
           return;
         }
         if (_workStress == null) {
-          setState(() => _currentError = "Please rate your daily stress level");
+          _showError("Please rate your daily stress level");
           return;
         }
 
-        setState(() => _currentError = null);
+        _clearError();
 
         vault.saveAnamnesis('work_type', _workActivity);
         vault.saveAnamnesis('work_schedule', _workSchedule);
@@ -3539,9 +3770,8 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
 
         if (_activityTypes.contains('Other')) ...[
           const SizedBox(height: 10),
-          TextField(
+          _buildClearableTextField(
             controller: _activityOtherController,
-            style: const TextStyle(color: Colors.white),
             decoration: const InputDecoration(
               labelText: "Please specify your activity",
               labelStyle: TextStyle(color: Colors.orangeAccent),
@@ -3549,14 +3779,14 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
               hintStyle: TextStyle(color: Colors.white24, fontSize: 12),
               enabledBorder: UnderlineInputBorder(borderSide: BorderSide(color: Colors.orangeAccent)),
             ),
+            onClear: () => _clearVaultTextKeysIfPresent(vault, ['activity_other_details']),
           ),
         ],
       ],
 
       const SizedBox(height: 20),
-      TextField(
+      _buildClearableTextField(
         controller: _activityNotesController,
-        style: const TextStyle(color: Colors.white),
         decoration: const InputDecoration(
           labelText: "Tell us a little more about your activity (optional)",
           labelStyle: TextStyle(color: Colors.white38),
@@ -3564,35 +3794,36 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
           hintStyle: TextStyle(color: Colors.white24, fontSize: 12),
           enabledBorder: UnderlineInputBorder(borderSide: BorderSide(color: Colors.white24)),
         ),
+        onClear: () => _clearVaultTextKeysIfPresent(vault, ['user_text_sport', 'text_sport']),
       ),
 
       const SizedBox(height: 24),
       _buildSelectableOption("Next ➡️", false, () {
         if (_sportLevel == null) {
-          setState(() => _currentError = "Please select your physical activity level");
+          _showError("Please select your physical activity level");
           return;
         }
 
         if (hasSportActive) {
           if (_activityDaysPerWeek == null) {
-            setState(() => _currentError = "Please select how many days per week you are active");
+            _showError("Please select how many days per week you are active");
             return;
           }
           if (_activityDurationMinutes == null) {
-            setState(() => _currentError = "Please select how long your activity usually lasts");
+            _showError("Please select how long your activity usually lasts");
             return;
           }
           if (_activityTypes.isEmpty) {
-            setState(() => _currentError = "Please select at least one activity type");
+            _showError("Please select at least one activity type");
             return;
           }
           if (_activityTypes.contains('Other') && _activityOtherController.text.trim().isEmpty) {
-            setState(() => _currentError = "Please specify your activity for «Other»");
+            _showError("Please specify your activity for «Other»");
             return;
           }
         }
 
-        setState(() => _currentError = null);
+        _clearError();
 
         vault.saveAnamnesis('sport_level', _sportLevel);
 
@@ -3719,6 +3950,7 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
         if (isNegativeCategory(cat)) {
           final isSel = _chronicCategories.contains(cat);
           return _buildSelectableOption(cat, isSel, () {
+            _clearError();
             setState(() {
               for (final existing in _chronicCategories.toList()) {
                 _clearChronicCategoryControllers(existing);
@@ -3726,7 +3958,6 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
               _chronicCategories.clear();
               _chronicConditionDetails.clear();
               _activeChronicCategory = null;
-              _currentError = null;
               if (!isSel) {
                 _chronicCategories.add(cat);
               }
@@ -3756,10 +3987,10 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
               label: cat,
               isSelected: isSel,
               onToggleCheckbox: () {
+                _clearError();
                 setState(() {
                   _chronicCategories.remove('No diagnosed chronic conditions');
                   _chronicCategories.remove("Not sure / Haven't been evaluated");
-                  _currentError = null;
                   if (isSel) {
                     _chronicCategories.remove(cat);
                     _chronicConditionDetails.remove(cat);
@@ -3775,10 +4006,10 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
                 });
               },
               onTapTitle: () {
+                _clearError();
                 setState(() {
                   _chronicCategories.remove('No diagnosed chronic conditions');
                   _chronicCategories.remove("Not sure / Haven't been evaluated");
-                  _currentError = null;
                   if (!isSel) {
                     _chronicCategories.add(cat);
                     _chronicConditionDetails[cat] ??= {};
@@ -3806,9 +4037,8 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
                     const SizedBox(height: 10),
 
                     const Text("What condition were you diagnosed with?", style: TextStyle(color: Colors.white70, fontSize: 13, fontWeight: FontWeight.w600)),
-                    TextField(
+                    _buildClearableTextField(
                       controller: diagCtrl,
-                      style: const TextStyle(color: Colors.white),
                       onChanged: (val) {
                         _chronicConditionDetails.putIfAbsent(cat, () => {})['diagnosis'] = val.trim();
                       },
@@ -3817,13 +4047,18 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
                         hintStyle: const TextStyle(color: Colors.white24, fontSize: 12),
                         enabledBorder: const UnderlineInputBorder(borderSide: BorderSide(color: Colors.white24)),
                       ),
+                      onClear: () {
+                        setState(() {
+                          _chronicConditionDetails[cat]?.remove('diagnosis');
+                        });
+                        _clearVaultNestedMapField(vault, 'chronic_condition_details', cat, 'diagnosis');
+                      },
                     ),
 
                     const SizedBox(height: 12),
                     const Text("When was it diagnosed? (optional)", style: TextStyle(color: Colors.white70, fontSize: 13, fontWeight: FontWeight.w600)),
-                    TextField(
+                    _buildClearableTextField(
                       controller: whenCtrl,
-                      style: const TextStyle(color: Colors.white),
                       onChanged: (val) {
                         final trimmed = val.trim();
                         final map = _chronicConditionDetails.putIfAbsent(cat, () => {});
@@ -3838,6 +4073,12 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
                         hintStyle: TextStyle(color: Colors.white24, fontSize: 12),
                         enabledBorder: UnderlineInputBorder(borderSide: BorderSide(color: Colors.white24)),
                       ),
+                      onClear: () {
+                        setState(() {
+                          _chronicConditionDetails[cat]?.remove('diagnosed_when');
+                        });
+                        _clearVaultNestedMapField(vault, 'chronic_condition_details', cat, 'diagnosed_when');
+                      },
                     ),
 
                     if (cat == 'Cancer or oncological history') ...[
@@ -3916,9 +4157,8 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
                     if (showSymptomField) ...[
                       const SizedBox(height: 12),
                       const Text("What symptoms are you experiencing? (optional)", style: TextStyle(color: Colors.white70, fontSize: 13, fontWeight: FontWeight.w600)),
-                      TextField(
+                      _buildClearableTextField(
                         controller: symCtrl,
-                        style: const TextStyle(color: Colors.white),
                         onChanged: (val) {
                           final trimmed = val.trim();
                           final map = _chronicConditionDetails.putIfAbsent(cat, () => {});
@@ -3933,6 +4173,12 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
                           hintStyle: const TextStyle(color: Colors.white24, fontSize: 12),
                           enabledBorder: const UnderlineInputBorder(borderSide: BorderSide(color: Colors.white24)),
                         ),
+                        onClear: () {
+                          setState(() {
+                            _chronicConditionDetails[cat]?.remove('current_symptoms_text');
+                          });
+                          _clearVaultNestedMapField(vault, 'chronic_condition_details', cat, 'current_symptoms_text');
+                        },
                       ),
                     ],
 
@@ -3945,7 +4191,7 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
                           final map = _chronicConditionDetails.putIfAbsent(cat, () => {});
                           final diagText = diagCtrl.text.trim();
                           if (diagText.isEmpty) {
-                            setState(() => _currentError = "Please enter the diagnosed condition for «$cat»");
+                            _showError("Please enter the diagnosed condition for «$cat»");
                             return;
                           }
                           map['diagnosis'] = diagText;
@@ -3958,17 +4204,17 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
                           }
 
                           if (cat == 'Cancer or oncological history' && (map['onco_status'] ?? '').isEmpty) {
-                            setState(() => _currentError = "Please select the oncological status for «$cat»");
+                            _showError("Please select the oncological status for «$cat»");
                             return;
                           }
 
                           if ((map['current_status'] ?? '').isEmpty) {
-                            setState(() => _currentError = "Please select the current status for «$cat»");
+                            _showError("Please select the current status for «$cat»");
                             return;
                           }
 
                           if ((map['currently_bothers'] ?? '').isEmpty) {
-                            setState(() => _currentError = "Please indicate whether «$cat» currently bothers you");
+                            _showError("Please indicate whether «$cat» currently bothers you");
                             return;
                           }
 
@@ -3986,8 +4232,8 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
                             map.remove('current_symptoms_text');
                           }
 
+                          _clearError();
                           setState(() {
-                            _currentError = null;
                             _activeChronicCategory = null;
                           });
                         },
@@ -4029,9 +4275,8 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
       }),
 
       const SizedBox(height: 16),
-      TextField(
+      _buildClearableTextField(
         controller: _chronicNotesController,
-        style: const TextStyle(color: Colors.white),
         decoration: const InputDecoration(
           labelText: "Additional medical history (optional)",
           labelStyle: TextStyle(color: Colors.white38),
@@ -4039,18 +4284,19 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
           hintStyle: TextStyle(color: Colors.white24, fontSize: 12),
           enabledBorder: UnderlineInputBorder(borderSide: BorderSide(color: Colors.white24)),
         ),
+        onClear: () => _clearVaultTextKeysIfPresent(vault, ['user_text_chronic_diseases', 'text_chronic_diseases']),
       ),
 
       const SizedBox(height: 24),
       _buildSelectableOption("Next ➡️", false, () {
         if (_chronicCategories.isEmpty) {
-          setState(() => _currentError = "Please select at least one option or «No diagnosed chronic conditions»");
+          _showError("Please select at least one option or «No diagnosed chronic conditions»");
           return;
         }
 
         final hasNegative = _chronicCategories.any(isNegativeCategory);
         if (hasNegative) {
-          setState(() => _currentError = null);
+          _clearError();
           vault.saveAnamnesis('chronic_categories', _chronicCategories.toList());
           vault.removeAnamnesisKeys(['chronic_condition_details', 'onco_status']);
           vault.saveAnamnesis('chronic_diseases', _chronicCategories.first);
@@ -4061,8 +4307,8 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
             if (diagText.isEmpty) {
               setState(() {
                 _activeChronicCategory = cat;
-                _currentError = "Please enter the diagnosed condition for «$cat»";
               });
+              _showError("Please enter the diagnosed condition for «$cat»");
               return;
             }
             if (map != null) {
@@ -4077,8 +4323,8 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
             if (!isCategoryComplete(cat)) {
               setState(() {
                 _activeChronicCategory = cat;
-                _currentError = "Please complete all required details for «$cat»";
               });
+              _showError("Please complete all required details for «$cat»");
               return;
             }
           }
@@ -4102,7 +4348,7 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
             }
           }
 
-          setState(() => _currentError = null);
+          _clearError();
           vault.saveAnamnesis('chronic_categories', _chronicCategories.toList());
           vault.saveAnamnesis('chronic_condition_details', cleanDetails);
           vault.saveAnamnesis('chronic_diseases', _clampSummary(summaryParts.join(', '), maxLen: 1024));
@@ -4168,6 +4414,7 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
         if (ev == 'None of the above') {
           final isNoneSel = _recentEvents.contains('None of the above');
           return _buildSelectableOption(ev, isNoneSel, () {
+            _clearError();
             setState(() {
               for (final existing in _recentEvents.toList()) {
                 _recentDetailsControllers[existing]?.clear();
@@ -4175,7 +4422,6 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
               _recentEvents.clear();
               _recentEventDetails.clear();
               _activeRecentEvent = null;
-              _currentError = null;
               if (!isNoneSel) {
                 _recentEvents.add('None of the above');
               }
@@ -4200,9 +4446,9 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
               label: ev,
               isSelected: isSel,
               onToggleCheckbox: () {
+                _clearError();
                 setState(() {
                   _recentEvents.remove('None of the above');
-                  _currentError = null;
                   if (isSel) {
                     _recentEvents.remove(ev);
                     _recentEventDetails.remove(ev);
@@ -4218,9 +4464,9 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
                 });
               },
               onTapTitle: () {
+                _clearError();
                 setState(() {
                   _recentEvents.remove('None of the above');
-                  _currentError = null;
                   if (!isSel) {
                     _recentEvents.add(ev);
                     _recentEventDetails[ev] ??= {};
@@ -4294,9 +4540,8 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
 
                     const SizedBox(height: 12),
                     const Text("Additional details (optional)", style: TextStyle(color: Colors.white70, fontSize: 13, fontWeight: FontWeight.w600)),
-                    TextField(
+                    _buildClearableTextField(
                       controller: detailsCtrl,
-                      style: const TextStyle(color: Colors.white),
                       onChanged: (val) {
                         final trimmed = val.trim();
                         final map = _recentEventDetails.putIfAbsent(ev, () => {});
@@ -4311,6 +4556,12 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
                         hintStyle: TextStyle(color: Colors.white24, fontSize: 12),
                         enabledBorder: UnderlineInputBorder(borderSide: BorderSide(color: Colors.white24)),
                       ),
+                      onClear: () {
+                        setState(() {
+                          _recentEventDetails[ev]?.remove('details');
+                        });
+                        _clearVaultNestedMapField(vault, 'recent_event_details', ev, 'details');
+                      },
                     ),
 
                     const SizedBox(height: 12),
@@ -4321,11 +4572,11 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
                         onPressed: () {
                           final map = _recentEventDetails.putIfAbsent(ev, () => {});
                           if ((map['timeframe_code'] ?? '').isEmpty) {
-                            setState(() => _currentError = "Please select when «$ev» happened");
+                            _showError("Please select when «$ev» happened");
                             return;
                           }
                           if ((map['recovery_status'] ?? '').isEmpty) {
-                            setState(() => _currentError = "Please select your recovery status for «$ev»");
+                            _showError("Please select your recovery status for «$ev»");
                             return;
                           }
                           final detText = detailsCtrl.text.trim();
@@ -4334,8 +4585,8 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
                           } else {
                             map.remove('details');
                           }
+                          _clearError();
                           setState(() {
-                            _currentError = null;
                             _activeRecentEvent = null;
                           });
                         },
@@ -4377,9 +4628,8 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
       }),
 
       const SizedBox(height: 16),
-      TextField(
+      _buildClearableTextField(
         controller: _recentNotesController,
-        style: const TextStyle(color: Colors.white),
         decoration: const InputDecoration(
           labelText: "Anything else you would like to mention? (optional)",
           labelStyle: TextStyle(color: Colors.white38),
@@ -4387,17 +4637,18 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
           hintStyle: TextStyle(color: Colors.white24, fontSize: 12),
           enabledBorder: UnderlineInputBorder(borderSide: BorderSide(color: Colors.white24)),
         ),
+        onClear: () => _clearVaultTextKeysIfPresent(vault, ['user_text_recent_illness', 'text_recent_illness']),
       ),
 
       const SizedBox(height: 24),
       _buildSelectableOption("Next ➡️", false, () {
         if (_recentEvents.isEmpty) {
-          setState(() => _currentError = "Please select your recent events or «None of the above»");
+          _showError("Please select your recent events or «None of the above»");
           return;
         }
 
         if (_recentEvents.contains('None of the above')) {
-          setState(() => _currentError = null);
+          _clearError();
           vault.saveAnamnesis('recent_events', ['None of the above']);
           vault.removeAnamnesisKeys(['recent_event_details']);
           vault.saveAnamnesis('recent_illness', 'Healthy (None of the above)');
@@ -4406,8 +4657,8 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
             if (!isEventComplete(ev)) {
               setState(() {
                 _activeRecentEvent = ev;
-                _currentError = "Please complete timeframe and recovery status for «$ev»";
               });
+              _showError("Please complete timeframe and recovery status for «$ev»");
               return;
             }
           }
@@ -4427,7 +4678,7 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
             summaryParts.add("$ev (${cleaned['timeframe']}, ${cleaned['recovery_status']})");
           }
 
-          setState(() => _currentError = null);
+          _clearError();
           vault.saveAnamnesis('recent_events', _recentEvents.toList());
           vault.saveAnamnesis('recent_event_details', cleanDetails);
           vault.saveAnamnesis('recent_illness', _clampSummary(summaryParts.join(', '), maxLen: 512));
@@ -4496,9 +4747,9 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
       ...statusOptions.map((st) {
         final isSel = _infectiousHistoryStatus == st;
         return _buildSelectableOption(st, isSel, () {
+          _clearError();
           setState(() {
             _infectiousHistoryStatus = st;
-            _currentError = null;
             if (st != diagnosedKey) {
               _infectiousDiagnosed.clear();
               _infectiousDiagnosedNotesController.clear();
@@ -4531,8 +4782,8 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
               ...infectionList.map((inf) {
                 final isInfSel = _infectiousDiagnosed.contains(inf);
                 return _buildSelectableOption(inf, isInfSel, () {
+                  _clearError();
                   setState(() {
-                    _currentError = null;
                     if (isInfSel) {
                       _infectiousDiagnosed.remove(inf);
                     } else {
@@ -4542,15 +4793,18 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
                 });
               }),
               const SizedBox(height: 10),
-              TextField(
+              _buildClearableTextField(
                 controller: _infectiousDiagnosedNotesController,
-                style: const TextStyle(color: Colors.white),
                 decoration: const InputDecoration(
                   labelText: "Current status or additional details (optional)",
                   labelStyle: TextStyle(color: Colors.white54, fontSize: 13),
                   hintText: "e.g. Hepatitis B was diagnosed several years ago, and I currently receive medical follow-up.",
                   hintStyle: TextStyle(color: Colors.white24, fontSize: 12),
                   enabledBorder: UnderlineInputBorder(borderSide: BorderSide(color: Colors.white24)),
+                ),
+                onClear: () => _clearVaultTextKeysIfPresent(
+                  vault,
+                  ['user_text_critical_infections', 'text_critical_infections'],
                 ),
               ),
             ],
@@ -4578,8 +4832,8 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
               ...infectionList.map((inf) {
                 final isInfSel = _infectiousTestedNegative.contains(inf);
                 return _buildSelectableOption(inf, isInfSel, () {
+                  _clearError();
                   setState(() {
-                    _currentError = null;
                     if (isInfSel) {
                       _infectiousTestedNegative.remove(inf);
                     } else {
@@ -4589,9 +4843,8 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
                 });
               }),
               const SizedBox(height: 10),
-              TextField(
+              _buildClearableTextField(
                 controller: _infectiousLastTestedController,
-                style: const TextStyle(color: Colors.white),
                 decoration: const InputDecoration(
                   labelText: "When were you last tested? (optional)",
                   labelStyle: TextStyle(color: Colors.white54, fontSize: 13),
@@ -4599,6 +4852,7 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
                   hintStyle: TextStyle(color: Colors.white24, fontSize: 12),
                   enabledBorder: UnderlineInputBorder(borderSide: BorderSide(color: Colors.white24)),
                 ),
+                onClear: () => _clearVaultTextKeysIfPresent(vault, ['infectious_last_tested']),
               ),
             ],
           ),
@@ -4608,16 +4862,16 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
       const SizedBox(height: 24),
       _buildSelectableOption("Next ➡️", false, () {
         if (_infectiousHistoryStatus == null) {
-          setState(() => _currentError = "Please select one of the options above");
+          _showError("Please select one of the options above");
           return;
         }
 
         if (_infectiousHistoryStatus == diagnosedKey && _infectiousDiagnosed.isEmpty) {
-          setState(() => _currentError = "Please select at least one diagnosed infection");
+          _showError("Please select at least one diagnosed infection");
           return;
         }
 
-        setState(() => _currentError = null);
+        _clearError();
         vault.saveAnamnesis('infectious_history_status', _infectiousHistoryStatus);
 
         if (_infectiousHistoryStatus == diagnosedKey) {
@@ -4795,9 +5049,9 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
       ...statusOptions.map((st) {
         final isSel = _familyHistoryStatus == st;
         return _buildSelectableOption(st, isSel, () {
+          _clearError();
           setState(() {
             _familyHistoryStatus = st;
-            _currentError = null;
             if (st != 'Yes') {
               _activeFamilyRelative = null;
             }
@@ -4831,8 +5085,8 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
                 label: rel,
                 isSelected: isSel,
                 onToggleCheckbox: () {
+                  _clearError();
                   setState(() {
-                    _currentError = null;
                     if (isSel) {
                       _familyRelatives.remove(rel);
                       _familyRelativeConditions.remove(rel);
@@ -4851,8 +5105,8 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
                   });
                 },
                 onTapTitle: () {
+                  _clearError();
                   setState(() {
-                    _currentError = null;
                     if (!isSel) {
                       _familyRelatives.add(rel);
                       _familyRelativeConditions.putIfAbsent(rel, () => <String>{});
@@ -4882,15 +5136,20 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
                       ),
                       if (rel == 'Other blood relatives') ...[
                         const SizedBox(height: 10),
-                        TextField(
+                        _buildClearableTextField(
                           controller: _familyOtherRelController,
-                          style: const TextStyle(color: Colors.white),
                           decoration: const InputDecoration(
                             labelText: "Specify relationship",
                             labelStyle: TextStyle(color: Colors.white70, fontSize: 13),
                             hintText: "e.g. Aunt, uncle, cousin",
                             hintStyle: TextStyle(color: Colors.white24, fontSize: 12),
                             enabledBorder: UnderlineInputBorder(borderSide: BorderSide(color: Colors.white24)),
+                          ),
+                          onClear: () => _clearVaultNestedMapField(
+                            vault,
+                            'family_history_details',
+                            'Other blood relatives',
+                            'relationship_detail',
                           ),
                         ),
                       ],
@@ -4915,8 +5174,8 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
                             backgroundColor: Colors.white12,
                             checkmarkColor: Colors.black,
                             onSelected: (_) {
+                              _clearError();
                               setState(() {
-                                _currentError = null;
                                 final setForRel = _familyRelativeConditions.putIfAbsent(rel, () => <String>{});
                                 if (isCSel) {
                                   setForRel.remove(cond);
@@ -4929,9 +5188,8 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
                         }).toList(),
                       ),
                       const SizedBox(height: 12),
-                      TextField(
+                      _buildClearableTextField(
                         controller: detailsCtrl,
-                        style: const TextStyle(color: Colors.white),
                         maxLines: null,
                         decoration: const InputDecoration(
                           labelText: "Additional details (optional)",
@@ -4939,6 +5197,12 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
                           hintText: "e.g. Type 2 diabetes, hypertension, colon cancer, other details",
                           hintStyle: TextStyle(color: Colors.white24, fontSize: 12),
                           enabledBorder: UnderlineInputBorder(borderSide: BorderSide(color: Colors.white24)),
+                        ),
+                        onClear: () => _clearVaultNestedMapField(
+                          vault,
+                          'family_history_details',
+                          rel,
+                          'details',
                         ),
                       ),
                       const SizedBox(height: 12),
@@ -4949,20 +5213,16 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
                           onPressed: () {
                             if (rel == 'Other blood relatives' &&
                                 _familyOtherRelController.text.trim().isEmpty) {
-                              setState(() {
-                                _currentError = "Please specify the relationship for «Other blood relatives»";
-                              });
+                              _showError("Please specify the relationship for «Other blood relatives»");
                               return;
                             }
                             final conds = _familyRelativeConditions[rel];
                             if (conds == null || conds.isEmpty) {
-                              setState(() {
-                                _currentError = "Please select at least one condition for «$rel»";
-                              });
+                              _showError("Please select at least one condition for «$rel»");
                               return;
                             }
+                            _clearError();
                             setState(() {
-                              _currentError = null;
                               _activeFamilyRelative = null;
                             });
                           },
@@ -5014,13 +5274,13 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
 
       _buildSelectableOption("Next ➡️", false, () {
         if (_familyHistoryStatus == null) {
-          setState(() => _currentError = "Please select one of the options above");
+          _showError("Please select one of the options above");
           return;
         }
 
         if (_familyHistoryStatus == 'Yes') {
           if (_familyRelatives.isEmpty) {
-            setState(() => _currentError = "Please select at least one blood relative or change your answer above");
+            _showError("Please select at least one blood relative or change your answer above");
             return;
           }
 
@@ -5033,8 +5293,8 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
                 _familyOtherRelController.text.trim().isEmpty) {
               setState(() {
                 _activeFamilyRelative = rel;
-                _currentError = "Please specify the relationship for «Other blood relatives»";
               });
+              _showError("Please specify the relationship for «Other blood relatives»");
               return;
             }
             final chosen = _familyRelativeConditions[rel] ?? <String>{};
@@ -5042,8 +5302,8 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
             if (orderedConds.isEmpty) {
               setState(() {
                 _activeFamilyRelative = rel;
-                _currentError = "Please select at least one condition for «$rel»";
               });
+              _showError("Please select at least one condition for «$rel»");
               return;
             }
 
@@ -5065,14 +5325,14 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
             summaryParts.add("$relLabel: ${orderedConds.join(', ')}");
           }
 
-          setState(() => _currentError = null);
+          _clearError();
           vault.saveAnamnesis('family_history_status', 'Yes');
           vault.saveAnamnesis('family_history_relatives', orderedRelatives);
           vault.saveAnamnesis('family_history_details', detailsPayload);
           vault.saveAnamnesis('heredity_risks', _clampSummary(summaryParts.join('; ')));
           vault.removeAnamnesisKeys(['user_text_heredity_risks', 'text_heredity_risks']);
         } else {
-          setState(() => _currentError = null);
+          _clearError();
           vault.saveAnamnesis('family_history_status', _familyHistoryStatus);
           vault.saveAnamnesis('heredity_risks', _familyHistoryStatus!);
           vault.removeAnamnesisKeys([
@@ -5132,6 +5392,8 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
   }
 
   Widget _stepMeds() {
+    final vault = context.read<VaultService>();
+
     const statusOptions = [
       'Yes',
       'No',
@@ -5188,6 +5450,7 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
       ...statusOptions.map((st) {
         final isSel = _medicationsStatus == st;
         return _buildSelectableOption(st, isSel, () {
+          _clearError();
           setState(() {
             if (_medicationsStatus == 'Yes' && st != 'Yes') {
               for (final cat in _medicationCategories.toList()) {
@@ -5197,7 +5460,6 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
               _activeMedicationCategory = null;
             }
             _medicationsStatus = st;
-            _currentError = null;
           });
         });
       }),
@@ -5228,8 +5490,8 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
                 label: cat,
                 isSelected: isSel,
                 onToggleCheckbox: () {
+                  _clearError();
                   setState(() {
-                    _currentError = null;
                     if (isSel) {
                       _uncheckMedicationCategory(cat);
                     } else {
@@ -5238,8 +5500,8 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
                   });
                 },
                 onTapTitle: () {
+                  _clearError();
                   setState(() {
-                    _currentError = null;
                     if (!isSel) {
                       _checkAndOpenMedicationCategory(cat);
                     } else {
@@ -5262,8 +5524,8 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
                       ),
                       TextButton(
                         onPressed: () {
+                          _clearError();
                           setState(() {
-                            _currentError = null;
                             _permanentlyClearMedicationCategory(cat);
                           });
                         },
@@ -5291,9 +5553,8 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
                         style: const TextStyle(color: Colors.orangeAccent, fontWeight: FontWeight.bold, fontSize: 14),
                       ),
                       const SizedBox(height: 10),
-                      TextField(
+                      _buildClearableTextField(
                         controller: nameCtrl,
-                        style: const TextStyle(color: Colors.white),
                         maxLines: null,
                         keyboardType: TextInputType.multiline,
                         onChanged: (_) => _archiveMedicationDraft(cat),
@@ -5306,11 +5567,16 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
                           helperStyle: const TextStyle(color: Colors.white38, fontSize: 11),
                           enabledBorder: const UnderlineInputBorder(borderSide: BorderSide(color: Colors.white24)),
                         ),
+                        onClear: () {
+                          setState(() {
+                            _archiveMedicationDraft(cat);
+                          });
+                          _clearVaultNestedMapField(vault, 'medication_details', cat, 'names');
+                        },
                       ),
                       const SizedBox(height: 12),
-                      TextField(
+                      _buildClearableTextField(
                         controller: courseCtrl,
-                        style: const TextStyle(color: Colors.white),
                         maxLines: null,
                         keyboardType: TextInputType.multiline,
                         onChanged: (_) => _archiveMedicationDraft(cat),
@@ -5321,41 +5587,34 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
                           hintStyle: const TextStyle(color: Colors.white24, fontSize: 12),
                           enabledBorder: const UnderlineInputBorder(borderSide: BorderSide(color: Colors.white24)),
                         ),
+                        onClear: () {
+                          setState(() {
+                            _archiveMedicationDraft(cat);
+                          });
+                          _clearVaultNestedMapField(vault, 'medication_details', cat, 'course');
+                        },
                       ),
                       const SizedBox(height: 12),
-                      Row(
-                        mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                        children: [
-                          TextButton(
-                            onPressed: () {
-                              setState(() {
-                                _currentError = null;
-                                _permanentlyClearMedicationCategory(cat);
-                              });
-                            },
-                            child: const Text("Clear text", style: TextStyle(color: Colors.redAccent, fontSize: 12.5)),
+                      Align(
+                        alignment: Alignment.centerRight,
+                        child: ElevatedButton(
+                          style: ElevatedButton.styleFrom(backgroundColor: Colors.orangeAccent),
+                          onPressed: () {
+                            if (nameCtrl.text.trim().isEmpty) {
+                              _showError("Please enter at least one medication or supplement name for «$cat»");
+                              return;
+                            }
+                            _archiveMedicationDraft(cat);
+                            _clearError();
+                            setState(() {
+                              _activeMedicationCategory = null;
+                            });
+                          },
+                          child: const Text(
+                            "Save and collapse",
+                            style: TextStyle(color: Colors.black, fontWeight: FontWeight.bold),
                           ),
-                          ElevatedButton(
-                            style: ElevatedButton.styleFrom(backgroundColor: Colors.orangeAccent),
-                            onPressed: () {
-                              if (nameCtrl.text.trim().isEmpty) {
-                                setState(() {
-                                  _currentError = "Please enter at least one medication or supplement name for «$cat»";
-                                });
-                                return;
-                              }
-                              _archiveMedicationDraft(cat);
-                              setState(() {
-                                _currentError = null;
-                                _activeMedicationCategory = null;
-                              });
-                            },
-                            child: const Text(
-                              "Save and collapse",
-                              style: TextStyle(color: Colors.black, fontWeight: FontWeight.bold),
-                            ),
-                          ),
-                        ],
+                        ),
                       ),
                     ],
                   ),
@@ -5400,16 +5659,14 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
       _buildSelectableOption("Finish 🚀", false, () async {
         if (_isSubmitting) return;
 
-        final vault = context.read<VaultService>();
-
         if (_medicationsStatus == null) {
-          setState(() => _currentError = "Please select one of the options above");
+          _showError("Please select one of the options above");
           return;
         }
 
         if (_medicationsStatus == 'Yes') {
           if (_medicationCategories.isEmpty) {
-            setState(() => _currentError = "Please select at least one category or change your answer above");
+            _showError("Please select at least one category or change your answer above");
             return;
           }
 
@@ -5422,8 +5679,8 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
             if (names.isEmpty) {
               setState(() {
                 _activeMedicationCategory = cat;
-                _currentError = "Please enter at least one medication or supplement name for «$cat»";
               });
+              _showError("Please enter at least one medication or supplement name for «$cat»");
               return;
             }
             final course = _getMapController(_medicationCourseControllers, cat).text.trim();
@@ -5451,8 +5708,8 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
           ]);
         }
 
+        _clearError(immediate: true);
         setState(() {
-          _currentError = null;
           _isSubmitting = true;
         });
 
@@ -5466,12 +5723,12 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
 
           // 4. Check device authentication
           if (auth == null || !auth.isAuthenticated) {
-            setState(() => _currentError = "Device pairing required to synchronize anamnesis with Aegis Server.");
+            _showError("Device pairing required to synchronize anamnesis with Aegis Server.");
             await AegisDevicePairingModal.show(context);
             if (!mounted) return;
 
             if (auth == null || !auth.isAuthenticated) {
-              setState(() => _currentError = "Draft saved securely. Pair device to synchronize with Aegis Server.");
+              _showError("Draft saved securely. Pair device to synchronize with Aegis Server.");
               return;
             }
 
@@ -5479,19 +5736,15 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
             await vault.associateGuestDraftToActivePatient();
             if (!mounted) return;
 
-            setState(() => _currentError = "Device paired! Tap 'Finish 🚀' to synchronize anamnesis with Aegis Server.");
+            _showError("Device paired! Tap 'Finish 🚀' to synchronize anamnesis with Aegis Server.");
             return;
           }
 
           // 5. Server synchronization via AegisApiClient
           if (apiClient == null) {
-            setState(() => _currentError = "API client unavailable. Draft saved securely.");
+            _showError("API client unavailable. Draft saved securely.");
             return;
           }
-
-          setState(() {
-            _currentError = "Synchronizing with Aegis Server (M1)...";
-          });
 
           final syncResult = await vault.syncAnamnesisToServer(
             apiClient: apiClient,
@@ -5501,28 +5754,22 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
           if (!mounted) return;
 
           if (syncResult.isSuccess) {
-            setState(() {
-              _currentError = null;
-            });
+            _clearError(immediate: true);
             _nextPage();
           } else {
-            setState(() {
-              if (syncResult.status == AnamnesisSyncStatus.offline) {
-                _currentError = "Connection timeout or network failure. Draft saved securely. Tap 'Finish 🚀' to retry.";
-              } else if (syncResult.status == AnamnesisSyncStatus.insufficientScopes) {
-                _currentError = "Access denied: session lacks 'cascade:intake' scope. Please re-pair device.";
-              } else if (syncResult.status == AnamnesisSyncStatus.unauthorized) {
-                _currentError = "Session expired or device not paired. Tap 'Finish 🚀' to re-authenticate.";
-              } else {
-                _currentError = syncResult.errorMessage ?? "Synchronization failed. Draft saved securely.";
-              }
-            });
+            if (syncResult.status == AnamnesisSyncStatus.offline) {
+              _showError("Connection timeout or network failure. Draft saved securely. Tap 'Finish 🚀' to retry.");
+            } else if (syncResult.status == AnamnesisSyncStatus.insufficientScopes) {
+              _showError("Access denied: session lacks 'cascade:intake' scope. Please re-pair device.");
+            } else if (syncResult.status == AnamnesisSyncStatus.unauthorized) {
+              _showError("Session expired or device not paired. Tap 'Finish 🚀' to re-authenticate.");
+            } else {
+              _showError(syncResult.errorMessage ?? "Synchronization failed. Draft saved securely.");
+            }
           }
         } catch (e) {
           if (!mounted) return;
-          setState(() {
-            _currentError = "Error: $e. Draft saved securely. Tap 'Finish 🚀' to retry.";
-          });
+          _showError("Error: $e. Draft saved securely. Tap 'Finish 🚀' to retry.");
         } finally {
           if (mounted) {
             setState(() {
@@ -5547,9 +5794,8 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
   ]);
 
   void _nextPage() {
+    _clearError(immediate: true);
     setState(() {
-      _currentError = null;
-
       _multiSelect.clear();
 
       _isSmokingBranch = false;
