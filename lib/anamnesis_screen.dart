@@ -141,8 +141,30 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
   final Set<String> _infectiousTestedNegative = {};
   final TextEditingController _infectiousLastTestedController = TextEditingController();
 
+  // --- STAGE 5 ENHANCED STATES ---
+  // Card 15: Family History & Heredity
+  String? _familyHistoryStatus;
+  final Set<String> _familyRelatives = {};
+  final Map<String, Set<String>> _familyRelativeConditions = {};
+  final Map<String, TextEditingController> _familyDetailsControllers = {};
+  final TextEditingController _familyOtherRelController = TextEditingController();
+  String? _activeFamilyRelative;
+
+  // Card 16: Medications, Vitamins & Supplements
+  String? _medicationsStatus;
+  final Set<String> _medicationCategories = {};
+  final Map<String, TextEditingController> _medicationNameControllers = {};
+  final Map<String, TextEditingController> _medicationCourseControllers = {};
+  final Map<String, Map<String, String>> _medicationDraftArchive = {};
+  String? _activeMedicationCategory;
+
   TextEditingController _getMapController(Map<String, TextEditingController> map, String key) {
     return map.putIfAbsent(key, () => TextEditingController());
+  }
+
+  String _clampSummary(String text, {int maxLen = 1000}) {
+    if (text.length <= maxLen) return text;
+    return '${text.substring(0, maxLen - 3)}...';
   }
 
   void _clearChronicCategoryControllers(String cat) {
@@ -460,6 +482,54 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
     if (_infectiousLastTestedController.text.isEmpty && global['infectious_last_tested'] != null) {
       _infectiousLastTestedController.text = global['infectious_last_tested'].toString();
     }
+
+    // Stage 5: Family History & Heredity
+    if (_familyHistoryStatus == null && global['family_history_status'] != null) {
+      _familyHistoryStatus = global['family_history_status'].toString();
+    }
+    if (_familyRelatives.isEmpty && global['family_history_relatives'] is List) {
+      _familyRelatives.addAll((global['family_history_relatives'] as List).map((e) => e.toString()));
+    }
+    if (_familyRelativeConditions.isEmpty && global['family_history_details'] is Map) {
+      (global['family_history_details'] as Map).forEach((k, v) {
+        if (v is Map) {
+          final rel = k.toString();
+          if (v['conditions'] is List) {
+            _familyRelativeConditions[rel] =
+                (v['conditions'] as List).map((e) => e.toString()).toSet();
+          }
+          if (v['details'] != null) {
+            _getMapController(_familyDetailsControllers, rel).text = v['details'].toString();
+          }
+          if (rel == 'Other blood relatives' && v['relationship_detail'] != null) {
+            _familyOtherRelController.text = v['relationship_detail'].toString();
+          }
+        }
+      });
+    }
+
+    // Stage 5: Medications, Vitamins & Supplements
+    if (_medicationsStatus == null && global['medications_status'] != null) {
+      _medicationsStatus = global['medications_status'].toString();
+    }
+    if (_medicationCategories.isEmpty && global['medication_categories'] is List) {
+      _medicationCategories.addAll((global['medication_categories'] as List).map((e) => e.toString()));
+    }
+    if (global['medication_details'] is Map) {
+      (global['medication_details'] as Map).forEach((k, v) {
+        if (v is Map) {
+          final cat = k.toString();
+          final nameCtrl = _getMapController(_medicationNameControllers, cat);
+          final courseCtrl = _getMapController(_medicationCourseControllers, cat);
+          if (nameCtrl.text.isEmpty && v['names'] != null) {
+            nameCtrl.text = v['names'].toString();
+          }
+          if (courseCtrl.text.isEmpty && v['course'] != null) {
+            courseCtrl.text = v['course'].toString();
+          }
+        }
+      });
+    }
   }
 
   void _resetLocalState() {
@@ -550,6 +620,18 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
     _infectiousDiagnosedNotesController.clear();
     _infectiousTestedNegative.clear();
     _infectiousLastTestedController.clear();
+    _familyHistoryStatus = null;
+    _familyRelatives.clear();
+    _familyRelativeConditions.clear();
+    for (final c in _familyDetailsControllers.values) { c.clear(); }
+    _familyOtherRelController.clear();
+    _activeFamilyRelative = null;
+    _medicationsStatus = null;
+    _medicationCategories.clear();
+    for (final c in _medicationNameControllers.values) { c.clear(); }
+    for (final c in _medicationCourseControllers.values) { c.clear(); }
+    _medicationDraftArchive.clear();
+    _activeMedicationCategory = null;
     _isSmokingBranch = false;
     _isSmokingFrequencyBranch = false;
     _isAlcoholBranch = false;
@@ -570,6 +652,8 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
         _activeGiSymptom = null;
         _activeChronicCategory = null;
         _activeRecentEvent = null;
+        _activeFamilyRelative = null;
+        _activeMedicationCategory = null;
       });
       _controller.previousPage(
         duration: const Duration(milliseconds: 400),
@@ -613,6 +697,10 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
     for (final c in _recentDetailsControllers.values) { c.dispose(); }
     _infectiousDiagnosedNotesController.dispose();
     _infectiousLastTestedController.dispose();
+    for (final c in _familyDetailsControllers.values) { c.dispose(); }
+    _familyOtherRelController.dispose();
+    for (final c in _medicationNameControllers.values) { c.dispose(); }
+    for (final c in _medicationCourseControllers.values) { c.dispose(); }
     super.dispose();
   }
 
@@ -4260,189 +4348,859 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
     ]);
   }
 
-  Widget _stepHeredity() => _wrapper(children: [
-    _buildTitle("Family Archive 🌳"),
-    _buildSubtitle("«Did close relatives experience serious conditions before 50–60 years of age?»"),
-
-    _buildCheckOption("💔 Heart attacks / Strokes", "her_heart"),
-    _buildCheckOption("📉 Oncology", "her_onco"),
-    _buildCheckOption("🍭 Diabetes", "her_diab"),
-    _buildCheckOption("🧠 Alzheimer's / Dementia", "her_brain"),
-    _buildCheckOption("✅ Nothing serious", "her_none"),
-
-    const SizedBox(height: 10),
-
-    TextField(
-      controller: _customInputController,
-      style: const TextStyle(color: Colors.white),
-      onChanged: (text) {
-        // If the user starts typing, we must uncheck "Nothing serious"
-        if (text.isNotEmpty && _multiSelect.contains('her_none')) {
-          setState(() => _multiSelect.remove('her_none'));
-        }
-      },
-      decoration: const InputDecoration(
-          hintText: "📝 Add your own (e.g., thyroid)...",
-          prefixIcon: Icon(Icons.people, color: Colors.white24)
+  Widget _buildMatryoshkaCardHeader({
+    required Key? checkboxKey,
+    required String label,
+    required bool isSelected,
+    required VoidCallback onToggleCheckbox,
+    required VoidCallback onTapTitle,
+  }) {
+    return Container(
+      margin: const EdgeInsets.only(bottom: 8),
+      decoration: BoxDecoration(
+        color: isSelected ? Colors.greenAccent.withValues(alpha: 0.1) : Colors.transparent,
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(
+          color: isSelected ? Colors.greenAccent : Colors.white24,
+          width: isSelected ? 2 : 1,
+        ),
       ),
-    ),
-
-    const SizedBox(height: 20),
-
-    _buildSelectableOption("Next ➡️", false, () {
-      final bool hasText = _customInputController.text.trim().isNotEmpty;
-      final bool hasSelection = _multiSelect.isNotEmpty;
-
-      // 1. VALIDATION: Do not allow proceeding with completely empty data
-      if (!hasSelection && !hasText) {
-        setState(() => _currentError = "Please select options or click «Nothing serious»");
-        return;
-      }
-
-      // 2. CONFLICT PLACEHOLDER: If "Nothing" is selected along with something else
-      if (_multiSelect.contains('her_none') && (hasText || _multiSelect.length > 1)) {
-        setState(() => _currentError = "«Nothing serious» is selected, but other data has been added. Please clarify.");
-        return;
-      }
-
-      // 3. SAVE TO VAULT: Bind the result
-      String result = _multiSelect.join(', ');
-      if (hasText) {
-        result += (result.isEmpty ? "" : ", ") + _customInputController.text.trim();
-      }
-
-      context.read<VaultService>().saveAnamnesis('heredity_risks', result);
-      _nextPage();
-    }),
-  ]);
-
-  Widget _stepMeds() => _wrapper(children: [
-    _buildTitle("Medications and Supplements 💊"),
-    _buildSubtitle("«Many medications directly alter lab results. This is critical for accuracy.»"),
-
-    _buildCheckOption("💊 Hormonal (incl. COC)", "med_horm"),
-    _buildCheckOption("💊 Statins (for cholesterol)", "med_stat"),
-    _buildCheckOption("💊 Vitamins / Supplements", "med_vit"),
-    _buildCheckOption("💊 Painkillers (NSAIDs)", "med_pain"),
-    _buildCheckOption("🚫 Taking nothing", "med_none"),
-
-    const SizedBox(height: 10),
-
-    TextField(
-      controller: _customInputController,
-      style: const TextStyle(color: Colors.white),
-      onChanged: (text) {
-        // Protection: if text input starts, reset "Taking nothing"
-        if (text.isNotEmpty && _multiSelect.contains('med_none')) {
-          setState(() => _multiSelect.remove('med_none'));
-        }
-      },
-      decoration: const InputDecoration(
-          hintText: "🌀 Other (e.g. Metformin)...",
-          prefixIcon: Icon(Icons.medication, color: Colors.white24)
+      child: Row(
+        children: [
+          Checkbox(
+            key: checkboxKey,
+            value: isSelected,
+            activeColor: Colors.greenAccent,
+            checkColor: Colors.black,
+            side: const BorderSide(color: Colors.white54),
+            onChanged: (_) => onToggleCheckbox(),
+          ),
+          Expanded(
+            child: InkWell(
+              onTap: onTapTitle,
+              borderRadius: BorderRadius.circular(12),
+              child: Padding(
+                padding: const EdgeInsets.symmetric(vertical: 14, horizontal: 6),
+                child: Text(
+                  label,
+                  style: TextStyle(
+                    color: isSelected ? Colors.greenAccent : Colors.white,
+                    fontSize: 15.5,
+                    fontWeight: isSelected ? FontWeight.w600 : FontWeight.normal,
+                  ),
+                ),
+              ),
+            ),
+          ),
+        ],
       ),
-    ),
+    );
+  }
 
-    const SizedBox(height: 20),
+  Widget _stepHeredity() {
+    final vault = context.read<VaultService>();
 
-    _buildSelectableOption("Finish 🚀", false, () async {
-      if (_isSubmitting) return;
+    const statusOptions = [
+      'Yes',
+      'No, as far as I know',
+      "I don't know my family history",
+      'Prefer not to answer',
+    ];
 
-      setState(() {
-        _isSubmitting = true;
-      });
+    const relativeOptions = [
+      'Mother',
+      'Father',
+      'Brother',
+      'Sister',
+      'Maternal grandmother',
+      'Maternal grandfather',
+      'Paternal grandmother',
+      'Paternal grandfather',
+      'Children',
+      'Other blood relatives',
+    ];
 
-      try {
-        final vault = context.read<VaultService>();
-        final auth = Provider.of<AuthSessionManager?>(context, listen: false);
-        final apiClient = Provider.of<AegisApiClient?>(context, listen: false);
-        final String textInput = _customInputController.text.trim();
+    const conditionOptions = [
+      'Heart and vascular conditions',
+      'Stroke',
+      'Diabetes mellitus',
+      'Oncological / cancer conditions',
+      'Neurological conditions',
+      'Mental health conditions',
+      'Genetic / hereditary conditions',
+      'Kidney conditions',
+      'Blood clotting disorders',
+      'Other conditions',
+    ];
 
-        // 1. Form the final medication string
-        String result = _multiSelect.join(', ');
-        if (textInput.isNotEmpty) {
-          result += (result.isEmpty ? "" : ", ") + textInput;
+    bool isRelativeComplete(String rel) {
+      final conds = _familyRelativeConditions[rel];
+      if (conds == null || conds.isEmpty) return false;
+      if (rel == 'Other blood relatives' && _familyOtherRelController.text.trim().isEmpty) {
+        return false;
+      }
+      return true;
+    }
+
+    String buildRelativeSummary(String rel) {
+      final conds = conditionOptions
+          .where((c) => _familyRelativeConditions[rel]?.contains(c) ?? false)
+          .toList();
+      final condText = conds.join(', ');
+      final extra = _getMapController(_familyDetailsControllers, rel).text.trim();
+      final relSpec = rel == 'Other blood relatives' ? _familyOtherRelController.text.trim() : '';
+      final prefix = relSpec.isNotEmpty ? '$relSpec: ' : '';
+      if (extra.isNotEmpty) {
+        return '$prefix$condText • $extra';
+      }
+      return '$prefix$condText';
+    }
+
+    return _wrapper(children: [
+      _buildTitle("Family Archive 🌳"),
+      _buildSubtitle("Do any of your blood relatives have medical conditions you know about?"),
+
+      ...statusOptions.map((st) {
+        final isSel = _familyHistoryStatus == st;
+        return _buildSelectableOption(st, isSel, () {
+          setState(() {
+            _familyHistoryStatus = st;
+            _currentError = null;
+            if (st != 'Yes') {
+              _activeFamilyRelative = null;
+            }
+          });
+        });
+      }),
+
+      if (_familyHistoryStatus == 'Yes') ...[
+        const SizedBox(height: 16),
+        const Align(
+          alignment: Alignment.centerLeft,
+          child: Text(
+            "Select affected blood relatives and add known conditions:",
+            style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 15),
+          ),
+        ),
+        const SizedBox(height: 10),
+
+        ...relativeOptions.map((rel) {
+          final isSel = _familyRelatives.contains(rel);
+          final isActive = _activeFamilyRelative == rel;
+          final isComplete = isRelativeComplete(rel);
+          final detailsCtrl = _getMapController(_familyDetailsControllers, rel);
+          final chosenConds = _familyRelativeConditions[rel] ?? <String>{};
+
+          return Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              _buildMatryoshkaCardHeader(
+                checkboxKey: ValueKey('fh_checkbox_$rel'),
+                label: rel,
+                isSelected: isSel,
+                onToggleCheckbox: () {
+                  setState(() {
+                    _currentError = null;
+                    if (isSel) {
+                      _familyRelatives.remove(rel);
+                      _familyRelativeConditions.remove(rel);
+                      detailsCtrl.clear();
+                      if (rel == 'Other blood relatives') {
+                        _familyOtherRelController.clear();
+                      }
+                      if (_activeFamilyRelative == rel) {
+                        _activeFamilyRelative = null;
+                      }
+                    } else {
+                      _familyRelatives.add(rel);
+                      _familyRelativeConditions.putIfAbsent(rel, () => <String>{});
+                      _activeFamilyRelative = rel;
+                    }
+                  });
+                },
+                onTapTitle: () {
+                  setState(() {
+                    _currentError = null;
+                    if (!isSel) {
+                      _familyRelatives.add(rel);
+                      _familyRelativeConditions.putIfAbsent(rel, () => <String>{});
+                      _activeFamilyRelative = rel;
+                    } else {
+                      _activeFamilyRelative = isActive ? null : rel;
+                    }
+                  });
+                },
+              ),
+
+              if (isSel && isActive) ...[
+                Container(
+                  margin: const EdgeInsets.only(left: 8, right: 8, bottom: 16),
+                  padding: const EdgeInsets.all(12),
+                  decoration: BoxDecoration(
+                    color: Colors.white.withValues(alpha: 0.04),
+                    borderRadius: BorderRadius.circular(12),
+                    border: Border.all(color: Colors.orangeAccent.withValues(alpha: 0.5)),
+                  ),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        "Family history for: $rel",
+                        style: const TextStyle(color: Colors.orangeAccent, fontWeight: FontWeight.bold, fontSize: 14),
+                      ),
+                      if (rel == 'Other blood relatives') ...[
+                        const SizedBox(height: 10),
+                        TextField(
+                          controller: _familyOtherRelController,
+                          style: const TextStyle(color: Colors.white),
+                          decoration: const InputDecoration(
+                            labelText: "Specify relationship",
+                            labelStyle: TextStyle(color: Colors.white70, fontSize: 13),
+                            hintText: "e.g. Aunt, uncle, cousin",
+                            hintStyle: TextStyle(color: Colors.white24, fontSize: 12),
+                            enabledBorder: UnderlineInputBorder(borderSide: BorderSide(color: Colors.white24)),
+                          ),
+                        ),
+                      ],
+                      const SizedBox(height: 12),
+                      const Text(
+                        "Known medical conditions (select all that apply):",
+                        style: TextStyle(color: Colors.white70, fontSize: 13, fontWeight: FontWeight.w600),
+                      ),
+                      const SizedBox(height: 8),
+                      Wrap(
+                        spacing: 6,
+                        runSpacing: 6,
+                        children: conditionOptions.map((cond) {
+                          final isCSel = chosenConds.contains(cond);
+                          return FilterChip(
+                            label: Text(
+                              cond,
+                              style: TextStyle(color: isCSel ? Colors.black : Colors.white, fontSize: 12),
+                            ),
+                            selected: isCSel,
+                            selectedColor: Colors.orangeAccent,
+                            backgroundColor: Colors.white12,
+                            checkmarkColor: Colors.black,
+                            onSelected: (_) {
+                              setState(() {
+                                _currentError = null;
+                                final setForRel = _familyRelativeConditions.putIfAbsent(rel, () => <String>{});
+                                if (isCSel) {
+                                  setForRel.remove(cond);
+                                } else {
+                                  setForRel.add(cond);
+                                }
+                              });
+                            },
+                          );
+                        }).toList(),
+                      ),
+                      const SizedBox(height: 12),
+                      TextField(
+                        controller: detailsCtrl,
+                        style: const TextStyle(color: Colors.white),
+                        maxLines: null,
+                        decoration: const InputDecoration(
+                          labelText: "Additional details (optional)",
+                          labelStyle: TextStyle(color: Colors.white70, fontSize: 13),
+                          hintText: "e.g. Type 2 diabetes, hypertension, colon cancer, other details",
+                          hintStyle: TextStyle(color: Colors.white24, fontSize: 12),
+                          enabledBorder: UnderlineInputBorder(borderSide: BorderSide(color: Colors.white24)),
+                        ),
+                      ),
+                      const SizedBox(height: 12),
+                      Align(
+                        alignment: Alignment.centerRight,
+                        child: ElevatedButton(
+                          style: ElevatedButton.styleFrom(backgroundColor: Colors.orangeAccent),
+                          onPressed: () {
+                            if (rel == 'Other blood relatives' &&
+                                _familyOtherRelController.text.trim().isEmpty) {
+                              setState(() {
+                                _currentError = "Please specify the relationship for «Other blood relatives»";
+                              });
+                              return;
+                            }
+                            final conds = _familyRelativeConditions[rel];
+                            if (conds == null || conds.isEmpty) {
+                              setState(() {
+                                _currentError = "Please select at least one condition for «$rel»";
+                              });
+                              return;
+                            }
+                            setState(() {
+                              _currentError = null;
+                              _activeFamilyRelative = null;
+                            });
+                          },
+                          child: const Text(
+                            "Save and collapse",
+                            style: TextStyle(color: Colors.black, fontWeight: FontWeight.bold),
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ] else if (isSel && !isActive && isComplete) ...[
+                Padding(
+                  padding: const EdgeInsets.only(left: 12, bottom: 10),
+                  child: InkWell(
+                    onTap: () => setState(() => _activeFamilyRelative = rel),
+                    child: Row(
+                      children: [
+                        Expanded(
+                          child: Text(
+                            buildRelativeSummary(rel),
+                            style: const TextStyle(color: Colors.orangeAccent, fontSize: 12.5),
+                          ),
+                        ),
+                        const Text("[Edit ✏️]", style: TextStyle(color: Colors.greenAccent, fontSize: 12)),
+                      ],
+                    ),
+                  ),
+                ),
+              ] else if (isSel && !isActive && !isComplete) ...[
+                Padding(
+                  padding: const EdgeInsets.only(left: 12, bottom: 10),
+                  child: InkWell(
+                    onTap: () => setState(() => _activeFamilyRelative = rel),
+                    child: const Text(
+                      "⚠️ Incomplete details: tap to complete",
+                      style: TextStyle(color: Colors.amberAccent, fontSize: 12),
+                    ),
+                  ),
+                ),
+              ],
+            ],
+          );
+        }),
+      ],
+
+      const SizedBox(height: 20),
+
+      _buildSelectableOption("Next ➡️", false, () {
+        if (_familyHistoryStatus == null) {
+          setState(() => _currentError = "Please select one of the options above");
+          return;
         }
 
-        // 2. Local save to Vault (instant)
-        vault.saveAnamnesis(
-          'medications',
-          result,
-          userText: textInput,
-        );
-
-        // 3. Ensure local persistence completes
-        await vault.flushPendingWrites();
-        if (!mounted) return;
-
-        // 4. Check device authentication
-        if (auth == null || !auth.isAuthenticated) {
-          setState(() => _currentError = "Device pairing required to synchronize anamnesis with Aegis Server.");
-          await AegisDevicePairingModal.show(context);
-          if (!mounted) return;
-
-          if (auth == null || !auth.isAuthenticated) {
-            setState(() => _currentError = "Draft saved securely. Pair device to synchronize with Aegis Server.");
+        if (_familyHistoryStatus == 'Yes') {
+          if (_familyRelatives.isEmpty) {
+            setState(() => _currentError = "Please select at least one blood relative or change your answer above");
             return;
           }
 
-          // Newly paired: associate guest draft to active patient
-          await vault.associateGuestDraftToActivePatient();
-          if (!mounted) return;
+          final orderedRelatives = relativeOptions.where((r) => _familyRelatives.contains(r)).toList();
+          final detailsPayload = <String, Map<String, dynamic>>{};
+          final summaryParts = <String>[];
 
-          setState(() => _currentError = "Device paired! Tap 'Finish 🚀' to synchronize anamnesis with Aegis Server.");
-          return;
+          for (final rel in orderedRelatives) {
+            if (rel == 'Other blood relatives' &&
+                _familyOtherRelController.text.trim().isEmpty) {
+              setState(() {
+                _activeFamilyRelative = rel;
+                _currentError = "Please specify the relationship for «Other blood relatives»";
+              });
+              return;
+            }
+            final chosen = _familyRelativeConditions[rel] ?? <String>{};
+            final orderedConds = conditionOptions.where((c) => chosen.contains(c)).toList();
+            if (orderedConds.isEmpty) {
+              setState(() {
+                _activeFamilyRelative = rel;
+                _currentError = "Please select at least one condition for «$rel»";
+              });
+              return;
+            }
+
+            final relMap = <String, dynamic>{
+              'conditions': orderedConds,
+            };
+            if (rel == 'Other blood relatives') {
+              relMap['relationship_detail'] = _familyOtherRelController.text.trim();
+            }
+            final notesText = _getMapController(_familyDetailsControllers, rel).text.trim();
+            if (notesText.isNotEmpty) {
+              relMap['details'] = notesText;
+            }
+            detailsPayload[rel] = relMap;
+
+            final relLabel = (rel == 'Other blood relatives' && relMap['relationship_detail'] != null)
+                ? "$rel (${relMap['relationship_detail']})"
+                : rel;
+            summaryParts.add("$relLabel: ${orderedConds.join(', ')}");
+          }
+
+          setState(() => _currentError = null);
+          vault.saveAnamnesis('family_history_status', 'Yes');
+          vault.saveAnamnesis('family_history_relatives', orderedRelatives);
+          vault.saveAnamnesis('family_history_details', detailsPayload);
+          vault.saveAnamnesis('heredity_risks', _clampSummary(summaryParts.join('; ')));
+          vault.removeAnamnesisKeys(['user_text_heredity_risks', 'text_heredity_risks']);
+        } else {
+          setState(() => _currentError = null);
+          vault.saveAnamnesis('family_history_status', _familyHistoryStatus);
+          vault.saveAnamnesis('heredity_risks', _familyHistoryStatus!);
+          vault.removeAnamnesisKeys([
+            'family_history_relatives',
+            'family_history_details',
+            'user_text_heredity_risks',
+            'text_heredity_risks',
+          ]);
         }
 
-        // 5. Server synchronization via AegisApiClient
-        if (apiClient == null) {
-          setState(() => _currentError = "API client unavailable. Draft saved securely.");
-          return;
-        }
+        _nextPage();
+      }),
+    ]);
+  }
 
-        setState(() {
-          _currentError = "Synchronizing with Aegis Server (M1)...";
-        });
+  void _archiveMedicationDraft(String cat) {
+    final nameText = _getMapController(_medicationNameControllers, cat).text;
+    final courseText = _getMapController(_medicationCourseControllers, cat).text;
+    if (nameText.trim().isNotEmpty || courseText.trim().isNotEmpty) {
+      _medicationDraftArchive[cat] = {
+        'names': nameText,
+        'course': courseText,
+      };
+    } else {
+      _medicationDraftArchive.remove(cat);
+    }
+  }
 
-        final syncResult = await vault.syncAnamnesisToServer(
-          apiClient: apiClient,
-          authSessionManager: auth,
-        );
+  void _uncheckMedicationCategory(String cat) {
+    _archiveMedicationDraft(cat);
+    _medicationCategories.remove(cat);
+    if (_activeMedicationCategory == cat) {
+      _activeMedicationCategory = null;
+    }
+  }
 
-        if (!mounted) return;
+  void _checkAndOpenMedicationCategory(String cat) {
+    final nameCtrl = _getMapController(_medicationNameControllers, cat);
+    final courseCtrl = _getMapController(_medicationCourseControllers, cat);
+    final archived = _medicationDraftArchive[cat];
+    if (archived != null) {
+      if (nameCtrl.text.isEmpty && (archived['names'] ?? '').isNotEmpty) {
+        nameCtrl.text = archived['names']!;
+      }
+      if (courseCtrl.text.isEmpty && (archived['course'] ?? '').isNotEmpty) {
+        courseCtrl.text = archived['course']!;
+      }
+    }
+    _medicationCategories.add(cat);
+    _activeMedicationCategory = cat;
+  }
 
-        if (syncResult.isSuccess) {
+  void _permanentlyClearMedicationCategory(String cat) {
+    _medicationDraftArchive.remove(cat);
+    _medicationNameControllers[cat]?.clear();
+    _medicationCourseControllers[cat]?.clear();
+  }
+
+  Widget _stepMeds() {
+    const statusOptions = [
+      'Yes',
+      'No',
+      'Not sure',
+      'Prefer not to answer',
+    ];
+
+    const categoryOptions = [
+      'Prescription medications',
+      'Over-the-counter medications',
+      'Vitamins',
+      'Supplements and herbal products',
+    ];
+
+    const nameHints = <String, String>{
+      'Prescription medications': 'e.g. Amoxicillin, tablets; physician-prescribed injections',
+      'Over-the-counter medications': 'e.g. Ibuprofen, tablets; nasal spray',
+      'Vitamins': 'e.g. Vitamin B6, intramuscular injections; Vitamin D, tablets',
+      'Supplements and herbal products': 'e.g. Ashwagandha, herbal extract; other dietary supplements',
+    };
+
+    const courseHints = <String, String>{
+      'Prescription medications': 'e.g. I have been taking a prescribed antibiotic for a week, started November 10',
+      'Over-the-counter medications': 'e.g. I only take a painkiller for headaches',
+      'Vitamins': 'e.g. I take a 1-month course followed by a 2-week break',
+      'Supplements and herbal products': 'e.g. I take a 1-month course followed by a 2-week break',
+    };
+
+    bool hasArchivedDraft(String cat) {
+      final archived = _medicationDraftArchive[cat];
+      if (archived != null &&
+          ((archived['names'] ?? '').trim().isNotEmpty ||
+              (archived['course'] ?? '').trim().isNotEmpty)) {
+        return true;
+      }
+      final nText = _medicationNameControllers[cat]?.text.trim() ?? '';
+      final cText = _medicationCourseControllers[cat]?.text.trim() ?? '';
+      return nText.isNotEmpty || cText.isNotEmpty;
+    }
+
+    String buildCategorySummary(String cat) {
+      final names = _getMapController(_medicationNameControllers, cat).text.trim();
+      final course = _getMapController(_medicationCourseControllers, cat).text.trim();
+      if (course.isNotEmpty) {
+        return '$names • $course';
+      }
+      return names;
+    }
+
+    return _wrapper(children: [
+      _buildTitle("Medications and Supplements 💊"),
+      _buildSubtitle("Do you currently take any medications, vitamins, or supplements?"),
+
+      ...statusOptions.map((st) {
+        final isSel = _medicationsStatus == st;
+        return _buildSelectableOption(st, isSel, () {
           setState(() {
+            if (_medicationsStatus == 'Yes' && st != 'Yes') {
+              for (final cat in _medicationCategories.toList()) {
+                _archiveMedicationDraft(cat);
+              }
+              _medicationCategories.clear();
+              _activeMedicationCategory = null;
+            }
+            _medicationsStatus = st;
             _currentError = null;
           });
-          _nextPage();
-        } else {
-          setState(() {
-            if (syncResult.status == AnamnesisSyncStatus.offline) {
-              _currentError = "Connection timeout or network failure. Draft saved securely. Tap 'Finish 🚀' to retry.";
-            } else if (syncResult.status == AnamnesisSyncStatus.insufficientScopes) {
-              _currentError = "Access denied: session lacks 'cascade:intake' scope. Please re-pair device.";
-            } else if (syncResult.status == AnamnesisSyncStatus.unauthorized) {
-              _currentError = "Session expired or device not paired. Tap 'Finish 🚀' to re-authenticate.";
-            } else {
-              _currentError = syncResult.errorMessage ?? "Synchronization failed. Draft saved securely.";
-            }
-          });
-        }
-      } catch (e) {
-        if (!mounted) return;
-        setState(() {
-          _currentError = "Error: $e. Draft saved securely. Tap 'Finish 🚀' to retry.";
         });
-      } finally {
-        if (mounted) {
-          setState(() {
-            _isSubmitting = false;
-          });
+      }),
+
+      if (_medicationsStatus == 'Yes') ...[
+        const SizedBox(height: 16),
+        const Align(
+          alignment: Alignment.centerLeft,
+          child: Text(
+            "Select all categories you currently take and fill in details:",
+            style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 15),
+          ),
+        ),
+        const SizedBox(height: 10),
+
+        ...categoryOptions.map((cat) {
+          final isSel = _medicationCategories.contains(cat);
+          final isActive = _activeMedicationCategory == cat;
+          final nameCtrl = _getMapController(_medicationNameControllers, cat);
+          final courseCtrl = _getMapController(_medicationCourseControllers, cat);
+          final hasNames = nameCtrl.text.trim().isNotEmpty;
+
+          return Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              _buildMatryoshkaCardHeader(
+                checkboxKey: ValueKey('med_checkbox_$cat'),
+                label: cat,
+                isSelected: isSel,
+                onToggleCheckbox: () {
+                  setState(() {
+                    _currentError = null;
+                    if (isSel) {
+                      _uncheckMedicationCategory(cat);
+                    } else {
+                      _checkAndOpenMedicationCategory(cat);
+                    }
+                  });
+                },
+                onTapTitle: () {
+                  setState(() {
+                    _currentError = null;
+                    if (!isSel) {
+                      _checkAndOpenMedicationCategory(cat);
+                    } else {
+                      _activeMedicationCategory = isActive ? null : cat;
+                    }
+                  });
+                },
+              ),
+
+              if (!isSel && hasArchivedDraft(cat)) ...[
+                Padding(
+                  padding: const EdgeInsets.only(left: 12, bottom: 10),
+                  child: Row(
+                    children: [
+                      const Expanded(
+                        child: Text(
+                          "Draft preserved — re-select category to restore",
+                          style: TextStyle(color: Colors.amberAccent, fontSize: 12),
+                        ),
+                      ),
+                      TextButton(
+                        onPressed: () {
+                          setState(() {
+                            _currentError = null;
+                            _permanentlyClearMedicationCategory(cat);
+                          });
+                        },
+                        child: const Text("Discard draft", style: TextStyle(color: Colors.redAccent, fontSize: 12)),
+                      ),
+                    ],
+                  ),
+                ),
+              ],
+
+              if (isSel && isActive) ...[
+                Container(
+                  margin: const EdgeInsets.only(left: 8, right: 8, bottom: 16),
+                  padding: const EdgeInsets.all(12),
+                  decoration: BoxDecoration(
+                    color: Colors.white.withValues(alpha: 0.04),
+                    borderRadius: BorderRadius.circular(12),
+                    border: Border.all(color: Colors.orangeAccent.withValues(alpha: 0.5)),
+                  ),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        "Details for: $cat",
+                        style: const TextStyle(color: Colors.orangeAccent, fontWeight: FontWeight.bold, fontSize: 14),
+                      ),
+                      const SizedBox(height: 10),
+                      TextField(
+                        controller: nameCtrl,
+                        style: const TextStyle(color: Colors.white),
+                        maxLines: null,
+                        keyboardType: TextInputType.multiline,
+                        onChanged: (_) => _archiveMedicationDraft(cat),
+                        decoration: InputDecoration(
+                          labelText: "Medication or supplement names & form / route",
+                          labelStyle: const TextStyle(color: Colors.white70, fontSize: 13),
+                          hintText: nameHints[cat],
+                          hintStyle: const TextStyle(color: Colors.white24, fontSize: 12),
+                          helperText: "You can list multiple items separated by commas or new lines",
+                          helperStyle: const TextStyle(color: Colors.white38, fontSize: 11),
+                          enabledBorder: const UnderlineInputBorder(borderSide: BorderSide(color: Colors.white24)),
+                        ),
+                      ),
+                      const SizedBox(height: 12),
+                      TextField(
+                        controller: courseCtrl,
+                        style: const TextStyle(color: Colors.white),
+                        maxLines: null,
+                        keyboardType: TextInputType.multiline,
+                        onChanged: (_) => _archiveMedicationDraft(cat),
+                        decoration: InputDecoration(
+                          labelText: "How long and how have you been taking them? (optional)",
+                          labelStyle: const TextStyle(color: Colors.white70, fontSize: 13),
+                          hintText: courseHints[cat],
+                          hintStyle: const TextStyle(color: Colors.white24, fontSize: 12),
+                          enabledBorder: const UnderlineInputBorder(borderSide: BorderSide(color: Colors.white24)),
+                        ),
+                      ),
+                      const SizedBox(height: 12),
+                      Row(
+                        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                        children: [
+                          TextButton(
+                            onPressed: () {
+                              setState(() {
+                                _currentError = null;
+                                _permanentlyClearMedicationCategory(cat);
+                              });
+                            },
+                            child: const Text("Clear text", style: TextStyle(color: Colors.redAccent, fontSize: 12.5)),
+                          ),
+                          ElevatedButton(
+                            style: ElevatedButton.styleFrom(backgroundColor: Colors.orangeAccent),
+                            onPressed: () {
+                              if (nameCtrl.text.trim().isEmpty) {
+                                setState(() {
+                                  _currentError = "Please enter at least one medication or supplement name for «$cat»";
+                                });
+                                return;
+                              }
+                              _archiveMedicationDraft(cat);
+                              setState(() {
+                                _currentError = null;
+                                _activeMedicationCategory = null;
+                              });
+                            },
+                            child: const Text(
+                              "Save and collapse",
+                              style: TextStyle(color: Colors.black, fontWeight: FontWeight.bold),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ],
+                  ),
+                ),
+              ] else if (isSel && !isActive && hasNames) ...[
+                Padding(
+                  padding: const EdgeInsets.only(left: 12, bottom: 10),
+                  child: InkWell(
+                    onTap: () => setState(() => _activeMedicationCategory = cat),
+                    child: Row(
+                      children: [
+                        Expanded(
+                          child: Text(
+                            buildCategorySummary(cat),
+                            style: const TextStyle(color: Colors.orangeAccent, fontSize: 12.5),
+                          ),
+                        ),
+                        const Text("[Edit ✏️]", style: TextStyle(color: Colors.greenAccent, fontSize: 12)),
+                      ],
+                    ),
+                  ),
+                ),
+              ] else if (isSel && !isActive && !hasNames) ...[
+                Padding(
+                  padding: const EdgeInsets.only(left: 12, bottom: 10),
+                  child: InkWell(
+                    onTap: () => setState(() => _activeMedicationCategory = cat),
+                    child: const Text(
+                      "⚠️ Incomplete details: tap to enter medication name",
+                      style: TextStyle(color: Colors.amberAccent, fontSize: 12),
+                    ),
+                  ),
+                ),
+              ],
+            ],
+          );
+        }),
+      ],
+
+      const SizedBox(height: 20),
+
+      _buildSelectableOption("Finish 🚀", false, () async {
+        if (_isSubmitting) return;
+
+        final vault = context.read<VaultService>();
+
+        if (_medicationsStatus == null) {
+          setState(() => _currentError = "Please select one of the options above");
+          return;
         }
-      }
-    }),
-  ]);
+
+        if (_medicationsStatus == 'Yes') {
+          if (_medicationCategories.isEmpty) {
+            setState(() => _currentError = "Please select at least one category or change your answer above");
+            return;
+          }
+
+          final orderedCats = categoryOptions.where((c) => _medicationCategories.contains(c)).toList();
+          final detailsPayload = <String, Map<String, String>>{};
+          final summaryParts = <String>[];
+
+          for (final cat in orderedCats) {
+            final names = _getMapController(_medicationNameControllers, cat).text.trim();
+            if (names.isEmpty) {
+              setState(() {
+                _activeMedicationCategory = cat;
+                _currentError = "Please enter at least one medication or supplement name for «$cat»";
+              });
+              return;
+            }
+            final course = _getMapController(_medicationCourseControllers, cat).text.trim();
+            final catMap = <String, String>{'names': names};
+            if (course.isNotEmpty) {
+              catMap['course'] = course;
+            }
+            detailsPayload[cat] = catMap;
+            summaryParts.add("$cat ($names)");
+          }
+
+          vault.saveAnamnesis('medications_status', 'Yes');
+          vault.saveAnamnesis('medication_categories', orderedCats);
+          vault.saveAnamnesis('medication_details', detailsPayload);
+          vault.saveAnamnesis('medications', _clampSummary(summaryParts.join('; ')));
+          vault.removeAnamnesisKeys(['user_text_medications', 'text_medications']);
+        } else {
+          vault.saveAnamnesis('medications_status', _medicationsStatus);
+          vault.saveAnamnesis('medications', _medicationsStatus!);
+          vault.removeAnamnesisKeys([
+            'medication_categories',
+            'medication_details',
+            'user_text_medications',
+            'text_medications',
+          ]);
+        }
+
+        setState(() {
+          _currentError = null;
+          _isSubmitting = true;
+        });
+
+        try {
+          final auth = Provider.of<AuthSessionManager?>(context, listen: false);
+          final apiClient = Provider.of<AegisApiClient?>(context, listen: false);
+
+          // 3. Ensure local persistence completes
+          await vault.flushPendingWrites();
+          if (!mounted) return;
+
+          // 4. Check device authentication
+          if (auth == null || !auth.isAuthenticated) {
+            setState(() => _currentError = "Device pairing required to synchronize anamnesis with Aegis Server.");
+            await AegisDevicePairingModal.show(context);
+            if (!mounted) return;
+
+            if (auth == null || !auth.isAuthenticated) {
+              setState(() => _currentError = "Draft saved securely. Pair device to synchronize with Aegis Server.");
+              return;
+            }
+
+            // Newly paired: associate guest draft to active patient
+            await vault.associateGuestDraftToActivePatient();
+            if (!mounted) return;
+
+            setState(() => _currentError = "Device paired! Tap 'Finish 🚀' to synchronize anamnesis with Aegis Server.");
+            return;
+          }
+
+          // 5. Server synchronization via AegisApiClient
+          if (apiClient == null) {
+            setState(() => _currentError = "API client unavailable. Draft saved securely.");
+            return;
+          }
+
+          setState(() {
+            _currentError = "Synchronizing with Aegis Server (M1)...";
+          });
+
+          final syncResult = await vault.syncAnamnesisToServer(
+            apiClient: apiClient,
+            authSessionManager: auth,
+          );
+
+          if (!mounted) return;
+
+          if (syncResult.isSuccess) {
+            setState(() {
+              _currentError = null;
+            });
+            _nextPage();
+          } else {
+            setState(() {
+              if (syncResult.status == AnamnesisSyncStatus.offline) {
+                _currentError = "Connection timeout or network failure. Draft saved securely. Tap 'Finish 🚀' to retry.";
+              } else if (syncResult.status == AnamnesisSyncStatus.insufficientScopes) {
+                _currentError = "Access denied: session lacks 'cascade:intake' scope. Please re-pair device.";
+              } else if (syncResult.status == AnamnesisSyncStatus.unauthorized) {
+                _currentError = "Session expired or device not paired. Tap 'Finish 🚀' to re-authenticate.";
+              } else {
+                _currentError = syncResult.errorMessage ?? "Synchronization failed. Draft saved securely.";
+              }
+            });
+          }
+        } catch (e) {
+          if (!mounted) return;
+          setState(() {
+            _currentError = "Error: $e. Draft saved securely. Tap 'Finish 🚀' to retry.";
+          });
+        } finally {
+          if (mounted) {
+            setState(() {
+              _isSubmitting = false;
+            });
+          }
+        }
+      }),
+    ]);
+  }
 
   Widget _stepFinal() => _wrapper(children: [
     _buildTitle("Your Profile is Configured! 🚀"),
@@ -4467,6 +5225,8 @@ class _AnamnesisScreenState extends State<AnamnesisScreen> {
       _isAlcoholBranch = false;
       _activeChronicCategory = null;
       _activeRecentEvent = null;
+      _activeFamilyRelative = null;
+      _activeMedicationCategory = null;
     });
 
     _customInputController.clear();

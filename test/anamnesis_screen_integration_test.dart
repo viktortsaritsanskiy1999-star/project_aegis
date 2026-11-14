@@ -1208,6 +1208,11 @@ void main() {
       expect(find.text("Medications and Supplements 💊"), findsOneWidget);
       expect(find.text("Finish 🚀"), findsOneWidget);
 
+      // Select Card 16 status per Stage 5 contract before tapping Finish
+      await tester.ensureVisible(find.text("No"));
+      await tester.tap(find.text("No"));
+      await tester.pumpAndSettle();
+
       await tester.ensureVisible(find.text("Finish 🚀"));
       await tester.pumpAndSettle();
 

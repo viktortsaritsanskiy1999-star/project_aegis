@@ -134,6 +134,15 @@ class AnamnesisModelOutput(BaseModel):
     training_sandbox: AnamnesisTrainingSandbox
 
 
+class FamilyHistoryRelativeDetail(BaseModel):
+    """Structured Stage 5 family history details for one blood relative."""
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    conditions: List[str] = Field(..., min_length=1)
+    relationship_detail: Optional[str] = Field(default=None, max_length=256)
+    details: Optional[str] = Field(default=None, max_length=1024)
+
+
 class AnamnesisQuestionnaireAnswers(BaseModel):
     """
     Strict server-side validation schema for raw answers from the 17 Flutter anamnesis cards.
@@ -253,11 +262,17 @@ class AnamnesisQuestionnaireAnswers(BaseModel):
     infectious_tested_negative: Optional[List[str]] = Field(default=None)
     infectious_last_tested: Optional[str] = Field(default=None, max_length=256)
 
-    # Card 14: Heredity
+    # Card 15: Heredity & Family History (Stage 5)
     heredity_risks: str = Field(..., min_length=1, max_length=1024)
+    family_history_status: Optional[str] = Field(default=None, max_length=128)
+    family_history_relatives: Optional[List[str]] = Field(default=None)
+    family_history_details: Optional[Dict[str, FamilyHistoryRelativeDetail]] = Field(default=None)
 
-    # Card 15: Medications & Supplements
+    # Card 16: Medications, Vitamins & Supplements (Stage 5)
     medications: str = Field(..., min_length=1, max_length=1024)
+    medications_status: Optional[str] = Field(default=None, max_length=128)
+    medication_categories: Optional[List[str]] = Field(default=None)
+    medication_details: Optional[Dict[str, Dict[str, str]]] = Field(default=None)
 
     # Optional custom user text inputs from Flutter cards
     user_text_medications: Optional[str] = Field(default=None, max_length=1024)
@@ -679,6 +694,117 @@ class AnamnesisQuestionnaireAnswers(BaseModel):
         else:
             if self.infectious_diagnosed or self.infectious_tested_negative or self.infectious_last_tested:
                 raise ValueError("Поля инфекционного анамнеза не могут передаваться без указания infectious_history_status.")
+
+        # 15. Family history & heredity consistency (Stage 5)
+        allowed_fh_statuses = {
+            "Yes",
+            "No, as far as I know",
+            "I don't know my family history",
+            "Prefer not to answer",
+        }
+        allowed_fh_relatives = {
+            "Mother",
+            "Father",
+            "Brother",
+            "Sister",
+            "Maternal grandmother",
+            "Maternal grandfather",
+            "Paternal grandmother",
+            "Paternal grandfather",
+            "Children",
+            "Other blood relatives",
+        }
+        allowed_fh_conditions = {
+            "Heart and vascular conditions",
+            "Stroke",
+            "Diabetes mellitus",
+            "Oncological / cancer conditions",
+            "Neurological conditions",
+            "Mental health conditions",
+            "Genetic / hereditary conditions",
+            "Kidney conditions",
+            "Blood clotting disorders",
+            "Other conditions",
+        }
+        if self.family_history_status is not None:
+            if self.family_history_status not in allowed_fh_statuses:
+                raise ValueError(f"Недопустимый статус семейного анамнеза: '{self.family_history_status}'.")
+            if self.family_history_status == "Yes":
+                if not self.family_history_relatives or len(self.family_history_relatives) == 0:
+                    raise ValueError("При выборе 'Yes' в семейном анамнезе необходимо указать хотя бы одного родственника (family_history_relatives).")
+                if len(set(self.family_history_relatives)) != len(self.family_history_relatives):
+                    raise ValueError("Список родственников (family_history_relatives) не должен содержать дубликатов.")
+                for rel in self.family_history_relatives:
+                    if rel not in allowed_fh_relatives:
+                        raise ValueError(f"Недопустимый родственник в family_history_relatives: '{rel}'.")
+                fh_details = self.family_history_details or {}
+                for rel in self.family_history_relatives:
+                    rel_detail = fh_details.get(rel)
+                    if rel_detail is None:
+                        raise ValueError(f"Для родственника '{rel}' необходимо указать выбранные заболевания (family_history_details).")
+                    if len(rel_detail.conditions) == 0:
+                        raise ValueError(f"Для родственника '{rel}' необходимо выбрать хотя бы одно заболевание.")
+                    if len(set(rel_detail.conditions)) != len(rel_detail.conditions):
+                        raise ValueError(f"Список заболеваний для родственника '{rel}' содержит дубликаты.")
+                    for cond in rel_detail.conditions:
+                        if cond not in allowed_fh_conditions:
+                            raise ValueError(f"Недопустимое заболевание '{cond}' для родственника '{rel}'.")
+                    rel_spec = (rel_detail.relationship_detail or "").strip()
+                    if rel == "Other blood relatives":
+                        if not rel_spec:
+                            raise ValueError("Для категории 'Other blood relatives' необходимо уточнить степень родства (relationship_detail).")
+                    elif rel_spec:
+                        raise ValueError(f"Поле relationship_detail допустимо только для 'Other blood relatives', а не для '{rel}'.")
+                for detail_rel in fh_details:
+                    if detail_rel not in self.family_history_relatives:
+                        raise ValueError(f"Указаны детали для невыбранного родственника: '{detail_rel}'.")
+            else:
+                if self.family_history_relatives or self.family_history_details:
+                    raise ValueError(f"Для статуса семейного анамнеза '{self.family_history_status}' детали родственников не указываются.")
+        else:
+            if self.family_history_relatives or self.family_history_details:
+                raise ValueError("Поля семейного анамнеза не могут передаваться без указания family_history_status.")
+
+        # 16. Medications, vitamins & supplements consistency (Stage 5)
+        allowed_med_statuses = {"Yes", "No", "Not sure", "Prefer not to answer"}
+        allowed_med_categories = {
+            "Prescription medications",
+            "Over-the-counter medications",
+            "Vitamins",
+            "Supplements and herbal products",
+        }
+        allowed_med_detail_keys = {"names", "course"}
+        if self.medications_status is not None:
+            if self.medications_status not in allowed_med_statuses:
+                raise ValueError(f"Недопустимый статус приёма препаратов: '{self.medications_status}'.")
+            if self.medications_status == "Yes":
+                if not self.medication_categories or len(self.medication_categories) == 0:
+                    raise ValueError("При выборе 'Yes' для лекарств необходимо выбрать хотя бы одну категорию (medication_categories).")
+                if len(set(self.medication_categories)) != len(self.medication_categories):
+                    raise ValueError("Список категорий препаратов (medication_categories) не должен содержать дубликатов.")
+                for cat in self.medication_categories:
+                    if cat not in allowed_med_categories:
+                        raise ValueError(f"Недопустимая категория препаратов: '{cat}'.")
+                med_details = self.medication_details or {}
+                for cat in self.medication_categories:
+                    cat_data = med_details.get(cat)
+                    if not cat_data or not isinstance(cat_data, dict):
+                        raise ValueError(f"Для категории '{cat}' необходимо указать сведения о препаратах (medication_details).")
+                    unknown_keys = set(cat_data.keys()) - allowed_med_detail_keys
+                    if unknown_keys:
+                        raise ValueError(f"Для категории '{cat}' переданы недопустимые поля: {sorted(unknown_keys)}.")
+                    names = (cat_data.get("names") or "").strip()
+                    if not names:
+                        raise ValueError(f"Для категории '{cat}' необходимо указать хотя бы одно название препарата или добавки (names).")
+                for detail_cat in med_details:
+                    if detail_cat not in self.medication_categories:
+                        raise ValueError(f"Указаны детали для невыбранной категории препаратов: '{detail_cat}'.")
+            else:
+                if self.medication_categories or self.medication_details:
+                    raise ValueError(f"Для статуса приёма препаратов '{self.medications_status}' категории и детали не указываются.")
+        else:
+            if self.medication_categories or self.medication_details:
+                raise ValueError("Поля приёма препаратов не могут передаваться без указания medications_status.")
 
         return self
 

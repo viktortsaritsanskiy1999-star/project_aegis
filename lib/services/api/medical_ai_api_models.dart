@@ -107,6 +107,14 @@ class AnamnesisQuestionnaireAnswers {
   final List<String>? infectiousTestedNegative;
   final String? infectiousLastTested;
 
+  // Stage 5 new fields
+  final String? familyHistoryStatus;
+  final List<String>? familyHistoryRelatives;
+  final Map<String, Map<String, dynamic>>? familyHistoryDetails;
+  final String? medicationsStatus;
+  final List<String>? medicationCategories;
+  final Map<String, Map<String, String>>? medicationDetails;
+
   const AnamnesisQuestionnaireAnswers({
     required this.ageConfirmation,
     required this.gender,
@@ -200,6 +208,12 @@ class AnamnesisQuestionnaireAnswers {
     this.infectiousDiagnosed,
     this.infectiousTestedNegative,
     this.infectiousLastTested,
+    this.familyHistoryStatus,
+    this.familyHistoryRelatives,
+    this.familyHistoryDetails,
+    this.medicationsStatus,
+    this.medicationCategories,
+    this.medicationDetails,
   });
 
   factory AnamnesisQuestionnaireAnswers.fromMap(Map<String, dynamic> map) {
@@ -311,6 +325,30 @@ class AnamnesisQuestionnaireAnswers {
       infectiousDiagnosed: (map['infectious_diagnosed'] as List<dynamic>?)?.map((e) => e.toString()).toList(),
       infectiousTestedNegative: (map['infectious_tested_negative'] as List<dynamic>?)?.map((e) => e.toString()).toList(),
       infectiousLastTested: map['infectious_last_tested'] as String?,
+      familyHistoryStatus: map['family_history_status'] as String?,
+      familyHistoryRelatives: (map['family_history_relatives'] as List<dynamic>?)?.map((e) => e.toString()).toList(),
+      familyHistoryDetails: (map['family_history_details'] as Map<dynamic, dynamic>?)?.map((k, v) {
+        final rawInner = v as Map<dynamic, dynamic>;
+        final normalized = <String, dynamic>{};
+        if (rawInner['conditions'] is List) {
+          normalized['conditions'] = (rawInner['conditions'] as List<dynamic>).map((e) => e.toString()).toList();
+        }
+        if (rawInner['relationship_detail'] != null) {
+          normalized['relationship_detail'] = rawInner['relationship_detail'].toString();
+        }
+        if (rawInner['details'] != null) {
+          normalized['details'] = rawInner['details'].toString();
+        }
+        return MapEntry(k.toString(), normalized);
+      }),
+      medicationsStatus: map['medications_status'] as String?,
+      medicationCategories: (map['medication_categories'] as List<dynamic>?)?.map((e) => e.toString()).toList(),
+      medicationDetails: (map['medication_details'] as Map<dynamic, dynamic>?)?.map(
+        (k, v) => MapEntry(
+          k.toString(),
+          (v as Map<dynamic, dynamic>).map((ik, iv) => MapEntry(ik.toString(), iv.toString())),
+        ),
+      ),
     );
   }
 
@@ -409,6 +447,12 @@ class AnamnesisQuestionnaireAnswers {
     if (infectiousDiagnosed != null) map['infectious_diagnosed'] = infectiousDiagnosed;
     if (infectiousTestedNegative != null) map['infectious_tested_negative'] = infectiousTestedNegative;
     if (infectiousLastTested != null) map['infectious_last_tested'] = infectiousLastTested;
+    if (familyHistoryStatus != null) map['family_history_status'] = familyHistoryStatus;
+    if (familyHistoryRelatives != null) map['family_history_relatives'] = familyHistoryRelatives;
+    if (familyHistoryDetails != null) map['family_history_details'] = familyHistoryDetails;
+    if (medicationsStatus != null) map['medications_status'] = medicationsStatus;
+    if (medicationCategories != null) map['medication_categories'] = medicationCategories;
+    if (medicationDetails != null) map['medication_details'] = medicationDetails;
     return map;
   }
 }

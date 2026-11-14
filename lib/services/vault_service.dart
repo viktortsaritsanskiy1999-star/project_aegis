@@ -1314,6 +1314,47 @@ class VaultService extends ChangeNotifier {
       infectiousTestedNegative = (global['infectious_tested_negative'] as List).map((e) => e.toString()).toList();
     }
 
+    List<String>? familyHistoryRelatives;
+    if (global['family_history_relatives'] is List) {
+      familyHistoryRelatives = (global['family_history_relatives'] as List).map((e) => e.toString()).toList();
+    }
+
+    Map<String, Map<String, dynamic>>? familyHistoryDetails;
+    if (global['family_history_details'] is Map) {
+      familyHistoryDetails = (global['family_history_details'] as Map).map((k, v) {
+        final normalized = <String, dynamic>{};
+        if (v is Map) {
+          if (v['conditions'] is List) {
+            normalized['conditions'] = (v['conditions'] as List).map((e) => e.toString()).toList();
+          }
+          if (v['relationship_detail'] != null) {
+            normalized['relationship_detail'] = v['relationship_detail'].toString();
+          }
+          if (v['details'] != null) {
+            normalized['details'] = v['details'].toString();
+          }
+        }
+        return MapEntry(k.toString(), normalized);
+      });
+    }
+
+    List<String>? medicationCategories;
+    if (global['medication_categories'] is List) {
+      medicationCategories = (global['medication_categories'] as List).map((e) => e.toString()).toList();
+    }
+
+    Map<String, Map<String, String>>? medicationDetails;
+    if (global['medication_details'] is Map) {
+      medicationDetails = (global['medication_details'] as Map).map(
+        (k, v) => MapEntry(
+          k.toString(),
+          (v is Map)
+              ? v.map((ik, iv) => MapEntry(ik.toString(), iv.toString()))
+              : <String, String>{},
+        ),
+      );
+    }
+
     return AnamnesisQuestionnaireAnswers(
       ageConfirmation: ageConf,
       gender: gender,
@@ -1339,8 +1380,8 @@ class VaultService extends ChangeNotifier {
       criticalInfections: criticalInfections,
       heredityRisks: heredityRisks,
       medications: medications,
-      userTextMedications: global['text_medications']?.toString().trim(),
-      userTextHeredityRisks: global['text_heredity_risks']?.toString().trim(),
+      userTextMedications: global['user_text_medications']?.toString().trim() ?? global['text_medications']?.toString().trim(),
+      userTextHeredityRisks: global['user_text_heredity_risks']?.toString().trim() ?? global['text_heredity_risks']?.toString().trim(),
       userTextChronicDiseases: global['user_text_chronic_diseases']?.toString().trim() ?? global['text_chronic_diseases']?.toString().trim(),
       userTextRecentIllness: global['user_text_recent_illness']?.toString().trim() ?? global['text_recent_illness']?.toString().trim(),
       userTextCriticalInfections: global['user_text_critical_infections']?.toString().trim() ?? global['text_critical_infections']?.toString().trim(),
@@ -1407,6 +1448,12 @@ class VaultService extends ChangeNotifier {
       infectiousDiagnosed: infectiousDiagnosed,
       infectiousTestedNegative: infectiousTestedNegative,
       infectiousLastTested: global['infectious_last_tested']?.toString().trim(),
+      familyHistoryStatus: global['family_history_status']?.toString().trim(),
+      familyHistoryRelatives: familyHistoryRelatives,
+      familyHistoryDetails: familyHistoryDetails,
+      medicationsStatus: global['medications_status']?.toString().trim(),
+      medicationCategories: medicationCategories,
+      medicationDetails: medicationDetails,
     );
   }
 
