@@ -64,7 +64,9 @@ void main() {
       await tester.pumpAndSettle();
 
       // Card 0 -> Card 1
-      await tester.tap(find.text("I'm 18+, let's go! 🚀"));
+      await tester.tap(find.text('SELECT ALL'));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('INITIALIZE PROTOCOL'));
       await tester.pumpAndSettle();
 
       // Card 1: Male, 34

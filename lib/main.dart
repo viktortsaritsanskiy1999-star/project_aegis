@@ -26,6 +26,7 @@ import 'widgets/aegis_device_pairing_modal.dart';
 import 'screens/doctor_document_view_screen.dart';
 import 'widgets/doctor_documents_section.dart';
 import 'widgets/referral_banner.dart';
+import 'prototypes/aegis_splash_hologram_prototype.dart';
 
 /// Safe testable TokenProvider abstraction for standard Aegis mobile runtime.
 /// In standard mobile builds prior to Stage 5.3 user authentication, returns null.
@@ -130,7 +131,30 @@ void main() => runApp(
 );
 
 class AegisApp extends StatefulWidget {
-  const AegisApp({super.key});
+  const AegisApp({
+    super.key,
+    this.enableStartupSplash = true,
+    this.debugSkipSplashVideoInitialization = false,
+    this.debugSimulatedSplashVideoDuration,
+    this.onSplashRPeakHaptic,
+    this.onSplashAuraAudioStarted,
+  });
+
+  /// Controls whether the cold-start Splash V4 -> ECG hologram sequence wraps
+  /// [RootGateScreen] on app boot. Defaults to `true` in production.
+  final bool enableStartupSplash;
+
+  /// Optional test hook bypassing native video plugin initialization.
+  final bool debugSkipSplashVideoInitialization;
+
+  /// Optional test hook controlling fallback hold timing when video plugin is bypassed.
+  final Duration? debugSimulatedSplashVideoDuration;
+
+  /// Optional test hook observing R-peak haptic triggers during splash transition.
+  final Future<void> Function()? onSplashRPeakHaptic;
+
+  /// Optional test hook observing Aura audio start during splash.
+  final VoidCallback? onSplashAuraAudioStarted;
 
   @override
   State<AegisApp> createState() => _AegisAppState();
@@ -182,7 +206,22 @@ class _AegisAppState extends State<AegisApp> with WidgetsBindingObserver {
     return MaterialApp(
       debugShowCheckedModeBanner: false,
       theme: ThemeData.dark(),
-      home: const RootGateScreen(),
+      home: widget.enableStartupSplash
+          ? AegisSplashPrototypeScreen(
+              key: const Key('aegis_production_startup_splash'),
+              destinationChild: const RootGateScreen(
+                key: Key('aegis_root_gate_screen'),
+              ),
+              debugSkipVideoInitialization:
+                  widget.debugSkipSplashVideoInitialization,
+              debugSimulatedVideoDuration:
+                  widget.debugSimulatedSplashVideoDuration,
+              onRPeakHaptic: widget.onSplashRPeakHaptic,
+              onAuraAudioStarted: widget.onSplashAuraAudioStarted,
+            )
+          : const RootGateScreen(
+              key: Key('aegis_root_gate_screen'),
+            ),
     );
   }
 }

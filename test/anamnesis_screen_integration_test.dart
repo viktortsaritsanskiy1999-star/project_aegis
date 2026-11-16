@@ -757,8 +757,12 @@ void main() {
       await tester.pumpAndSettle();
 
       // Card 0: Click age confirmation
-      expect(find.text("I'm 18+, let's go! 🚀"), findsOneWidget);
-      await tester.tap(find.text("I'm 18+, let's go! 🚀"));
+      expect(find.text('Clinical & Age Clearance'), findsOneWidget);
+      await tester.ensureVisible(find.text('SELECT ALL'));
+      await tester.tap(find.text('SELECT ALL'));
+      await tester.pumpAndSettle();
+      await tester.ensureVisible(find.text('INITIALIZE PROTOCOL'));
+      await tester.tap(find.text('INITIALIZE PROTOCOL'));
       await tester.pumpAndSettle();
 
       // Card 1: Biological Profile
@@ -788,7 +792,8 @@ void main() {
       await tester.pumpAndSettle();
 
       // Form inputs must be completely wiped and reset to Card 0 for Patient B
-      expect(find.text("I'm 18+, let's go! 🚀"), findsOneWidget);
+      expect(find.text('Clinical & Age Clearance'), findsOneWidget);
+      expect(find.text('SELECT ALL'), findsOneWidget);
       expect(find.text('42'), findsNothing);
 
       vault.dispose();

@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:ui';
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 import 'services/api/aegis_api_client.dart';
@@ -21,6 +22,7 @@ class _AnamnesisScreenState extends State<AnamnesisScreen>
   final int _totalPages = 17;
 
   // --- SELECTION STATES ---
+  final Set<int> _ageGateSelectedCards = <int>{};
   String? _currentError; // Universal error indicator for the current screen
   int _errorSequence = 0;
   Timer? _errorDismissTimer;
@@ -714,6 +716,7 @@ class _AnamnesisScreenState extends State<AnamnesisScreen>
   }
 
   void _resetLocalState() {
+    _ageGateSelectedCards.clear();
     _selectedGender = null;
     _multiSelect.clear();
     _customInputController.clear();
@@ -1063,18 +1066,21 @@ class _AnamnesisScreenState extends State<AnamnesisScreen>
     final double progress = ((_currentPage) / (_totalPages - 1)).clamp(0.0, 1.0);
 
     return Scaffold(
-      backgroundColor: const Color(0xFF1A1A1A),
+      backgroundColor: _currentPage == 0
+          ? const Color(0xFF070B12)
+          : const Color(0xFF1A1A1A),
       body: SafeArea(
         child: Stack(
           children: [
             Column(
               children: [
-                LinearProgressIndicator(
-                  value: progress,
-                  backgroundColor: Colors.white10,
-                  valueColor: const AlwaysStoppedAnimation<Color>(Colors.greenAccent),
-                  minHeight: 4,
-                ),
+                if (_currentPage > 0)
+                  LinearProgressIndicator(
+                    value: progress,
+                    backgroundColor: Colors.white10,
+                    valueColor: const AlwaysStoppedAnimation<Color>(Colors.greenAccent),
+                    minHeight: 4,
+                  ),
                 if (_currentPage > 0)
                   Align(
                     alignment: Alignment.centerLeft,
@@ -1244,14 +1250,429 @@ class _AnamnesisScreenState extends State<AnamnesisScreen>
 
   // --- CARDS ---
 
-  Widget _stepAgeGate() => _wrapper(children: [
-    _buildTitle("Let's set the ground rules 🤝"),
-    _buildSubtitle("«We all know how this works on other websites: you click \"I am 18\" and move on. But here, the story is different...\n\nBy clicking the button, you confirm that you are an adult (18+) and take full responsibility for the accuracy of your data.»"),
-    _buildSelectableOption("I'm 18+, let's go! 🚀", false, () {
-      context.read<VaultService>().saveAnamnesis('age_confirmation', 'Confirmed');
-      _nextPage();
-    }),
-  ]);
+  Widget _stepAgeGate() {
+    final bool allSelected = _ageGateSelectedCards.length == 3;
+
+    return Stack(
+      fit: StackFit.expand,
+      children: [
+        // Subtle Bio-Cyan radial backlight behind the consent cards (#003B4D @ 18%, blur ~120px)
+        Positioned.fill(
+          child: IgnorePointer(
+            child: Center(
+              child: Container(
+                width: 300,
+                height: 300,
+                decoration: BoxDecoration(
+                  shape: BoxShape.circle,
+                  gradient: RadialGradient(
+                    colors: [
+                      const Color(0xFF003B4D).withValues(alpha: 0.18),
+                      const Color(0xFF003B4D).withValues(alpha: 0.0),
+                    ],
+                  ),
+                  boxShadow: [
+                    BoxShadow(
+                      color: const Color(0xFF003B4D).withValues(alpha: 0.18),
+                      blurRadius: 120,
+                      spreadRadius: 36,
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ),
+        ),
+        LayoutBuilder(
+          builder: (context, constraints) {
+            return SingleChildScrollView(
+              clipBehavior: Clip.none,
+              padding: const EdgeInsets.fromLTRB(24, 18, 24, 40),
+              child: ConstrainedBox(
+                constraints: BoxConstraints(
+                  minHeight: (constraints.maxHeight - 58).clamp(0.0, double.infinity),
+                ),
+                child: Column(
+                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    Column(
+                      crossAxisAlignment: CrossAxisAlignment.stretch,
+                      children: [
+                        const Text(
+                          'Clinical & Age Clearance',
+                          textAlign: TextAlign.center,
+                          style: TextStyle(
+                            color: Color(0xFFF2F7FA),
+                            fontSize: 28,
+                            fontWeight: FontWeight.w600,
+                            letterSpacing: -0.3,
+                            height: 1.2,
+                          ),
+                        ),
+                        const SizedBox(height: 10),
+                        const Text(
+                          'Acknowledge operational parameters to initialize telemetry',
+                          textAlign: TextAlign.center,
+                          style: TextStyle(
+                            color: Color(0xFF7E92A6),
+                            fontSize: 16,
+                            fontWeight: FontWeight.w400,
+                            height: 1.35,
+                          ),
+                        ),
+                        const SizedBox(height: 22),
+                        _buildAgeGateCard(
+                          index: 0,
+                          cardKey: const Key('age_gate_card_0'),
+                          title: 'Adult Physiology (18+)',
+                          subtitle: 'Calibrated strictly for adult reference ranges',
+                          iconPainter: _AgeShieldIconPainter(),
+                        ),
+                        const SizedBox(height: 12),
+                        _buildAgeGateCard(
+                          index: 1,
+                          cardKey: const Key('age_gate_card_1'),
+                          title: 'Informational AI Synthesis',
+                          subtitle: 'Not a substitute for emergency or clinical diagnosis',
+                          iconPainter: _ClinicalSynthesisIconPainter(),
+                        ),
+                        const SizedBox(height: 12),
+                        _buildAgeGateCard(
+                          index: 2,
+                          cardKey: const Key('age_gate_card_2'),
+                          title: 'Encrypted Biometric Vault',
+                          subtitle: 'Zero-knowledge local and cloud telemetry processing',
+                          iconPainter: _BiometricVaultIconPainter(),
+                        ),
+                        const SizedBox(height: 8),
+                        // Preserve fixed slot height so hiding SELECT ALL causes zero vertical jump
+                        SizedBox(
+                          height: 36,
+                          child: allSelected
+                              ? null
+                              : Align(
+                                  alignment: Alignment.centerRight,
+                                  child: TextButton(
+                                    key: const Key('age_gate_select_all_button'),
+                                    onPressed: () {
+                                      setState(() {
+                                        _ageGateSelectedCards.addAll(const [0, 1, 2]);
+                                      });
+                                    },
+                                    style: TextButton.styleFrom(
+                                      foregroundColor: const Color(0xFF00E5FF),
+                                      padding: const EdgeInsets.symmetric(
+                                        horizontal: 12,
+                                        vertical: 8,
+                                      ),
+                                      minimumSize: const Size(48, 36),
+                                      tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                                      shape: RoundedRectangleBorder(
+                                        borderRadius: BorderRadius.circular(10),
+                                      ),
+                                    ),
+                                    child: const Text(
+                                      'SELECT ALL',
+                                      style: TextStyle(
+                                        color: Color(0xFF40F2FF),
+                                        fontSize: 12.5,
+                                        fontWeight: FontWeight.w600,
+                                        letterSpacing: 1.4,
+                                      ),
+                                    ),
+                                  ),
+                                ),
+                        ),
+                      ],
+                    ),
+                    Padding(
+                      padding: const EdgeInsets.only(top: 10, bottom: 22),
+                      child: _buildAgeGateRegulatoryNotice(),
+                    ),
+                    _buildAgeGateInitializeButton(allSelected),
+                  ],
+                ),
+              ),
+            );
+          },
+        ),
+      ],
+    );
+  }
+
+  Widget _buildAgeGateCard({
+    required int index,
+    required Key cardKey,
+    required String title,
+    required String subtitle,
+    required CustomPainter iconPainter,
+  }) {
+    final bool isSelected = _ageGateSelectedCards.contains(index);
+
+    final Widget cardBody = Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 15),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.center,
+        children: [
+          Container(
+            width: 48,
+            height: 48,
+            decoration: BoxDecoration(
+              color: const Color(0xFF061218),
+              borderRadius: BorderRadius.circular(12),
+              border: Border.all(
+                color: isSelected
+                    ? const Color(0x3300E5FF)
+                    : const Color(0xFF142834),
+                width: 1.0,
+              ),
+            ),
+            child: Padding(
+              padding: const EdgeInsets.all(8),
+              child: CustomPaint(
+                painter: iconPainter,
+                size: const Size(32, 32),
+              ),
+            ),
+          ),
+          const SizedBox(width: 14),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                AnimatedDefaultTextStyle(
+                  duration: const Duration(milliseconds: 240),
+                  curve: Curves.easeOutCubic,
+                  style: TextStyle(
+                    color: isSelected
+                        ? const Color(0xFFFFFFFF)
+                        : const Color(0xFFA0B2C6),
+                    fontSize: 17,
+                    fontWeight: FontWeight.w500,
+                    height: 1.25,
+                  ),
+                  child: Text(title),
+                ),
+                const SizedBox(height: 4),
+                Text(
+                  subtitle,
+                  style: const TextStyle(
+                    color: Color(0xFF73899E),
+                    fontSize: 13.5,
+                    fontWeight: FontWeight.w400,
+                    height: 1.35,
+                  ),
+                ),
+              ],
+            ),
+          ),
+          const SizedBox(width: 12),
+          AnimatedContainer(
+            duration: const Duration(milliseconds: 180),
+            curve: Curves.easeOutCubic,
+            width: 26,
+            height: 26,
+            decoration: BoxDecoration(
+              shape: BoxShape.circle,
+              color: isSelected
+                  ? const Color(0x2600E5FF) // #00E5FF @ 15%
+                  : Colors.transparent,
+              border: Border.all(
+                color: isSelected
+                    ? const Color(0xFF00E5FF)
+                    : const Color(0xFF1E2D3D),
+                width: 1.5,
+              ),
+            ),
+            child: Center(
+              child: AnimatedScale(
+                scale: isSelected ? 1.0 : 0.6,
+                duration: const Duration(milliseconds: 180),
+                curve: Curves.easeOutCubic,
+                child: AnimatedOpacity(
+                  opacity: isSelected ? 1.0 : 0.0,
+                  duration: const Duration(milliseconds: 180),
+                  curve: Curves.easeOutCubic,
+                  child: const Icon(
+                    Icons.check_rounded,
+                    size: 16,
+                    color: Color(0xFFB8FBFF),
+                  ),
+                ),
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+
+    return Semantics(
+      button: true,
+      toggled: isSelected,
+      label: title,
+      child: GestureDetector(
+        key: cardKey,
+        behavior: HitTestBehavior.opaque,
+        onTap: () {
+          setState(() {
+            if (isSelected) {
+              _ageGateSelectedCards.remove(index);
+            } else {
+              _ageGateSelectedCards.add(index);
+            }
+          });
+        },
+        child: AnimatedContainer(
+          duration: const Duration(milliseconds: 240),
+          curve: Curves.easeOutCubic,
+          decoration: BoxDecoration(
+            borderRadius: BorderRadius.circular(16),
+            border: Border.all(
+              color: isSelected
+                  ? const Color(0x9900E5FF) // #00E5FF @ 60%
+                  : const Color(0xFF1E2D3D),
+              width: isSelected ? 1.2 : 1.0,
+            ),
+            boxShadow: isSelected
+                ? const [
+                    BoxShadow(
+                      color: Color(0x2E00E5FF), // #00E5FF @ 18%
+                      blurRadius: 14,
+                      spreadRadius: 0,
+                    ),
+                  ]
+                : const [],
+          ),
+          child: ClipRRect(
+            borderRadius: BorderRadius.circular(15),
+            child: isSelected
+                ? BackdropFilter(
+                    filter: ImageFilter.blur(sigmaX: 16, sigmaY: 16),
+                    child: DecoratedBox(
+                      decoration: const BoxDecoration(
+                        gradient: LinearGradient(
+                          begin: Alignment.topLeft,
+                          end: Alignment.bottomRight,
+                          colors: [
+                            Color(0xD90D222B), // #0D222B @ 85%
+                            Color(0xE609131C), // #09131C @ 90%
+                          ],
+                        ),
+                      ),
+                      child: cardBody,
+                    ),
+                  )
+                : ColoredBox(
+                    color: const Color(0xBF0B111A), // #0B111A @ 75%
+                    child: cardBody,
+                  ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildAgeGateRegulatoryNotice() {
+    return const Padding(
+      padding: EdgeInsets.symmetric(horizontal: 4),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Text(
+            'REGULATORY & LIABILITY NOTICE',
+            textAlign: TextAlign.center,
+            style: TextStyle(
+              color: Color(0xFF5E768D),
+              fontSize: 10.5,
+              fontWeight: FontWeight.w600,
+              letterSpacing: 1.2,
+              height: 1.3,
+            ),
+          ),
+          SizedBox(height: 6),
+          Text(
+            'AEGIS provides AI-generated health insights for informational purposes only. Results are not a medical diagnosis or treatment recommendation and do not replace professional medical advice. In an emergency, contact emergency services.',
+            textAlign: TextAlign.center,
+            style: TextStyle(
+              color: Color(0xFF5E768D),
+              fontSize: 11.0,
+              fontWeight: FontWeight.w400,
+              height: 1.4,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildAgeGateInitializeButton(bool allSelected) {
+    return Semantics(
+      button: true,
+      enabled: allSelected,
+      label: 'INITIALIZE PROTOCOL',
+      child: GestureDetector(
+        key: const Key('age_gate_initialize_button'),
+        behavior: HitTestBehavior.opaque,
+        onTap: allSelected
+            ? () {
+                context
+                    .read<VaultService>()
+                    .saveAnamnesis('age_confirmation', 'Confirmed');
+                _nextPage();
+              }
+            : null,
+        child: Container(
+          height: 56,
+          decoration: BoxDecoration(
+            borderRadius: BorderRadius.circular(28),
+            color: allSelected ? null : const Color(0xFF1E2D3D),
+            gradient: allSelected
+                ? const LinearGradient(
+                    begin: Alignment.topLeft,
+                    end: Alignment.bottomRight,
+                    colors: [
+                      Color(0xFF26F0FF),
+                      Color(0xFF00C4E0),
+                    ],
+                  )
+                : null,
+            boxShadow: allSelected
+                ? const [
+                    BoxShadow(
+                      color: Color(0x5900E5FF), // #00E5FF @ 35% opacity
+                      blurRadius: 16,
+                      spreadRadius: 1,
+                      offset: Offset.zero,
+                    ),
+                    BoxShadow(
+                      color: Color(0x2E00E5FF), // #00E5FF @ 18% opacity
+                      blurRadius: 30,
+                      spreadRadius: 0,
+                      offset: Offset(0, 3),
+                    ),
+                  ]
+                : const [],
+          ),
+          child: Center(
+            child: Text(
+              'INITIALIZE PROTOCOL',
+              style: TextStyle(
+                color: allSelected
+                    ? const Color(0xFF041016)
+                    : const Color(0xFF7E92A6),
+                fontSize: 15,
+                fontWeight: FontWeight.w700,
+                letterSpacing: 1.5,
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
 
   Widget _stepBioProfile() {
     final vault = context.read<VaultService>();
@@ -5814,4 +6235,241 @@ class _AnamnesisScreenState extends State<AnamnesisScreen>
         curve: Curves.easeInOut
     );
   }
+}
+
+void _drawNeonCyanPath(Canvas canvas, Path path, {double strokeWidth = 1.65}) {
+  final glowPaint = Paint()
+    ..color = const Color(0x4D00E5FF)
+    ..style = PaintingStyle.stroke
+    ..strokeWidth = strokeWidth + 1.8
+    ..strokeCap = StrokeCap.round
+    ..strokeJoin = StrokeJoin.round
+    ..maskFilter = const MaskFilter.blur(BlurStyle.normal, 2.2);
+
+  final strokePaint = Paint()
+    ..color = const Color(0xFF00E5FF)
+    ..style = PaintingStyle.stroke
+    ..strokeWidth = strokeWidth
+    ..strokeCap = StrokeCap.round
+    ..strokeJoin = StrokeJoin.round;
+
+  canvas.drawPath(path, glowPaint);
+  canvas.drawPath(path, strokePaint);
+}
+
+class _AgeShieldIconPainter extends CustomPainter {
+  @override
+  void paint(Canvas canvas, Size size) {
+    final w = size.width;
+    final h = size.height;
+
+    final shield = Path()
+      ..moveTo(w * 0.50, h * 0.08)
+      ..lineTo(w * 0.86, h * 0.20)
+      ..lineTo(w * 0.86, h * 0.49)
+      ..cubicTo(w * 0.86, h * 0.72, w * 0.67, h * 0.85, w * 0.50, h * 0.92)
+      ..cubicTo(w * 0.33, h * 0.85, w * 0.14, h * 0.72, w * 0.14, h * 0.49)
+      ..lineTo(w * 0.14, h * 0.20)
+      ..close();
+
+    _drawNeonCyanPath(canvas, shield, strokeWidth: 1.7);
+
+    final textPainter = TextPainter(
+      text: TextSpan(
+        text: '18+',
+        style: TextStyle(
+          color: const Color(0xFF00E5FF),
+          fontSize: w * 0.34,
+          fontWeight: FontWeight.w700,
+          letterSpacing: -0.4,
+          height: 1.0,
+        ),
+      ),
+      textDirection: TextDirection.ltr,
+    )..layout();
+
+    textPainter.paint(
+      canvas,
+      Offset((w - textPainter.width) * 0.5, h * 0.48 - textPainter.height * 0.5),
+    );
+  }
+
+  @override
+  bool shouldRepaint(covariant _AgeShieldIconPainter oldDelegate) => false;
+}
+
+class _ClinicalSynthesisIconPainter extends CustomPainter {
+  @override
+  void paint(Canvas canvas, Size size) {
+    final w = size.width;
+    final h = size.height;
+
+    // Cross geometry centered upper-left to leave lower-right overlap for heart + ECG
+    const double cx = 0.42;
+    const double cy = 0.44;
+    const double armHalf = 0.125;
+    const double armExtent = 0.34;
+
+    final cross = Path()
+      ..moveTo(w * (cx - armHalf), h * (cy - armExtent))
+      ..lineTo(w * (cx + armHalf), h * (cy - armExtent))
+      ..lineTo(w * (cx + armHalf), h * (cy - armHalf))
+      ..lineTo(w * (cx + armExtent), h * (cy - armHalf))
+      ..lineTo(w * (cx + armExtent), h * (cy + armHalf))
+      ..lineTo(w * (cx + armHalf), h * (cy + armHalf))
+      ..lineTo(w * (cx + armHalf), h * (cy + armExtent))
+      ..lineTo(w * (cx - armHalf), h * (cy + armExtent))
+      ..lineTo(w * (cx - armHalf), h * (cy + armHalf))
+      ..lineTo(w * (cx - armExtent), h * (cy + armHalf))
+      ..lineTo(w * (cx - armExtent), h * (cy - armHalf))
+      ..lineTo(w * (cx - armHalf), h * (cy - armHalf))
+      ..close();
+
+    _drawNeonCyanPath(canvas, cross, strokeWidth: 1.55);
+
+    // Heart overlapping lower-right of the medical cross
+    final hx = w * 0.67;
+    final hy = h * 0.65;
+    final hw = w * 0.24;
+    final hh = h * 0.21;
+
+    final heart = Path()
+      ..moveTo(hx, hy - hh * 0.28)
+      ..cubicTo(
+        hx - hw * 0.32,
+        hy - hh * 1.10,
+        hx - hw * 1.15,
+        hy - hh * 0.72,
+        hx - hw * 1.05,
+        hy - hh * 0.04,
+      )
+      ..cubicTo(
+        hx - hw * 0.98,
+        hy + hh * 0.45,
+        hx - hw * 0.38,
+        hy + hh * 0.86,
+        hx,
+        hy + hh * 1.15,
+      )
+      ..cubicTo(
+        hx + hw * 0.38,
+        hy + hh * 0.86,
+        hx + hw * 0.98,
+        hy + hh * 0.45,
+        hx + hw * 1.05,
+        hy - hh * 0.04,
+      )
+      ..cubicTo(
+        hx + hw * 1.15,
+        hy - hh * 0.72,
+        hx + hw * 0.32,
+        hy - hh * 1.10,
+        hx,
+        hy - hh * 0.28,
+      )
+      ..close();
+
+    // Occlude intersecting cross lines cleanly inside the heart
+    canvas.drawPath(
+      heart,
+      Paint()
+        ..color = const Color(0xFF061218)
+        ..style = PaintingStyle.fill,
+    );
+    _drawNeonCyanPath(canvas, heart, strokeWidth: 1.45);
+
+    final ecg = Path()
+      ..moveTo(hx - hw * 0.78, hy + hh * 0.08)
+      ..lineTo(hx - hw * 0.36, hy + hh * 0.08)
+      ..lineTo(hx - hw * 0.14, hy - hh * 0.34)
+      ..lineTo(hx + hw * 0.12, hy + hh * 0.44)
+      ..lineTo(hx + hw * 0.34, hy - hh * 0.04)
+      ..lineTo(hx + hw * 0.78, hy + hh * 0.08);
+
+    _drawNeonCyanPath(canvas, ecg, strokeWidth: 1.35);
+  }
+
+  @override
+  bool shouldRepaint(covariant _ClinicalSynthesisIconPainter oldDelegate) =>
+      false;
+}
+
+class _BiometricVaultIconPainter extends CustomPainter {
+  @override
+  void paint(Canvas canvas, Size size) {
+    final w = size.width;
+    final h = size.height;
+
+    final bodyRect = RRect.fromRectAndRadius(
+      Rect.fromCenter(
+        center: Offset(w * 0.50, h * 0.64),
+        width: w * 0.42,
+        height: h * 0.35,
+      ),
+      Radius.circular(w * 0.055),
+    );
+    final lockPath = Path()
+      ..addRRect(bodyRect)
+      ..moveTo(w * 0.36, h * 0.465)
+      ..lineTo(w * 0.36, h * 0.31)
+      ..arcToPoint(
+        Offset(w * 0.64, h * 0.31),
+        radius: Radius.circular(w * 0.14),
+        clockwise: true,
+      )
+      ..lineTo(w * 0.64, h * 0.465)
+      ..addOval(
+        Rect.fromCircle(center: Offset(w * 0.50, h * 0.60), radius: w * 0.042),
+      )
+      ..moveTo(w * 0.50, h * 0.642)
+      ..lineTo(w * 0.50, h * 0.73);
+
+    _drawNeonCyanPath(canvas, lockPath, strokeWidth: 1.55);
+
+    // Symmetrical left/right circuit traces ending in circular nodes
+    final traces = Path();
+    final List<Offset> nodeCenters = [];
+    for (final double sign in const [-1.0, 1.0]) {
+      final double edgeX = w * (0.50 + sign * 0.21);
+      final double bendX = w * (0.50 + sign * 0.30);
+      final double endDiagX = w * (0.50 + sign * 0.375);
+      final double endMidX = w * (0.50 + sign * 0.39);
+
+      traces
+        ..moveTo(edgeX, h * 0.54)
+        ..lineTo(bendX, h * 0.54)
+        ..lineTo(endDiagX, h * 0.43)
+        ..moveTo(edgeX, h * 0.64)
+        ..lineTo(endMidX, h * 0.64)
+        ..moveTo(edgeX, h * 0.74)
+        ..lineTo(bendX, h * 0.74)
+        ..lineTo(endDiagX, h * 0.85);
+
+      nodeCenters.addAll([
+        Offset(w * (0.50 + sign * 0.405), h * 0.40),
+        Offset(w * (0.50 + sign * 0.425), h * 0.64),
+        Offset(w * (0.50 + sign * 0.405), h * 0.88),
+      ]);
+    }
+
+    _drawNeonCyanPath(canvas, traces, strokeWidth: 1.3);
+
+    final nodeFill = Paint()
+      ..color = const Color(0xFF061218)
+      ..style = PaintingStyle.fill;
+    final nodeStroke = Paint()
+      ..color = const Color(0xFF00E5FF)
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 1.3;
+    final double nodeRadius = w * 0.043;
+
+    for (final center in nodeCenters) {
+      canvas.drawCircle(center, nodeRadius, nodeFill);
+      canvas.drawCircle(center, nodeRadius, nodeStroke);
+    }
+  }
+
+  @override
+  bool shouldRepaint(covariant _BiometricVaultIconPainter oldDelegate) =>
+      false;
 }

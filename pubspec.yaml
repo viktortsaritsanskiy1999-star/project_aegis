@@ -21,6 +21,7 @@ dependencies:
   http: ^1.6.0
   flutter_secure_storage: 10.3.4
   google_sign_in: ^7.2.0
+  video_player: ^2.11.1
 
 dev_dependencies:
   flutter_test:
@@ -41,3 +42,5 @@ flutter:
     - assets/images/lymphaticsystem.png
     - assets/images/nervesystem.png
     - assets/images/stomack.png
+    - assets/video/aegis_splash.mp4
+    - assets/audio/candidates/audio_aura.MP3
