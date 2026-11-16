@@ -424,5 +424,402 @@ void main() {
         await tester.pumpAndSettle();
       },
     );
+
+    testWidgets(
+      '6. Optional FrameTiming diagnostics: disabled by default, captures structural events & batched Top-5 correlation when enabled, cleans up on finish',
+      (tester) async {
+        // A. Default disabled state must NOT emit any report.
+        expect(AegisHologramTransition.defaultEnableFrameTimingDiagnostics, isFalse);
+        int defaultReports = 0;
+        await tester.pumpWidget(
+          MaterialApp(
+            home: AegisSplashPrototypeScreen(
+              debugSkipVideoInitialization: true,
+              debugSimulatedVideoDuration: const Duration(milliseconds: 200),
+              onFrameTimingReport: (_) => defaultReports++,
+            ),
+          ),
+        );
+        await tester.pump(const Duration(milliseconds: 220));
+        await tester.pump(const Duration(milliseconds: 2100));
+        await tester.pumpAndSettle();
+        expect(defaultReports, 0);
+
+        // B. When enabled, captures all Phase A->B->C structural events and emits once.
+        SplashTransitionTimingReport? capturedReport;
+        int reportCalls = 0;
+
+        await tester.pumpWidget(
+          MaterialApp(
+            home: AegisHologramTransition(
+              startTransition: true,
+              enableFrameTimingDiagnostics: true,
+              onFrameTimingReport: (report) {
+                reportCalls++;
+                capturedReport = report;
+              },
+              splashChild: const ColoredBox(color: Color(0xFF0A1420)),
+              consentChild: const ColoredBox(color: Color(0xFF070B12)),
+            ),
+          ),
+        );
+
+        // Step across Phase A -> Phase B -> Phase C milestones
+        await tester.pump(const Duration(milliseconds: 16));
+        await tester.pump(const Duration(milliseconds: 140));
+        await tester.pump(const Duration(milliseconds: 200));
+        await tester.pump(const Duration(milliseconds: 50));
+        await tester.pump(const Duration(milliseconds: 1100));
+        await tester.pumpAndSettle();
+
+        expect(reportCalls, 1);
+        expect(capturedReport, isNotNull);
+        final eventLabels =
+            capturedReport!.structuralEvents.map((e) => e.label).toList();
+        expect(
+          eventLabels,
+          containsAllInOrder([
+            'TRANSITION_START',
+            'SHADER_MASK_MOUNT',
+            'OPACITY_BELOW_1',
+            'PHASE_B_START',
+            'SPLASH_LAYER_REMOVE',
+            'PHASE_C_START',
+          ]),
+        );
+
+        // C. Deterministic verification of batched/delayed FrameTiming correlation & Top-5 ranking
+        const baseVsync = 100000000;
+        final snapshots = [
+          const SplashUiSnapshotSample(
+            vsyncUs: baseVsync,
+            elapsedMs: 0.0,
+            pA: 0.0,
+            pB: 0.0,
+            pC: 0.0,
+            events: ['TRANSITION_START'],
+          ),
+          const SplashUiSnapshotSample(
+            vsyncUs: baseVsync + 16000,
+            elapsedMs: 16.0,
+            pA: 0.042,
+            pB: 0.0,
+            pC: 0.0,
+            events: ['SHADER_MASK_MOUNT'],
+          ),
+          const SplashUiSnapshotSample(
+            vsyncUs: baseVsync + 140000,
+            elapsedMs: 140.0,
+            pA: 0.368,
+            pB: 0.0,
+            pC: 0.0,
+            events: ['OPACITY_BELOW_1'],
+          ),
+          const SplashUiSnapshotSample(
+            vsyncUs: baseVsync + 385000,
+            elapsedMs: 385.0,
+            pA: 1.0,
+            pB: 0.06,
+            pC: 0.0,
+            events: ['SPLASH_LAYER_REMOVE'],
+          ),
+        ];
+
+        final rawTimings = [
+          // Pre-transition frame delivered in first batch -> excluded safely
+          const SplashRawTimingSample(
+            vsyncStartUs: baseVsync - 32000,
+            buildMs: 25.0,
+            rasterMs: 25.0,
+            totalSpanMs: 50.0,
+          ),
+          // Exact match at SHADER_MASK_MOUNT
+          const SplashRawTimingSample(
+            vsyncStartUs: baseVsync + 16200,
+            buildMs: 9.5,
+            rasterMs: 18.2,
+            totalSpanMs: 27.7,
+          ),
+          // Delayed/offset match near OPACITY_BELOW_1
+          const SplashRawTimingSample(
+            vsyncStartUs: baseVsync + 145000,
+            buildMs: 4.1,
+            rasterMs: 11.4,
+            totalSpanMs: 15.5,
+          ),
+          // Unmatched timestamp far from any snapshot -> must remain UNCORRELATED
+          const SplashRawTimingSample(
+            vsyncStartUs: baseVsync + 900000,
+            buildMs: 3.0,
+            rasterMs: 5.0,
+            totalSpanMs: 8.0,
+          ),
+        ];
+
+        final report = SplashTransitionTimingReport.correlateForTesting(
+          rawTimings: rawTimings,
+          snapshots: snapshots,
+          structuralEvents: capturedReport!.structuralEvents,
+          firstTransitionVsyncUs: baseVsync,
+        );
+
+        expect(report.preTransitionSkippedFrames, 1);
+        expect(report.totalFrames, 3);
+        expect(report.phaseABFrames, 2);
+        expect(report.uncorrelatedFrames, 1);
+        expect(report.uiOver8msCount, 1);
+        expect(report.uiOver16msCount, 0);
+        expect(report.rasterOver8msCount, 2);
+        expect(report.rasterOver16msCount, 1);
+        expect(report.uiP95Ms, closeTo(9.5, 0.001));
+        expect(report.rasterP95Ms, closeTo(18.2, 0.001));
+        expect(report.spanP95Ms, closeTo(27.7, 0.001));
+        expect(report.topHeaviestFrames.first.correlationType, 'EXACT_VSYNC');
+        expect(
+          report.topHeaviestFrames.first.events,
+          contains('SHADER_MASK_MOUNT'),
+        );
+        expect(report.topHeaviestFrames[1].correlationType, 'OFFSET_NEAREST');
+        expect(report.topHeaviestFrames.last.phaseLabel, 'UNCORRELATED');
+        expect(
+          report.formattedSummary,
+          contains('Percentiles (p95): UI=9.50ms | Raster=18.20ms | TotalSpan=27.70ms'),
+        );
+        expect(
+          report.formattedSummary,
+          contains('Top-3 Heaviest Frames:'),
+        );
+
+        final emptyReport = SplashTransitionTimingReport.correlateForTesting(
+          rawTimings: const [],
+          snapshots: const [],
+          structuralEvents: const [],
+          firstTransitionVsyncUs: null,
+          warmupTimings: const [
+            SplashRawTimingSample(
+              vsyncStartUs: baseVsync - 5000000,
+              buildMs: 1.2,
+              rasterMs: 14.5,
+              totalSpanMs: 15.7,
+            ),
+            SplashRawTimingSample(
+              vsyncStartUs: baseVsync - 4983000,
+              buildMs: 0.7,
+              rasterMs: 4.2,
+              totalSpanMs: 4.9,
+            ),
+          ],
+          warmupCompletedBeforeTransition: true,
+        );
+        expect(emptyReport.uiP95Ms, 0.0);
+        expect(emptyReport.rasterP95Ms, 0.0);
+        expect(emptyReport.spanP95Ms, 0.0);
+        expect(emptyReport.warmupFramesCount, 2);
+        expect(emptyReport.warmupMaxUiMs, closeTo(1.2, 0.001));
+        expect(emptyReport.warmupMaxRasterMs, closeTo(14.5, 0.001));
+        expect(emptyReport.warmupCompletedBeforeTransition, isTrue);
+        expect(
+          emptyReport.formattedSummary,
+          contains(
+            'Warmup: completed=true, frames=2, maxUI=1.20ms, maxRaster=14.50ms',
+          ),
+        );
+
+        await tester.pumpWidget(const SizedBox.shrink());
+        await tester.pumpAndSettle();
+      },
+    );
+
+    testWidgets(
+      '7. Cold-start 2-frame GPU warmup executes then unmounts cleanly while RepaintBoundary + Opacity/ShaderMask isolate splashChild',
+      (WidgetTester tester) async {
+        tester.view.physicalSize = const Size(1080, 2400);
+        tester.view.devicePixelRatio = 2.0;
+        addTearDown(tester.view.resetPhysicalSize);
+        addTearDown(tester.view.resetDevicePixelRatio);
+
+        int initCount = 0;
+        int disposeCount = 0;
+        int completedCount = 0;
+
+        Widget buildHarness({required bool startTransition}) {
+          return MaterialApp(
+            home: AegisHologramTransition(
+              startTransition: startTransition,
+              onTransitionCompleted: () => completedCount++,
+              splashChild: _SplashLifecycleProbe(
+                key: const Key('splash_lifecycle_probe'),
+                onInit: () => initCount++,
+                onDispose: () => disposeCount++,
+              ),
+              consentChild: const Scaffold(
+                body: Center(child: Text('Destination Ready')),
+              ),
+            ),
+          );
+        }
+
+        final warmupFinder =
+            find.byKey(const ValueKey<String>('aegis_gpu_warmup_layer'));
+        final visibilityFinder =
+            find.byKey(const ValueKey<String>('aegis_splash_visibility_layer'));
+
+        // Frame 1 (t = 0ms): 2-frame GPU warmup layer is mounted & occluded, splash layer isolated.
+        await tester.pumpWidget(buildHarness(startTransition: false));
+        expect(initCount, 1);
+        expect(disposeCount, 0);
+        expect(warmupFinder, findsOneWidget);
+        expect(visibilityFinder, findsOneWidget);
+        expect(
+          tester.widget<Visibility>(visibilityFinder).visible,
+          isTrue,
+        );
+        expect(
+          find.descendant(
+            of: visibilityFinder,
+            matching: find.byType(RepaintBoundary),
+          ),
+          findsOneWidget,
+        );
+        expect(
+          find.descendant(
+            of: visibilityFinder,
+            matching: find.byType(Opacity),
+          ),
+          findsOneWidget,
+        );
+        expect(
+          find.descendant(
+            of: visibilityFinder,
+            matching: find.byType(ShaderMask),
+          ),
+          findsOneWidget,
+        );
+        expect(
+          tester
+              .widget<Opacity>(
+                find.descendant(
+                  of: visibilityFinder,
+                  matching: find.byType(Opacity),
+                ),
+              )
+              .opacity,
+          closeTo(254.0 / 255.0, 0.0001),
+        );
+
+        // Pump Frame 2 + rebuild Frame 3 -> warmup unmounts permanently; video hold returns to fast-path opacity 1.0.
+        await tester.pump();
+        await tester.pump();
+        expect(warmupFinder, findsNothing);
+        expect(initCount, 1);
+        expect(disposeCount, 0);
+        expect(
+          tester
+              .widget<Opacity>(
+                find.descendant(
+                  of: visibilityFinder,
+                  matching: find.byType(Opacity),
+                ),
+              )
+              .opacity,
+          1.0,
+        );
+
+        // Start Phase A (t = 5550ms -> +0ms): active OpacityLayer (<1.0) + ShaderMask from frame 0, warmup stays unmounted.
+        await tester.pumpWidget(buildHarness(startTransition: true));
+        await tester.pump();
+        expect(warmupFinder, findsNothing);
+        expect(
+          tester
+              .widget<Opacity>(
+                find.descendant(
+                  of: visibilityFinder,
+                  matching: find.byType(Opacity),
+                ),
+              )
+              .opacity,
+          lessThan(1.0),
+        );
+
+        // Past edgeFeather > 0.005 (+20ms): no splash subtree recreation.
+        await tester.pump(const Duration(milliseconds: 20));
+        expect(initCount, 1);
+        expect(disposeCount, 0);
+        expect(
+          find.descendant(
+            of: visibilityFinder,
+            matching: find.byType(ShaderMask),
+          ),
+          findsOneWidget,
+        );
+
+        // Past pA >= 0.35 (+160ms): continuous Opacity/ShaderMask fade without mid-phase layer switch.
+        await tester.pump(const Duration(milliseconds: 140));
+        expect(initCount, 1);
+        expect(disposeCount, 0);
+        expect(
+          tester.widget<Visibility>(visibilityFinder).visible,
+          isTrue,
+        );
+
+        // Past pA == 1.0 (+400ms, mid-Phase B): splash hidden via Visibility(maintainState: true), NOT disposed!
+        await tester.pump(const Duration(milliseconds: 240));
+        expect(initCount, 1);
+        expect(disposeCount, 0);
+        expect(completedCount, 0);
+        expect(visibilityFinder, findsOneWidget);
+        expect(
+          tester.widget<Visibility>(visibilityFinder).visible,
+          isFalse,
+        );
+
+        // Past Phase C start (+1000ms, ClipRect curtain revealed before Visibility in Stack): still not disposed!
+        await tester.pump(const Duration(milliseconds: 600));
+        expect(initCount, 1);
+        expect(disposeCount, 0);
+        expect(completedCount, 0);
+        expect(visibilityFinder, findsOneWidget);
+
+        // Transition completes (~7500ms): splash subtree is now unmounted & disposed cleanly.
+        await tester.pumpAndSettle();
+        expect(completedCount, 1);
+        expect(initCount, 1);
+        expect(disposeCount, 1);
+        expect(find.text('Destination Ready'), findsOneWidget);
+      },
+    );
   });
+}
+
+class _SplashLifecycleProbe extends StatefulWidget {
+  const _SplashLifecycleProbe({
+    super.key,
+    required this.onInit,
+    required this.onDispose,
+  });
+
+  final VoidCallback onInit;
+  final VoidCallback onDispose;
+
+  @override
+  State<_SplashLifecycleProbe> createState() => _SplashLifecycleProbeState();
+}
+
+class _SplashLifecycleProbeState extends State<_SplashLifecycleProbe> {
+  @override
+  void initState() {
+    super.initState();
+    widget.onInit();
+  }
+
+  @override
+  void dispose() {
+    widget.onDispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return const ColoredBox(color: Color(0xFF0A1420));
+  }
 }

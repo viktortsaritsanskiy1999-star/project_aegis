@@ -134,6 +134,9 @@ class AegisApp extends StatefulWidget {
   const AegisApp({
     super.key,
     this.enableStartupSplash = true,
+    this.enableSplashFrameTimingDiagnostics =
+        AegisHologramTransition.defaultEnableFrameTimingDiagnostics,
+    this.onSplashFrameTimingReport,
     this.debugSkipSplashVideoInitialization = false,
     this.debugSimulatedSplashVideoDuration,
     this.onSplashRPeakHaptic,
@@ -143,6 +146,13 @@ class AegisApp extends StatefulWidget {
   /// Controls whether the cold-start Splash V4 -> ECG hologram sequence wraps
   /// [RootGateScreen] on app boot. Defaults to `true` in production.
   final bool enableStartupSplash;
+
+  /// Temporary Profile Mode flag enabling one-shot `FrameTiming` collection for
+  /// Splash V4 Phase A -> Phase B. Disabled by default.
+  final bool enableSplashFrameTimingDiagnostics;
+
+  /// Optional observer invoked once with the Splash V4 `FrameTiming` summary.
+  final ValueChanged<SplashTransitionTimingReport>? onSplashFrameTimingReport;
 
   /// Optional test hook bypassing native video plugin initialization.
   final bool debugSkipSplashVideoInitialization;
@@ -212,6 +222,9 @@ class _AegisAppState extends State<AegisApp> with WidgetsBindingObserver {
               destinationChild: const RootGateScreen(
                 key: Key('aegis_root_gate_screen'),
               ),
+              enableFrameTimingDiagnostics:
+                  widget.enableSplashFrameTimingDiagnostics,
+              onFrameTimingReport: widget.onSplashFrameTimingReport,
               debugSkipVideoInitialization:
                   widget.debugSkipSplashVideoInitialization,
               debugSimulatedVideoDuration:
